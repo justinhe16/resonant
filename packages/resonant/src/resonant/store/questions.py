@@ -2,7 +2,7 @@
 
 A question is one ``resonant ask`` (kind ``ask``), a ``resonant check`` that is waiting for
 the owner (kind ``check``) or a ``resonant request`` waiting for an approver and the tool's
-run (kind ``request``, migration 032; ``approval_id`` is the gate approval it asked for).
+run (kind ``request``, migration 033; ``approval_id`` is the gate approval it asked for).
 An owner message is text for a running worker (``ClaudeRunner.deliver_message``). Plain
 functions over a connection; every state change is one conditional UPDATE, so of two racing
 paths (the CLI giving up and an answer arriving, a CLI reply and a resume prompt) exactly one
@@ -42,7 +42,7 @@ class Question:
     asked_at: datetime
     answered_at: datetime | None
     delivered_at: datetime | None
-    approval_id: str | None = None  # a request's gate approval (migration 032)
+    approval_id: str | None = None  # a request's gate approval (migration 033)
 
 
 @dataclass(frozen=True)

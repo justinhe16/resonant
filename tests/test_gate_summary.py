@@ -212,6 +212,10 @@ BUILTIN_PROMPTS = {
     "add_repo": ({"repo": "own/garden"}, "OK to add the repo own/garden for runs? [X6] yes / no"),
     "forget_repo": ({"repo": "garden"}, "OK to forget the repo garden? [X6] yes / no"),
     "cancel_watch": ({"id": "k2b"}, "OK to cancel watch k2b? [X6] yes / no"),
+    "pause_job": ({"id": "J12"}, "OK to pause job J12? [X6] yes / no"),
+    "resume_job": ({"id": "J12"}, "OK to resume job J12? [X6] yes / no"),
+    "delete_job": ({"id": "J12"}, "OK to delete job J12? [X6] yes / no"),
+    "run_job_now": ({"id": "J12"}, "OK to run job J12 now? [X6] yes / no"),
 }
 
 

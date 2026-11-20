@@ -87,6 +87,7 @@ from resonant.runners.worker_cli import (
     NO_ANSWER_YET,
     Ask,
     Check,
+    JobNote,
     Note,
     Reply,
     Request,
@@ -94,6 +95,7 @@ from resonant.runners.worker_cli import (
     ToolRequest,
 )
 from resonant.store import approvals as ap
+from resonant.store import jobs as jobs_store
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
 from resonant.store import runs
@@ -174,6 +176,7 @@ MAY_HAVE_RUN = (
 
 EventKind = Literal["question", "note", "check", "request"]
 NO_TRUST = "denied: checks aren't set up here, so don't do it."
+JOB_NOTE_NO_JOB = "This run isn't a registered job's, so there is nothing to save to."
 
 
 class TrustChecker(Protocol):
@@ -374,6 +377,8 @@ class WorkerDesk:
                 return await self._self_op(run, req, gone)
             case ToolRequest():
                 return await self._request(run, req, gone)
+            case JobNote():
+                return self._job_note(run, req)
 
     async def _self_op(self, run: Run, req: SelfOp, gone: asyncio.Future[None]) -> Reply | None:
         """``resonant restart|update``: allowed by the ask, else checked like a net-new
@@ -562,6 +567,26 @@ class WorkerDesk:
         with contextlib.suppress(Exception):
             self._on_note(run.code)
         return self._reply(run.code, "Noted.", EXIT_OK)
+
+    def _job_note(self, run: Run, req: JobNote) -> Reply:
+        """PER-298: a registered job's run saves its memory and seen keys (redacted)."""
+        link = jobs_store.run_link(self.conn, run.code)
+        if link is None:
+            return self._reply(run.code, JOB_NOTE_NO_JOB, EXIT_USAGE)
+        red = self._redactor_for(run.code)
+        note = None if req.note is None else red.text(req.note)
+        seen = tuple(red.text(k) for k in req.seen)
+        try:
+            job = jobs_store.save_note(self.conn, link.job, note=note, seen=seen,
+                                       now=self.clock())  # fmt: skip
+        except jobs_store.NoteTooBig as e:
+            return self._reply(run.code, f"Usage error: {e}.", EXIT_USAGE)
+        if job is None:
+            return self._reply(run.code, f"Job {link.job} is gone; nothing saved.", EXIT_USAGE)
+        with atomic(self.conn):
+            audit(self.conn, "run.job_note", run=run.code, job=job.id, seen=len(seen),
+                  note=note is not None)  # fmt: skip
+        return self._reply(run.code, f"Saved for {job.id}'s next run.", EXIT_OK)
 
     async def _check(self, run: Run, req: Check, gone: asyncio.Future[None]) -> Reply | None:
         try:

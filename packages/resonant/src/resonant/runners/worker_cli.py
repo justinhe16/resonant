@@ -20,10 +20,11 @@ any other process.
 
 The protocol is one JSON line each way. Request: ``{"token", "cmd", ...}`` with ``cmd`` one
 of ``ask``/``note``/``check``/``restart``/``update`` (GD-1: restart Resonant, or pull its main,
-sync and restart; the run is stopped by the restart and resumed after it) or ``request``
-(PER-296: ``{"tool": "<ext>.<tool>", "args": {k: v}, "reason"}``, an extension tool the
-instance marks ``worker_requestable``, called through the gate as the run's requester and
-approved in the run's thread). Reply:
+sync and restart; the run is stopped by the restart and resumed after it), ``job_note``
+(PER-298: ``{"payload": "<the JSON object>"}``, a registered job's memory and seen keys) or
+``request`` (PER-296: ``{"tool": "<ext>.<tool>", "args": {k: v}, "reason"}``, an extension
+tool the instance marks ``worker_requestable``, called through the gate as the run's
+requester and approved in the run's thread). Reply:
 ``{"text", "exit"}``; the shim prints ``text`` (plain text for Claude to read) and exits with
 ``exit``:
 
@@ -76,6 +77,9 @@ MAX_TOOL = 130  # ``<ext>.<tool>``
 MAX_ARGS = 32
 MAX_ARG = 2000
 MAX_REASON = 300
+MAX_JOB_NOTE = 4096  # bytes: store.jobs.MEMORY_MAX
+MAX_SEEN = 200  # keys in one job-note
+MAX_SEEN_KEY = 200
 READ_TIMEOUT_S = 10.0
 SUN_PATH_MAX = 100  # macOS sun_path is 104 bytes with the NUL; keep a margin
 START_TOLERANCE_S = 1.0
@@ -118,6 +122,15 @@ class SelfOp:
 
 
 @dataclass(frozen=True)
+class JobNote:
+    """``resonant job-note '{"seen": [...], "note": "..."}'`` (PER-298): a registered job's
+    run saves its memory (``note`` replaces it) and the keys it handled (``seen`` adds them)."""
+
+    note: str | None = None
+    seen: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ToolRequest:
     """``resonant request <ext>.<tool> [--arg k=v …] [--reason …]`` (PER-296). ``args`` are
     the CLI's strings, in order; the desk fits them to the tool's schema."""
@@ -132,7 +145,7 @@ class ToolRequest:
         return f"{self.extension}.{self.tool}"
 
 
-Request = Ask | Note | Check | SelfOp | ToolRequest
+Request = Ask | Note | Check | SelfOp | JobNote | ToolRequest
 
 
 @dataclass(frozen=True)
@@ -207,7 +220,9 @@ def parse_request(obj: Any) -> Request:
         return SelfOp(cmd)
     if cmd == "request":
         return _tool_request(req)
-    raise BadRequest("unknown command; use ask, note, check, request, restart or update")
+    if cmd == "job_note":
+        return _job_note(req)
+    raise BadRequest("unknown command; use ask, note, check, job-note, request, restart or update")
 
 
 def _tool_request(req: dict[str, Any]) -> ToolRequest:
@@ -231,6 +246,41 @@ def _tool_request(req: dict[str, Any]) -> ToolRequest:
         raise BadRequest(f"too many args (at most {MAX_ARGS})")
     reason = _text(req, "reason", MAX_REASON, required=False)
     return ToolRequest(ext, tool, tuple(pairs), reason)
+
+
+def _job_note(req: dict[str, Any]) -> JobNote:
+    raw = req.get("payload")
+    if not isinstance(raw, str):
+        raise BadRequest('job-note takes one JSON object, like \'{"note": "..."}\'')
+    try:
+        obj: Any = json.loads(raw)
+    except ValueError:
+        raise BadRequest("job-note: that isn't JSON") from None
+    if not isinstance(obj, dict):
+        raise BadRequest("job-note takes a JSON object with seen and/or note")
+    body = cast(dict[str, Any], obj)
+    if unknown := set(body) - {"seen", "note"}:
+        raise BadRequest(f"job-note: unknown fields {sorted(unknown)}; use seen and note")
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        raise BadRequest("job-note: note must be text")
+    if note is not None and len(note.encode()) > MAX_JOB_NOTE:
+        raise BadRequest(f"job-note: note is too long (at most {MAX_JOB_NOTE} bytes)")
+    seen_raw = body.get("seen", [])
+    if not isinstance(seen_raw, list):
+        raise BadRequest("job-note: seen must be a list of keys")
+    seen: list[str] = []
+    for item in cast(list[Any], seen_raw):
+        if not isinstance(item, str) or not item.strip():
+            raise BadRequest("job-note: each seen key must be non-empty text")
+        if len(item) > MAX_SEEN_KEY:
+            raise BadRequest(f"job-note: a seen key is too long (at most {MAX_SEEN_KEY})")
+        seen.append(item.strip())
+    if len(seen) > MAX_SEEN:
+        raise BadRequest(f"job-note: too many seen keys (at most {MAX_SEEN})")
+    if note is None and not seen:
+        raise BadRequest("job-note: give seen, note or both")
+    return JobNote(note, tuple(seen))
 
 
 # --- the control dir --------------------------------------------------------------------------
@@ -310,6 +360,9 @@ _SHIM_SOURCE = r'''
       approver approves it in the run's thread, Resonant runs it, and you get the result.
       Waits like ask (exit 3: end your turn, you're resumed with the result). At most 3
       open at once. `resonant request --help` lists the tools you may request here.
+  resonant job-note '{"seen": ["<key>", ...], "note": "<memory>"}'
+      Only in a registered job's run: save what its next run should know (note replaces
+      the memory, at most 4 KB) and the keys it handled (seen adds them).
   resonant restart
       Restart Resonant itself. This session is stopped by the restart and resumed after it.
   resonant update
@@ -354,6 +407,8 @@ def main():
     r.add_argument("tool", help="<extension>.<tool>")
     r.add_argument("--arg", action="append", default=[], metavar="KEY=VALUE")
     r.add_argument("--reason", default="", help="why, in a sentence (the approver sees it)")
+    j = sub.add_parser("job-note", help="save a registered job's memory and seen keys")
+    j.add_argument("payload", help='JSON: {"seen": [...], "note": "..."}')
     sub.add_parser("restart", help="restart Resonant (this session is resumed after it)")
     sub.add_parser("update", help="pull Resonant's main, sync and restart")
     args = p.parse_args()
@@ -366,6 +421,8 @@ def main():
                "urgent": args.urgent}
     elif args.cmd == "note":
         req = {"cmd": "note", "text": " ".join(args.text), "urgent": args.urgent}
+    elif args.cmd == "job-note":
+        req = {"cmd": "job_note", "payload": args.payload}
     elif args.cmd in ("restart", "update"):
         req = {"cmd": args.cmd}
     elif args.cmd == "request":
