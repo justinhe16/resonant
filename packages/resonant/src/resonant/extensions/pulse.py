@@ -49,6 +49,13 @@ unrouted: the retry upserts the same item (still untold), the channel drops the 
 send, and ``mark_told`` runs. A recipient the channel refuses is skipped; any other channel
 error raises.
 
+Another instance's alerts (PER-301). :meth:`Pulse.ingest_instance` (personal Resonant's
+``POST /api/notify-owner``) stores an urgent item of source ``instance:<name>`` and takes the
+same urgent path (step 4), rendered ``[Cori] 🔴 <title>``, deduped by the item's fingerprint;
+each sent text is also recorded in ``system_texts`` (``outside``), so the brains can answer
+about it. On an instance with ``notify_owner`` (``bridge``), :meth:`Pulse.route` forwards each
+urgent item it would send to personal Resonant too (``notify_owner.OwnerBridge``).
+
 :func:`render_item` is the one-line form of a stored item (urgent sends and the hourly pulse):
 ``[name] <mark> <title>``, no prefix for ``core``; the title is already clean.
 """
@@ -60,7 +67,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from resonant.config import NotifyConfig
 from resonant.extensions.notify import (
@@ -77,13 +84,19 @@ from resonant.extensions.notify import (
 from resonant.gateway.channel import ChannelRefused
 from resonant.ops import Sender
 from resonant.store import pulse as items
+from resonant.store import system_texts
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, utcnow
 from resonant_sdk import Event
 
+if TYPE_CHECKING:
+    from resonant.notify_owner import OwnerBridge
+
 log = logging.getLogger(__name__)
 
 EVENT_TYPE = "item"
+INSTANCE_PREFIX = "instance:"  # PER-301: items another instance sent (POST /api/notify-owner)
+Outcome = Literal["sent", "held", "told", "unreachable"]
 URGENT_MARK = "\U0001f534"  # red circle
 GOOD_MARK = "\U0001f7e2"  # green circle: an urgent item with ``tone: good``
 CLEAR_MARK = "✓"  # check mark
@@ -102,11 +115,27 @@ def urgent_mark(item: items.Item) -> str:
     return GOOD_MARK if item.tone == "good" else URGENT_MARK
 
 
+def instance_source(instance: str) -> str:
+    """The pulse source of another instance's alerts: ``instance:cori``."""
+    return INSTANCE_PREFIX + instance
+
+
+def source_label(source: str) -> str | None:
+    """The code-built prefix name of a source: None for ``core``, the instance's name
+    capitalized for ``instance:<name>`` (``[Cori]``, as ``instance.display_name`` defaults),
+    else the extension name."""
+    if source == "core":
+        return None
+    if source.startswith(INSTANCE_PREFIX):
+        return source.removeprefix(INSTANCE_PREFIX).capitalize()
+    return source
+
+
 def render_item(item: items.Item, mark: str = "", max_chars: int = 300) -> str:
     """``[source] <mark> <title>`` for a stored item (its title is already cleaned, so it is
-    not cleaned again). ``core`` items get no prefix."""
+    not cleaned again). ``core`` items get no prefix; ``instance:cori`` items ``[Cori]``."""
     text = f"{mark} {item.title}" if mark else item.title
-    return render_clean(None if item.source == "core" else item.source, text, max_chars)
+    return render_clean(source_label(item.source), text, max_chars)
 
 
 def _ttl_s(raw: object) -> int:
@@ -120,7 +149,9 @@ def _ttl_s(raw: object) -> int:
 
 class Pulse:
     """Ingests ``ext.<name>.item`` events (see the module docstring). ``recipients(ext)`` is
-    the gate's approvers (owner first); ``manifest_of(ext)`` the loaded manifest or None."""
+    the gate's approvers (owner first); ``manifest_of(ext)`` the loaded manifest or None.
+    ``bridge`` (PER-301, an instance with ``notify_owner``): urgent news is also forwarded to
+    personal Resonant, which texts the owner."""
 
     def __init__(
         self,
@@ -131,6 +162,7 @@ class Pulse:
         manifest_of: ManifestOf,
         config: NotifyConfig | None = None,
         clock: Callable[[], datetime] = utcnow,
+        bridge: OwnerBridge | None = None,
     ) -> None:
         self.conn = conn
         self.channel = channel
@@ -138,67 +170,126 @@ class Pulse:
         self.manifest_of = manifest_of
         self.config = config or NotifyConfig()
         self.clock = clock
+        self.bridge = bridge
 
     async def route(self, event: Event) -> None:
         """Store one item report and send it now if it is urgent news. Returns None (consume
         it); raises a ``ChannelError`` to have the loop retry it."""
         ext = event.source.removeprefix(SOURCE_PREFIX)
         if not event.source.startswith(SOURCE_PREFIX) or event.type != f"ext.{ext}.{EVENT_TYPE}":
-            self._audit("pulse.refused", ext, event, reason="malformed")
+            self._audit_event("pulse.refused", ext, event, reason="malformed")
             return None
         manifest = self.manifest_of(ext)
         if manifest is None:
-            self._audit("pulse.refused", ext, event, reason="not loaded")
+            self._audit_event("pulse.refused", ext, event, reason="not loaded")
             return None
         if manifest.report is None:
-            self._audit("pulse.refused", ext, event, reason="no report grant")
+            self._audit_event("pulse.refused", ext, event, reason="no report grant")
             return None
         now = self.clock()
         try:
             stored = self._store(ext, event, manifest.report.max_urgency)
         except ValueError as e:
-            self._audit("pulse.refused", ext, event, reason=f"bad item: {e}"[:200])
+            self._audit_event("pulse.refused", ext, event, reason=f"bad item: {e}"[:200])
             return None
         if stored is None:
-            self._audit("pulse.stale", ext, event, reason="newer report already stored")
+            self._audit_event("pulse.stale", ext, event, reason="newer report already stored")
             return None
         item, urgency, quiet = stored
         if quiet or event.payload.get("baseline") is True:
             items.mark_told(self.conn, [item], now)
             reason = "quiet" if quiet else "baseline"
-            self._audit("pulse.held", ext, event, reason=reason, key=item.key)
+            self._audit_event("pulse.held", ext, event, reason=reason, key=item.key)
             return None
         if urgency != "urgent" or not item.changed:
             return None  # normal and low wait for the pulse; the owner already heard this one
-        hour = clock_hour(now)
-        reason = None
+        if self.bridge is not None and self._hold_reason(ext, now, event.dedupe_key) in (
+            None,
+            "capped",  # personal Resonant keeps its own cap
+        ):  # PER-301: another instance's urgent news reaches the owner through personal
+            self.bridge.forward(f"ext/{ext}/{item.key}", f"{ext}: {item.title}",
+                                clear=item.cleared)  # fmt: skip
+        await self._send_urgent(
+            ext, item, now, send_key=f"pulse:urgent:{event.id}", idempotency_key=event.dedupe_key,
+            trace_id=event.trace_id, event_type=event.type,
+        )  # fmt: skip
+        return None
+
+    async def ingest_instance(
+        self, instance: str, key: str, title: str, *, clear: bool = False
+    ) -> tuple[Outcome, str | None]:
+        """PER-301: an urgent alert from another instance on this user (``POST
+        /api/notify-owner``), stored as an item of source ``instance:<name>`` and sent like an
+        extension's urgent report: ``[Cori] 🔴 <title>`` once per fingerprint (``✓`` for
+        ``clear``), held while paused or muted (``/ext mute cori``) or over the per-hour cap.
+        A sent text is recorded in ``system_texts`` (kind ``pulse``, ``outside``) so the brains
+        see it as Resonant's own turn. Returns the outcome and the hold reason."""
+        source = instance_source(instance)
+        now = self.clock()
+        if clear and items.get(self.conn, source, key) is None:
+            return "told", None  # an all-clear for something never said: nothing to say
+        _change, item = items.upsert(
+            self.conn, source, key, clean_text(title), "urgent", None, clear,
+            items.DEFAULT_TTL_S, now, None,
+        )  # fmt: skip
+        if not item.changed:
+            return "told", None
+        idem = f"{source}:{key}:{item.fingerprint}"
+        return await self._send_urgent(
+            source, item, now, send_key=f"pulse:urgent:{idem}", idempotency_key=idem,
+            trace_id=None, event_type=f"{source}.item", record=True,
+        )  # fmt: skip
+
+    def _hold_reason(self, source: str, now: datetime, dedupe_key: str | None) -> str | None:
         if paused(self.conn):
-            reason = "paused"
-        elif muted_until(self.conn, ext, now) is not None:
-            reason = "muted"
-        elif sent_in_hour(self.conn, ext, hour, event.dedupe_key) >= self.config.max_per_hour:
-            reason = "capped"
+            return "paused"
+        if muted_until(self.conn, source, now) is not None:
+            return "muted"
+        if sent_in_hour(self.conn, source, clock_hour(now), dedupe_key) >= self.config.max_per_hour:
+            return "capped"
+        return None
+
+    async def _send_urgent(
+        self,
+        source: str,
+        item: items.Item,
+        now: datetime,
+        *,
+        send_key: str,
+        idempotency_key: str | None,
+        trace_id: str | None,
+        event_type: str,
+        record: bool = False,
+    ) -> tuple[Outcome, str | None]:
+        """Send an urgent item the owner hasn't heard to each recipient, or hold it (see the
+        module docstring, step 4). ``record``: put the text in ``system_texts`` too."""
+        detail: dict[str, Any] = {"idempotency_key": idempotency_key, "trace_id": trace_id,
+                                  "event_type": event_type}  # fmt: skip
+        hour = clock_hour(now)
+        reason = self._hold_reason(source, now, idempotency_key)
         if reason is not None:
-            self._audit("pulse.held", ext, event, reason=reason, key=item.key)
-            return None
+            self._audit("pulse.held", source, **detail, reason=reason, key=item.key)
+            return "held", reason
         mark = CLEAR_MARK if item.cleared else urgent_mark(item)
         message = render_item(item, mark, self.config.max_chars)
         sent = 0
-        for recipient in self.recipients(ext) or ():
+        for recipient in self.recipients(source) or ():
+            key = f"{send_key}:{recipient}"
             try:
-                await self.channel.send(
-                    recipient, message, dedupe_key=f"pulse:urgent:{event.id}:{recipient}"
-                )
+                await self.channel.send(recipient, message, dedupe_key=key)
             except ChannelRefused:
-                log.warning("pulse recipient refused", extra={"extension": ext})
+                log.warning("pulse recipient refused", extra={"extension": source})
                 continue
             sent += 1
+            if record:
+                system_texts.record(self.conn, recipient, "pulse", message, ref=key, now=now,
+                                    outside=True)  # fmt: skip
         if not sent:  # nobody took it: stays pending and rides the hourly pulse
-            self._audit("pulse.unreachable", ext, event, key=item.key)
-            return None
+            self._audit("pulse.unreachable", source, **detail, key=item.key)
+            return "unreachable", None
         items.mark_told(self.conn, [item], now)
-        self._audit("pulse.sent", ext, event, recipients=sent, hour=iso(hour), key=item.key)
-        return None
+        self._audit("pulse.sent", source, **detail, recipients=sent, hour=iso(hour), key=item.key)
+        return "sent", None
 
     def _store(
         self, ext: str, event: Event, grant: items.Urgency
@@ -246,17 +337,22 @@ class Pulse:
         )
         return item, granted, quiet
 
-    def _audit(self, action: str, ext: str, event: Event, **detail: Any) -> None:
+    def _audit_event(self, action: str, ext: str, event: Event, **detail: Any) -> None:
+        self._audit(action, ext, idempotency_key=event.dedupe_key, trace_id=event.trace_id,
+                    event_type=event.type, **detail)  # fmt: skip
+
+    def _audit(self, action: str, ext: str, **detail: Any) -> None:
         with atomic(self.conn):
-            audit(
-                self.conn,
-                action,
-                extension=ext,
-                idempotency_key=event.dedupe_key,
-                trace_id=event.trace_id,
-                event_type=event.type,
-                **detail,
-            )
+            audit(self.conn, action, extension=ext, **detail)
 
 
-__all__ = ["EVENT_TYPE", "Pulse", "clamp", "render_item"]
+__all__ = [
+    "EVENT_TYPE",
+    "INSTANCE_PREFIX",
+    "Outcome",
+    "Pulse",
+    "clamp",
+    "instance_source",
+    "render_item",
+    "source_label",
+]

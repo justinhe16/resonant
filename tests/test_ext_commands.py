@@ -687,6 +687,19 @@ def test_mute_and_unmute(ctx: BuiltinContext) -> None:
     assert actions == [("ext.notify_muted", OWNER), ("ext.notify_unmuted", OWNER)]
 
 
+def test_mute_an_instance_that_sent_alerts(ctx: BuiltinContext) -> None:
+    """PER-301: ``/ext mute cori`` mutes the alerts Cori sends through /api/notify-owner
+    (pulse source ``instance:cori``) once she has sent one."""
+    until = NOW + timedelta(hours=1)
+    with pytest.raises(ToolFailed, match="no such extension"):
+        mute_extension(ctx, {"extension": "cori", "until": until.isoformat()})
+    pulse_store.upsert(ctx.conn, "instance:cori", "k", "t", "urgent", None, False, 3600, NOW)
+    out = mute_extension(ctx, {"extension": "cori", "until": until.isoformat()})
+    assert out["extension"] == "cori"
+    assert kv_get(ctx.conn, "ext.instance:cori.muted_until") == "2026-10-14T18:30:00.000+00:00"
+    assert mute_extension(ctx, {"extension": "cori", "off": True})["was_muted"] is True
+
+
 @pytest.mark.parametrize(
     "args",
     [
