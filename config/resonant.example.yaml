@@ -103,6 +103,7 @@ pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it
   remention_after: 10m                  # a pending approval is mentioned once more after this (capped at half gate.approval_ttl_s)
+  # heartbeat: {room: null}            # PER-303: an hourly alive line to a channels.slack.rooms key (Cori)
 
 # The brain's read tools (docs/brain-plan.md D5; read_file, list_dir, search, tail_log,
 # read_transcript) and ask_claude (D8). Defaults shown commented out:

@@ -63,10 +63,24 @@ so the brains' "Already told" can leave out what a text shown in the transcript 
 counts as outside): the text lists an item that isn't a code-built core notice (a worker's
 item, the rollup's PR lines, a worker question, an extension's item), or a briefing names a
 worker; the turn that sees it is tainted, as after a run's outcome.
+
+The heartbeat (PER-303, ``pulse.heartbeat: {room, quiet_hours}``; ``room: null``, the default,
+is off and changes nothing): after the owner step, whether or not it sent anything, the same
+job posts one code-built line to the room (``ChannelHub.post_room``, Cori's
+``channels.slack.rooms.pulse``, ``#voyager-pulse``): ``✓ Cori up · healthy · running R12, R14 ·
+next job J3 at 14:00`` (``idle``; the next job only once PER-298's ``registered_jobs`` exist),
+``⏸ Cori paused · …`` while paused, then ``⚠ <check>: degraded since <time>`` lines (at most 5,
+``+N more``) and ``Waiting: 2 approvals (oldest 40m)``; under 500 characters. It needs only the
+room (no owner, no iMessage), posts in the briefing hour, and inside the quiet hours unless
+``quiet_hours: true``. With it on the job ``runs_while_paused`` and skips the owner step while
+paused. Exactly once through :func:`deliver` (records ``heartbeat.inflight:<key>``, key
+``heartbeat:<date>:<HH>``; an unsent record of an earlier hour is abandoned), recorded as a
+``heartbeat`` system text of ``room:<key>``. A failed post is logged and never fails the job.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import sqlite3
@@ -78,9 +92,12 @@ from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext
-from resonant.extensions import notify, rollup
+from resonant.extensions import cron, notify, rollup
 from resonant.extensions.pulse import render_item, urgent_mark
+from resonant.gateway.hub import RoomPosting
+from resonant.store import approvals as approvals_store
 from resonant.store import pulse as store
+from resonant.store import runs as runs_store
 from resonant.store import system_texts
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.when import format_due
@@ -102,6 +119,8 @@ LINE_MAX = 200
 HEADER = "btw:"
 CORE = "core"
 INFLIGHT = "pulse.inflight:"  # kv: one record per dedupe key, see deliver()
+# A send that isn't ``channel.send(owner, …)``: ``(text, dedupe_key)`` (the heartbeat's room).
+Post = Callable[[str, str], Awaitable[object]]
 INFLIGHT_KEEP = timedelta(days=2)
 UNSENT_MAX_AGE = timedelta(hours=2)  # an unsent record older than this is abandoned
 ITEM_TTL_S = 24 * 3600
@@ -473,14 +492,17 @@ def is_outside(items: Sequence[store.Item]) -> bool:
 
 
 def text_kind(key: str) -> system_texts.Kind:
-    """The system text kind of a delivery's dedupe key: ``briefing:…`` or the pulse's."""
-    return "briefing" if key.startswith("briefing:") else "pulse"
+    """The system text kind of a delivery's dedupe key: ``briefing:…``, ``heartbeat:…`` or
+    the pulse's."""
+    if key.startswith("briefing:"):
+        return "briefing"
+    return "heartbeat" if key.startswith("heartbeat:") else "pulse"
 
 
-def prune_inflight(conn: sqlite3.Connection, now: datetime) -> None:
+def prune_inflight(conn: sqlite3.Connection, now: datetime, *, inflight: str = INFLIGHT) -> None:
     """Drop delivery records (done, or never finished) older than ``INFLIGHT_KEEP``, and
-    any whose ``at`` is corrupt."""
-    rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
+    any whose ``at`` is corrupt (``inflight``: the records' kv prefix)."""
+    rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (inflight + "%",)).fetchall()
     with atomic(conn):
         for (k,) in rows:
             rec: Any = kv_get(conn, k)
@@ -501,6 +523,8 @@ async def deliver(
     *,
     rewrite: Callable[[str, list[store.Item]], Awaitable[str]] | None = None,
     outside: Callable[[list[store.Item]], bool] = is_outside,
+    post: Post | None = None,
+    inflight: str = INFLIGHT,
 ) -> tuple[str, int]:
     """Send one message to ``owner`` exactly once for dedupe key ``key``.
 
@@ -516,12 +540,19 @@ async def deliver(
 
     ``outside`` says from the listed items whether the text carries outside content (kept in
     the record for the system text, PER-274; default :func:`is_outside`).
+
+    ``post`` (PER-303, the heartbeat) sends ``(text, dedupe_key)`` somewhere else than
+    ``channel.send(owner, …)`` (a room); ``owner`` is then only the system text's principal.
+    ``inflight`` is the kv prefix of the records, so a heartbeat's (``heartbeat.inflight:``)
+    and the owner's never finish each other's.
     """
-    rkey = INFLIGHT + key
+    rkey = inflight + key
     raw: Any = kv_get(conn, rkey)
     rec = cast(dict[str, Any], raw) if isinstance(raw, dict) else None
     if rec is None:
-        await _finish_unsent(conn, channel, owner, now, except_key=rkey)
+        await _finish_unsent(
+            conn, channel, owner, now, except_key=rkey, post=post, inflight=inflight
+        )
         built = build()
         if built is None:
             return "nothing", 0
@@ -545,7 +576,9 @@ async def deliver(
             kv_set(conn, rkey, rec)
     elif rec.get("sent"):
         return "duplicate", 0
-    return "sent", await _send_recorded(conn, channel, owner, key, rec, now)
+    return "sent", await _send_recorded(
+        conn, channel, owner, key, rec, now, post=post, inflight=inflight
+    )
 
 
 async def _send_recorded(
@@ -555,6 +588,9 @@ async def _send_recorded(
     key: str,
     rec: dict[str, Any],
     now: datetime,
+    *,
+    post: Post | None = None,
+    inflight: str = INFLIGHT,
 ) -> int:
     """Send the stored text under its own dedupe key, mark exactly its items told and record
     it as a system text (PER-274, once per key)."""
@@ -563,7 +599,10 @@ async def _send_recorded(
 
     recorded = cast(list[list[str]], rec["items"])
     text = str(rec["text"])
-    await channel.send(owner, text, dedupe_key=key)
+    if post is None:
+        await channel.send(owner, text, dedupe_key=key)
+    else:
+        await post(text, key)
     with atomic(conn):
         for source, ikey, fp in recorded:
             item = store.get(conn, source, ikey)
@@ -571,12 +610,19 @@ async def _send_recorded(
                 store.mark_told(conn, [replace(item, fingerprint=fp)], now)
         system_texts.record(conn, owner, text_kind(key), record_text(text), ref=key, now=now,
                             outside=rec.get("outside") is not False)  # fmt: skip
-        kv_set(conn, INFLIGHT + key, {**rec, "sent": True})
+        kv_set(conn, inflight + key, {**rec, "sent": True})
     return len(recorded)
 
 
 async def _finish_unsent(
-    conn: sqlite3.Connection, channel: Channel, owner: str, now: datetime, *, except_key: str
+    conn: sqlite3.Connection,
+    channel: Channel,
+    owner: str,
+    now: datetime,
+    *,
+    except_key: str,
+    post: Post | None = None,
+    inflight: str = INFLIGHT,
 ) -> None:
     """Finish the delivery records of other keys that never got marked: a run that raised
     after its send (the scheduler consumes that due time, so no catch-up reruns it). Without
@@ -590,7 +636,7 @@ async def _finish_unsent(
     out."""
     pending: list[tuple[datetime, str, dict[str, Any]]] = []
     abandoned: list[str] = []
-    for (k,) in conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall():
+    for (k,) in conn.execute("SELECT key FROM kv WHERE key LIKE ?", (inflight + "%",)).fetchall():
         raw: Any = kv_get(conn, k)
         if k == except_key or not isinstance(raw, dict) or cast(dict[str, Any], raw).get("sent"):
             continue
@@ -606,7 +652,10 @@ async def _finish_unsent(
                 conn.execute("DELETE FROM kv WHERE key = ?", (k,))
     for _at, k, rec in sorted(pending, key=lambda p: (p[0], p[1])):
         try:
-            await _send_recorded(conn, channel, owner, k.removeprefix(INFLIGHT), rec, now)
+            await _send_recorded(
+                conn, channel, owner, k.removeprefix(inflight), rec, now,
+                post=post, inflight=inflight,
+            )  # fmt: skip
         except Exception:
             log.warning("pulse: could not finish an earlier delivery", extra={"key": k})
 
@@ -736,25 +785,244 @@ def _due(args: dict[str, Any]) -> datetime | None:
     return dt if dt.utcoffset() is not None else None
 
 
+# --- the heartbeat (PER-303) -----------------------------------------------------------------
+
+HEARTBEAT_INFLIGHT = "heartbeat.inflight:"  # kv: the heartbeat's delivery records (deliver())
+HEARTBEAT_MAX_CHARS = 500
+HEARTBEAT_HEALTH_LINES = 5
+HEARTBEAT_CODES = 8  # running R-codes named on the first line, then ``+N``
+
+
+def heartbeat_key(local: datetime) -> str:
+    return f"heartbeat:{local.date().isoformat()}:{local:%H}"
+
+
+def heartbeat_principal(room: str) -> str:
+    """Whose system text a room's heartbeat is: the room's (``room:pulse``), not a person's,
+    so an hourly line never crowds anyone's transcript."""
+    return f"room:{room}"
+
+
+def _at(dt: datetime, now: datetime, zone: ZoneInfo) -> str:
+    """``14:00`` today (local), else ``Mon 14:00`` (a week either way at most matters)."""
+    local, today = dt.astimezone(zone), now.astimezone(zone)
+    return f"{local:%H:%M}" if local.date() == today.date() else f"{local:%a %H:%M}"
+
+
+def _age(delta: timedelta) -> str:
+    """``40m``, ``3h``, ``2d``."""
+    minutes = max(0, int(delta.total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    if minutes < 48 * 60:
+        return f"{minutes // 60}h"
+    return f"{minutes // (24 * 60)}d"
+
+
+def next_registered_job(conn: sqlite3.Connection, now: datetime) -> tuple[str, datetime] | None:
+    """The next due registered job (PER-298's ``registered_jobs``: ``J<n>``, ``active``,
+    ``schedule`` in ``tz``) as ``(id, due)``. A soft dependency: None while the table doesn't
+    exist (or doesn't read), and a row whose cron doesn't parse is left out. Read-only."""
+    try:
+        rows = conn.execute(
+            "SELECT * FROM registered_jobs WHERE state = 'active' ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    best: tuple[str, datetime] | None = None
+    for r in rows:
+        try:
+            keys = r.keys()
+            if "kind" in keys and r["kind"] not in (None, "schedule"):
+                continue
+            due = cron.parse_schedule(str(r["schedule"]), str(r["tz"])).next_after(now)
+            job_id = str(r["id"])
+        except (cron.CronError, IndexError, KeyError, TypeError, ValueError):
+            continue
+        if due is not None and (best is None or due < best[1]):
+            best = (job_id, due)
+    return best
+
+
+def heartbeat_text(
+    conn: sqlite3.Connection, settings: Settings, now: datetime, *, paused: bool
+) -> str:
+    """The heartbeat, code-built from the store (no voice), at most ``HEARTBEAT_MAX_CHARS``.
+
+    ``✓ Cori up · healthy · running R12, R14 · next job J3 at 14:00`` (``idle`` with no run;
+    the next job only when PER-298's registered jobs exist), ``⏸ Cori paused · …`` while
+    paused. Then a ``⚠ <check>: degraded since <time>`` line per degraded health row (at most
+    5, then ``+N more``; Slack's own ``slack`` row among them) and ``Waiting: 2 approvals
+    (oldest 40m)``. Names only: R-codes, check names and counts, never a run's ask or a
+    detail."""
+    from resonant.monitor import health_snapshot  # late: the monitor imports the gateway
+
+    zone = ZoneInfo(settings.timezone)
+    name = settings.instance.display_name
+    degraded = [(c, row) for c, row in health_snapshot(conn).items() if row["state"] == "degraded"]
+    parts = [f"⏸ {name} paused" if paused else f"✓ {name} up"]
+    if degraded:
+        parts.append(f"{len(degraded)} check{'s' if len(degraded) != 1 else ''} degraded")
+    else:
+        parts.append("healthy")
+    codes = [r.code for r in runs_store.active(conn)]
+    if codes:
+        shown = ", ".join(codes[:HEARTBEAT_CODES])
+        extra = len(codes) - HEARTBEAT_CODES
+        parts.append(f"running {shown}" + (f" +{extra}" if extra > 0 else ""))
+    else:
+        parts.append("idle")
+    job = next_registered_job(conn, now)
+    if job is not None:
+        parts.append(f"next job {job[0]} at {_at(job[1], now, zone)}")
+    lines = [" · ".join(parts)]
+    for check, row in degraded[:HEARTBEAT_HEALTH_LINES]:
+        since = row.get("since")
+        line = f"⚠ {check}: {row['state']}"
+        if isinstance(since, str):
+            with contextlib.suppress(ValueError):
+                line += f" since {_at(datetime.fromisoformat(since), now, zone)}"
+        lines.append(line)
+    if len(degraded) > HEARTBEAT_HEALTH_LINES:
+        lines.append(f"+{len(degraded) - HEARTBEAT_HEALTH_LINES} more")
+    waiting = approvals_store.pending_all(conn, now)
+    if waiting:
+        oldest = min(a.created_at for a in waiting)
+        n = len(waiting)
+        lines.append(f"Waiting: {n} approval{'s' if n != 1 else ''} (oldest {_age(now - oldest)})")
+    text = "\n".join(lines)
+    if len(text) > HEARTBEAT_MAX_CHARS:
+        text = text[: HEARTBEAT_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
+async def send_heartbeat(
+    conn: sqlite3.Connection,
+    channel: RoomPosting,
+    *,
+    settings: Settings,
+    now: datetime,
+    due: datetime | None = None,
+) -> dict[str, Any]:
+    """Post the heartbeat to ``pulse.heartbeat.room`` once for the due hour.
+
+    Returns ``{posted, skipped?}`` (``skipped``: ``off``, ``quiet``, ``duplicate``,
+    ``failed``); never the text. Posts while paused (as ``⏸``) and, unless
+    ``pulse.heartbeat.quiet_hours``, inside the quiet hours; the briefing hour too. Exactly
+    once through :func:`deliver` (its own records, ``heartbeat.inflight:``), keyed
+    ``heartbeat:<local date>:<HH>``, recorded as a ``heartbeat`` system text of
+    ``room:<key>``. Never raises: a refused or failed post (the room isn't configured, the
+    bot was removed from it, Slack is down) is logged and ``failed`` (the Slack adapter notes
+    the room's error in its health detail, so the ``slack`` check shows it); a rerun in the
+    same hour tries again under the same key, and a later hour abandons it (never sent late).
+    """
+    hb = settings.pulse.heartbeat
+    room = hb.room
+    if room is None:
+        return {"posted": False, "skipped": "off"}
+    local = (due or now).astimezone(ZoneInfo(settings.timezone))
+    try:
+        prune_inflight(conn, now, inflight=HEARTBEAT_INFLIGHT)
+        if hb.quiet_hours and settings.pulse.in_quiet(local.time()):
+            return {"posted": False, "skipped": "quiet"}
+        key = heartbeat_key(local)
+        _drop_other_heartbeats(conn, HEARTBEAT_INFLIGHT + key)
+        paused = _paused(conn)
+        text = heartbeat_text(conn, settings, now, paused=paused)
+
+        async def post(body: str, key: str) -> object:
+            return await channel.post_room(room, body, dedupe_key=key)
+
+        status, _count = await deliver(
+            conn,
+            cast("Channel", channel),  # unused: ``post`` sends
+            heartbeat_principal(room),
+            key,
+            now,
+            lambda: (text, []),
+            outside=lambda _items: False,  # code-built names and counts only
+            post=post,
+            inflight=HEARTBEAT_INFLIGHT,
+        )
+    except Exception as e:
+        log.warning("heartbeat: not posted to room %s (%s)", room, type(e).__name__)
+        return {"posted": False, "skipped": "failed"}
+    if status == "duplicate":
+        return {"posted": False, "skipped": "duplicate"}
+    return {"posted": True}
+
+
+def _drop_other_heartbeats(conn: sqlite3.Connection, keep: str) -> None:
+    """Abandon every unsent heartbeat record but ``keep``'s: a heartbeat is only worth its
+    own hour, so a post that failed is never sent late next to the new one."""
+    rows = conn.execute(
+        "SELECT key FROM kv WHERE key LIKE ?", (HEARTBEAT_INFLIGHT + "%",)
+    ).fetchall()
+    stale: list[str] = []
+    for (k,) in rows:
+        rec: Any = kv_get(conn, k)
+        if k != keep and not (isinstance(rec, dict) and cast(dict[str, Any], rec).get("sent")):
+            stale.append(k)
+    if stale:
+        with atomic(conn):
+            for k in stale:
+                conn.execute("DELETE FROM kv WHERE key = ?", (k,))
+
+
+def _room_poster(channel: Channel | None) -> RoomPosting | None:
+    return channel if isinstance(channel, RoomPosting) else None
+
+
 def pulse_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> CoreJob | None:
-    """The ``CORE_JOBS`` factory. None when disabled, with no channel, or with no owner."""
+    """The ``CORE_JOBS`` factory.
+
+    The owner pulse needs ``pulse.enabled``, a channel and an owner; the heartbeat (PER-303)
+    only ``pulse.heartbeat.room`` and a channel that posts to rooms (the hub). None when
+    neither can run. With the heartbeat on, the job runs while paused too
+    (``runs_while_paused``): the owner step is skipped then (``paused``, as the scheduler
+    would have), and the heartbeat posts ``⏸``. The heartbeat runs after the owner step,
+    whether or not it sent anything (or raised), and never fails the job."""
     from resonant.extensions.scheduler import CoreJob
 
     channel, owner = deps.channel, deps.owner
-    if not deps.settings.pulse.enabled:
+    settings = deps.settings
+    owner_pulse = settings.pulse.enabled and channel is not None and owner is not None
+    rooms = _room_poster(channel) if settings.pulse.heartbeat.room is not None else None
+    if not owner_pulse and rooms is None:
+        if settings.pulse.enabled:
+            log.info("pulse not scheduled", extra={"channel": channel is not None})
         return None
-    if channel is None or owner is None:
-        log.info("pulse not scheduled", extra={"channel": channel is not None})
-        return None
-    conn, settings = deps.conn, deps.settings
+    conn = deps.conn
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
-        return await send_pulse(
-            conn, channel, owner, settings=settings, now=clock(), due=_due(args),
-            voice=deps.components.voice,
-        )  # fmt: skip
+        now, due = clock(), _due(args)
+        beat: dict[str, Any] | None = None
+        try:
+            if not owner_pulse:
+                out: dict[str, Any] = {"sent": False, "count": 0, "skipped": "unreachable"}
+            elif rooms is not None and _paused(conn):
+                out = {"sent": False, "count": 0, "skipped": "paused"}
+            else:
+                assert channel is not None and owner is not None
+                out = await send_pulse(
+                    conn, channel, owner, settings=settings, now=now, due=due,
+                    voice=deps.components.voice,
+                )  # fmt: skip
+        finally:
+            if rooms is not None:
+                beat = await send_heartbeat(conn, rooms, settings=settings, now=now, due=due)
+        if beat is not None:
+            out["heartbeat"] = beat
+        return out
 
-    return CoreJob(id=JOB_ID, schedule=SCHEDULE, run=run, catchup=CATCHUP, timeout_s=TIMEOUT_S)
+    return CoreJob(
+        id=JOB_ID,
+        schedule=SCHEDULE,
+        run=run,
+        catchup=CATCHUP,
+        timeout_s=TIMEOUT_S,
+        runs_while_paused=rooms is not None,
+    )
 
 
 __all__ = [
@@ -766,6 +1034,8 @@ __all__ = [
     "dedupe_key",
     "deliver",
     "fit_lines",
+    "heartbeat_key",
+    "heartbeat_text",
     "is_outside",
     "item_line",
     "manual_dedupe_key",
@@ -776,6 +1046,7 @@ __all__ = [
     "refresh_core_items",
     "run_pulse_now",
     "schedule",
+    "send_heartbeat",
     "send_pulse",
     "voiced_pulse",
 ]

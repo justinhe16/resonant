@@ -39,6 +39,13 @@ channels:
     follow_idle_days: 14                # a tagged thread is followed until idle this long
     # link_base: https://resonant-relay-jhe.fly.dev   # run codes link to <link_base>#/runs/R12
 
+# PER-303: the hourly alive line to #voyager-pulse ("✓ Cori up · healthy · idle"). Turn on at
+# go-live with channels.slack (rooms: {pulse: C…} above). Absence is the Fly checker's (PER-305).
+# pulse:
+#   heartbeat:
+#     room: pulse                       # a channels.slack.rooms key; null (default) is off
+#     quiet_hours: false                # true: skip pulse.quiet_hours like the owner pulse
+
 # PER-290 (two daemons, one checkout): Ollama and keep-awake stay personal Resonant's (Cori
 # reads these as false and refuses them true; she uses the owner's Ollama at 127.0.0.1:11434),
 # and code deploys come from personal Resonant (Cori's /update, update_resonant and her workers'
