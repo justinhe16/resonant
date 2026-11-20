@@ -175,6 +175,15 @@ def _port_problem(settings: Settings) -> str | None:
     return f"api.port {port} on {host} is already in use"
 
 
+def _uninstall_label() -> str:
+    """The daemon label to remove. A config that no longer loads must not block uninstall:
+    then the label comes from the instance name asked for (or the default)."""
+    try:
+        return load_settings().daemon_label
+    except ValueError:  # pydantic's ValidationError and InstanceError are ValueErrors
+        return instance.daemon_label(instance.requested() or instance.DEFAULT_INSTANCE)
+
+
 @daemon_app.command("uninstall")
 def daemon_uninstall(
     ollama: Annotated[bool, typer.Option(help="Also remove the Ollama LaunchAgent.")] = True,
@@ -183,7 +192,7 @@ def daemon_uninstall(
     ] = True,
 ) -> None:
     """Stop and remove the LaunchAgents."""
-    labels = [load_settings().daemon_label] + ([launchd.OLLAMA_LABEL] if ollama else [])
+    labels = [_uninstall_label()] + ([launchd.OLLAMA_LABEL] if ollama else [])
     labels += [launchd.CAFFEINATE_LABEL] if keep_awake else []
     for label in labels:
         removed = launchd.uninstall(label)

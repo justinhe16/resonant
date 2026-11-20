@@ -640,3 +640,14 @@ def test_personal_status_text_is_unchanged(resonant_home: Path) -> None:
     assert status["instance"] == {"name": "resonant", "display_name": "Resonant"}
     assert render_status(status).startswith("Resonant up ")
     assert render_status({"uptime_s": 5}).startswith("Resonant up ")  # an older daemon
+
+
+def test_uninstall_works_with_a_broken_config(
+    resonant_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    removed: list[str] = []
+    monkeypatch.setattr(launchd, "uninstall", lambda label: removed.append(label) or False)  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType, reportUnknownMemberType]
+    (resonant_home / "config.yaml").write_text("model:\n  nmae: typo\n")
+    result = CliRunner().invoke(cli.app, ["daemon", "uninstall", "--no-ollama", "--no-keep-awake"])
+    assert result.exit_code == 0, result.output
+    assert removed == ["com.resonant.daemon"]

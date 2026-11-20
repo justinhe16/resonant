@@ -39,6 +39,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from resonant.instance import SERVICE_RE
+
 SECURITY = "/usr/bin/security"
 SERVICE = "resonant"
 TIMEOUT_S = 5.0
@@ -49,7 +51,6 @@ MIN_LEN = 8
 MAX_LEN = 3500
 ENCODED_PREFIX = "resonant-b64:"
 _PLAIN = re.compile(r"[A-Za-z0-9_.:@/+=-]+")
-_SERVICE = re.compile(r"[a-z][a-z0-9._-]{0,63}")  # config's instance.SERVICE_RE
 ENV_PREFIX = "RESONANT_SECRET_"
 
 EXT_SLUG = r"[a-z][a-z0-9-]{0,47}"  # the manifest's extension name rule
@@ -205,7 +206,7 @@ class SubprocessSecurity:
 
 def validate_service(service: str) -> str:
     """A service that is safe in argv and on a ``security -i`` line (no spaces, no option)."""
-    if not _SERVICE.fullmatch(service):
+    if not SERVICE_RE.fullmatch(service):
         raise ValueError(f"keychain service {service!r} must match [a-z][a-z0-9._-]{{0,63}}")
     return service
 
