@@ -55,10 +55,14 @@ def check_slack_webhook(name: str, raw: str) -> str:
     url = raw.strip()
     if any(c in url for c in " \n\r\t"):
         raise ConfigError(f"{name} has characters a URL can't contain")
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:  # a bad port or bracket; its message may quote the value
+        raise ConfigError(f"{name} is not a valid URL") from None
     if parts.scheme != "https":
         raise ConfigError(f"{name} must be https")
-    if parts.hostname != SLACK_HOST or parts.port or parts.username or parts.password:
+    if parts.hostname != SLACK_HOST or port or parts.username or parts.password:
         raise ConfigError(f"{name} must be a Slack Incoming Webhook on {SLACK_HOST}")
     return url
 

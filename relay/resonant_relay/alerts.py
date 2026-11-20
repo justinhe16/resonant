@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Literal, Protocol
 
 from resonant_relay import http
-from resonant_relay.source import Sender
+from resonant_relay.source import DEFAULT_INSTANCE, Sender
 
 Kind = Literal["stale", "failing", "read_error"]
 Event = Literal["open", "recovered"]
@@ -73,7 +73,8 @@ class WebhookNotifier:
             "message": alert.message,
             "at": alert.at.isoformat(),
         }
-        if alert.instance is not None:
+        # Only another instance's alerts carry it, so personal's body is exactly as before.
+        if alert.instance is not None and alert.instance != DEFAULT_INSTANCE:
             body["instance"] = alert.instance
         self._send(self._url, json.dumps(body).encode(), {"Content-Type": "application/json"})
 

@@ -123,6 +123,10 @@ def test_webhook_payload_names_the_instance():
         Alert("stale", "open", "t", "m", AT, "cori")
     )
     assert json.loads(cap.calls[0][1])["instance"] == "cori"
+    WebhookNotifier("https://hooks.example/x", send=cap).send(
+        Alert("stale", "open", "t", "m", AT, "resonant")
+    )
+    assert "instance" not in json.loads(cap.calls[1][1])  # personal's body is unchanged
 
 
 def test_cori_routing_from_settings():

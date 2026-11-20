@@ -209,6 +209,12 @@ def test_a_slack_webhook_for_an_unwatched_instance_is_ignored():
             "SLACK_WEBHOOK_CORI": "https://hooks.slack.com.evil/x",
         },
         {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://u:p@hooks.slack.com/x"},
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://hooks.slack.com:abc/x"},
+        {
+            "RELAY_INSTANCES": "resonant,cori",
+            "SLACK_WEBHOOK_CORI": "https://hooks.slack.com:99999/x",
+        },
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://[hooks.slack.com/x"},
         {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "ntfy,slack"},  # no URL
         {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "pager"},
         {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "webhook"},  # no WEBHOOK_URL
