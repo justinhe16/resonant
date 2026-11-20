@@ -291,6 +291,21 @@ def _after(
     return found[-limit:]
 
 
+def channel_of(conn: sqlite3.Connection, event_id: str | None) -> str:
+    """The channel a conversation is on (PER-295): the source of the message ``event_id``
+    when it is a channel adapter's (``slack``), else ``imessage`` (the default every reader
+    here takes, so iMessage-only installs read exactly what they did)."""
+    from resonant.principals import KNOWN_CHANNELS
+
+    if event_id is None:
+        return "imessage"
+    try:
+        event = get_event(conn, event_id)
+    except sqlite3.Error:
+        return "imessage"
+    return event.source if event is not None and event.source in KNOWN_CHANNELS else "imessage"
+
+
 def unfolded(
     conn: sqlite3.Connection,
     principal: str,

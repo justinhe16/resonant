@@ -26,6 +26,11 @@ The hub never sends outside a principal's identities: it only picks the adapter,
 adapter resolves the address from principals.yaml itself (and refuses on its own too).
 iMessage-only, the hub always picks iMessage, so every send is what it was before the hub.
 
+**Rooms (PER-295).** :meth:`post_room` is the one send that takes no principal: it posts to
+a configured Slack room (``channels.slack.rooms``, by key) through the running adapter that
+can (``RoomPosting``: Slack). An unknown key, or no such adapter running, raises
+:class:`ChannelRefused`. Jobs and the pulse use it for ``#digest``-style posts.
+
 **Running.** An adapter is running unless it failed to start. Sends stay possible after
 :meth:`stop` (the loop drains in-flight steps after the readers stop, and those may still
 reply), as they were with the iMessage channel alone.
@@ -75,6 +80,15 @@ class HealthReporting(Protocol):
     """An adapter that reports reader health (``IMessageChannel``, ``FakeChannel``)."""
 
     def health(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class RoomPosting(Protocol):
+    """An adapter with named rooms (``SlackChannel``): ``post_room`` refuses unknown keys."""
+
+    async def post_room(
+        self, key: str, text: str, *, dedupe_key: str | None = None
+    ) -> MessageRef: ...
 
 
 class ChannelHub:
@@ -187,6 +201,15 @@ class ChannelHub:
         if prompt.thread is not None and prompt.thread.channel != adapter.name:
             prompt = replace(prompt, thread=None)
         return await adapter.request_approval(principal, prompt)
+
+    async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
+        """Post ``text`` to the room ``key`` (see "Rooms" above). Raises ``ChannelRefused``."""
+        for name in self.running:
+            adapter = self._adapters[name]
+            if isinstance(adapter, RoomPosting):
+                return await adapter.post_room(key, text, dedupe_key=dedupe_key)
+        self._audit("channel.send_refused", room=key, reason="no running channel has rooms")
+        raise ChannelRefused("no running channel has rooms")
 
     # --- health --------------------------------------------------------------------------
 

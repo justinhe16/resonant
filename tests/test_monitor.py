@@ -422,22 +422,32 @@ async def test_deadman_stale_loop_body() -> None:
     assert bodies[0] == b"event loop stale"
 
 
-# --- no Slack in core ----------------------------------------------------------------------
+# --- Slack only in the Slack adapter -----------------------------------------------------------
+# Health alerts never go through Slack. PER-295: ``slack_sdk`` is the Slack channel's own
+# dependency, imported only by ``gateway/slack/client.py`` (lazily: personal Resonant, with no
+# ``channels.slack``, never loads it).
 
 _SLACK_IMPORT = re.compile(r"^\s*(?:import|from)\s+slack", re.MULTILINE | re.IGNORECASE)
 
 
-def test_no_slack_imports_in_core() -> None:
+def test_slack_sdk_only_in_the_slack_adapter() -> None:
     root = Path(__file__).resolve().parents[1] / "packages"
     files = [
         *(root / "resonant" / "src").rglob("*.py"),
         *(root / "resonant-sdk" / "src").rglob("*.py"),
     ]
     assert files
-    offenders = [str(p) for p in files if _SLACK_IMPORT.search(p.read_text())]
+    allowed = root / "resonant" / "src" / "resonant" / "gateway" / "slack" / "client.py"
+    offenders = [str(p) for p in files if p != allowed and _SLACK_IMPORT.search(p.read_text())]
     assert offenders == []
+    top_level = [
+        ln
+        for ln in allowed.read_text().splitlines()
+        if ln.startswith(("import slack", "from slack"))
+    ]
+    assert top_level == []  # only indented (lazy) imports
     deps = (root / "resonant" / "pyproject.toml").read_text().lower()
-    assert "slack" not in deps
+    assert '"slack-sdk==' in deps  # pinned
 
 
 def test_cli_health_section(capsys: pytest.CaptureFixture[str]) -> None:

@@ -27,6 +27,17 @@ claude:
 channels:
   imessage:
     enabled: false                      # Cori talks in Slack (PER-292, PER-295), never iMessage
+  # PER-295: the Slack adapter (Socket Mode: no public port). Turn on at go-live (PER-311), after
+  # the owner sets both tokens in Cori's Keychain (values never go in this file):
+  #   resonant --instance cori secret set slack/bot_token   (xoxb-…)
+  #   resonant --instance cori secret set slack/app_token   (xapp-…, connections:write)
+  slack:
+    enabled: false
+    team_id: T00000000                  # the DORI workspace (events from any other team are dropped)
+    bot_user_id: U00000000              # Cori's bot user (auth.test must answer both)
+    rooms: {}                           # post_room keys -> channel ids, e.g. {digest: C0123, pulse: C0456}
+    follow_idle_days: 14                # a tagged thread is followed until idle this long
+    # link_base: https://resonant-relay-jhe.fly.dev   # run codes link to <link_base>#/runs/R12
 
 # PER-290 (two daemons, one checkout): Ollama and keep-awake stay personal Resonant's (Cori
 # reads these as false and refuses them true; she uses the owner's Ollama at 127.0.0.1:11434),

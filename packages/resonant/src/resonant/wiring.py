@@ -7,8 +7,8 @@ end-to-end tests call it with fakes. With every channel disabled nothing here ru
 daemon is exactly Phase 0. (``build_imessage_stack`` and ``IMessageStack`` are the pre-PER-292
 names, kept as aliases.)
 
-Channels (PER-292). ``build_channels`` builds one adapter per enabled channel (iMessage
-today; Slack is PER-295) and ``build_stack`` puts them, plus any injected ``channels``, in one
+Channels (PER-292). ``build_channels`` builds one adapter per enabled channel (iMessage,
+and Slack since PER-295) and ``build_stack`` puts them, plus any injected ``channels``, in one
 ``gateway.hub.ChannelHub``. Every component below gets the hub as its ``channel``: none of
 them names an adapter. The router accepts messages from every adapter in the hub.
 
@@ -104,7 +104,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from resonant.backup import health_check as backup_health
 from resonant.brain.facts import FactStore, facts_dir
@@ -119,6 +119,7 @@ from resonant.extensions.pulse_job import JOB_ID as PULSE_JOB
 from resonant.extensions.recover import Recovery
 from resonant.extensions.scheduler import CoreDeps
 from resonant.gate import PolicyGate
+from resonant.gate.types import Gate
 from resonant.gateway.channel import Channel
 from resonant.gateway.hub import ChannelHub
 from resonant.gateway.imessage.channel import IMessageChannel
@@ -193,19 +194,42 @@ def route_event(router: RouteFn, notifier: Notifier, pulse: Pulse | None = None)
     return route
 
 
+@runtime_checkable
+class GateBound(Protocol):
+    """An adapter that resolves approvals itself (Slack's buttons, PER-295)."""
+
+    gate: Gate | None
+
+    def bind_gate(self, gate: Gate) -> None: ...
+
+
 def build_channels(
     settings: Settings,
     principals: Principals,
     conn: sqlite3.Connection,
     *,
     osa_runner: OsaRunner | None = None,
+    secrets: SecretStore | None = None,
+    gate: Gate | None = None,
 ) -> dict[str, Channel]:
     """One adapter per enabled channel, by name, in ``ChannelsConfig`` order (iMessage
-    first). PER-295 adds Slack here."""
+    first, then Slack). Slack (PER-295) reads its tokens from ``secrets`` (default: this
+    instance's Keychain service) and resolves button clicks through ``gate``; its module
+    (and ``slack_sdk``) is imported only when it is enabled."""
     out: dict[str, Channel] = {}
     if settings.channels.imessage.enabled:
         out["imessage"] = IMessageChannel(
             settings.channels.imessage, principals, conn, runner=osa_runner
+        )
+    if settings.channels.slack.enabled:
+        from resonant.gateway.slack import SlackChannel
+
+        out["slack"] = SlackChannel(
+            settings.channels.slack,
+            principals,
+            conn,
+            secrets=secrets or SecretStore(service=settings.keychain_service),
+            gate=gate,
         )
     return out
 
@@ -396,8 +420,18 @@ def build_stack(
         client = OllamaClient(settings.model)
         model, close_model = client, client.aclose
 
-    adapters = build_channels(settings, components.principals, conn, osa_runner=osa_runner)
+    adapters = build_channels(
+        settings,
+        components.principals,
+        conn,
+        osa_runner=osa_runner,
+        secrets=components.executor.secrets,
+        gate=components.gate,
+    )
     adapters.update(channels or {})
+    for adapter in adapters.values():  # an injected Slack adapter resolves clicks too
+        if isinstance(adapter, GateBound) and adapter.gate is None:
+            adapter.bind_gate(components.gate)
     channel = ChannelHub(adapters, components.principals, conn)
     router = Router(
         conn,
