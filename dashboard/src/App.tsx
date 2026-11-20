@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { Dashboard } from "@/Dashboard";
+import { InstanceDashboard } from "@/Instances";
 import { SupabaseGate } from "@/SupabaseGate";
 import { TriangleAlert } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { loadConfig } from "@/lib/config";
-import { loadLocal } from "@/lib/local";
-import { loadLocalDay } from "@/lib/panelDays";
+import { type InstanceRef, loadLocalInstances, localLoaderFor } from "@/lib/instances";
+import { type DayLoader, loadLocalDay } from "@/lib/panelDays";
 import { createRemoteClient, type RemoteClient } from "@/lib/supabase";
 
 type State =
@@ -45,7 +45,7 @@ export function App({ makeRemote = createRemoteClient }: AppProps) {
     case "loading":
       return null;
     case "local":
-      return <Dashboard load={loadLocal} loadDay={loadLocalDay} />;
+      return <LocalInstances />;
     case "supabase":
       return <SupabaseGate client={state.client} />;
     case "error":
@@ -59,4 +59,23 @@ export function App({ makeRemote = createRemoteClient }: AppProps) {
         </div>
       );
   }
+}
+
+/** Archived panel days are this daemon's own: another instance's page has none (yet). */
+const localDays = (inst: InstanceRef | null): DayLoader | undefined => (!inst || inst.self ? loadLocalDay : undefined);
+
+/** The local page: this daemon's dashboard at once, and a switcher when `GET /api/instances`
+ * lists another instance (PER-306). */
+function LocalInstances() {
+  const [instances, setInstances] = useState<InstanceRef[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void loadLocalInstances().then((list) => {
+      if (alive) setInstances(list);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return <InstanceDashboard instances={instances} loaderFor={localLoaderFor} dayLoaderFor={localDays} />;
 }

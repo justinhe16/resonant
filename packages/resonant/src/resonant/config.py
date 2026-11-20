@@ -152,6 +152,31 @@ class NotifyOwnerConfig(_Section):
         return validate_ref(v)
 
 
+class InstanceLink(_Section):
+    """PER-306: another instance on this Mac whose dashboard this daemon's page can switch to
+    (``instances: [{name: cori, url: http://127.0.0.1:7778}]``). The API proxies its
+    ``/api/dashboard`` over loopback (``GET /api/instances/<name>/dashboard``), so the page
+    stays same-origin. Read-only: nothing is ever sent to it but that GET."""
+
+    name: str
+    url: str  # its loopback API's base URL
+
+    @field_validator("name")
+    @classmethod
+    def _slug(cls, v: str) -> str:
+        return inst.validate_name(v)
+
+    @field_validator("url")
+    @classmethod
+    def _loopback_url(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme != "http" or not is_loopback(parsed.hostname or ""):
+            raise ValueError("instances[].url must be an http URL on a loopback host")
+        if parsed.path not in ("", "/") or parsed.query or parsed.username or parsed.password:
+            raise ValueError("instances[].url is the API's base URL, like http://127.0.0.1:7778")
+        return v.rstrip("/")
+
+
 class HealthConfig(_Section):
     healthchecks_url: str | None = None
     ping_every_s: float = Field(default=60.0, gt=0)
@@ -1287,6 +1312,8 @@ class Settings(BaseSettings):
     brain: BrainConfig = Field(default_factory=BrainConfig)
     # PER-301: another instance's bridge to personal Resonant (None: no forwarding)
     notify_owner: NotifyOwnerConfig | None = None
+    # PER-306: the other instances the dashboard can switch to (empty: no switcher)
+    instances: list[InstanceLink] = Field(default_factory=list[InstanceLink], max_length=8)
 
     @field_validator("home")
     @classmethod
@@ -1403,6 +1430,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"notify_owner is for another instance; {inst.DEFAULT_INSTANCE} texts the owner"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _other_instances(self) -> Self:
+        """PER-306: each linked instance once, and never this one."""
+        names = [i.name for i in self.instances]
+        if len(set(names)) != len(names):
+            raise ValueError("instances: each name at most once")
+        if self.instance.name in names:
+            raise ValueError(f"instances: {self.instance.name} is this instance")
         return self
 
     @model_validator(mode="after")

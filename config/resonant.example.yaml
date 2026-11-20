@@ -221,3 +221,10 @@ pulse:
 #       path: ~/work/dori               # checkout elsewhere than <code_dir>/dori
 #       allow_github_changes: false     # refuses .github/ changes (unset keeps the default: on)
 #       quote_ask: true                 # quote your ask in the PR body (unset keeps the default)
+
+# PER-306: other Resonant instances on this Mac the dashboard can switch to (a header switcher,
+# "Resonant · Cori"). The page reads each one through this daemon over loopback, with its Remote
+# Control links and approval codes left out. Unset: no switcher, nothing changes.
+# instances:
+#   - name: cori
+#     url: http://127.0.0.1:7778          # its api.host:api.port (loopback http only)

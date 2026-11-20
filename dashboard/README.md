@@ -30,7 +30,7 @@ DASHBOARD_FIXTURE=local npm run dev   # serves src/test/fixtures/local.json at /
 npm run dev                           # proxies /api to a running daemon on 127.0.0.1:7777
 ```
 
-`DASHBOARD_FIXTURE` also takes `remote`, `remote-v1` (an old daemon's text-free push) and `empty`. The fixtures are real snapshots: `tests/test_dashboard_snapshot.py` validates them against the Pydantic models, and `remote.json` must be `local.json` without its links and approval codes (the Remote Control links, approval `code`s and each panel's `local_url`).
+`DASHBOARD_FIXTURE` also takes `remote`, `remote-v1` (an old daemon's text-free push), `empty` and `cori` (PER-306: registered jobs, Slack, a member's run). The fixtures are real snapshots: `tests/test_dashboard_snapshot.py` validates them against the Pydantic models, and `remote.json` must be `local.json` without its links and approval codes (the Remote Control links, approval `code`s and each panel's `local_url`).
 
 ## Extension panels (PER-280)
 

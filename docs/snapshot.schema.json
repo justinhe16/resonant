@@ -150,6 +150,19 @@
           "title": "Outside",
           "type": "array"
         },
+        "requested_by": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Requested By"
+        },
         "run_code": {
           "anyOf": [
             {
@@ -344,6 +357,25 @@
         "write"
       ],
       "title": "BrainTool",
+      "type": "object"
+    },
+    "Channels": {
+      "additionalProperties": false,
+      "description": "PER-306: the live channel adapters beyond iMessage (iMessage is a health row).",
+      "properties": {
+        "slack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlackStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Channels",
       "type": "object"
     },
     "ClaudeBrain": {
@@ -2483,6 +2515,150 @@
       "title": "Questions",
       "type": "object"
     },
+    "RegisteredJob": {
+      "additionalProperties": false,
+      "description": "PER-298's registered job (``store.jobs``): cron plus a prompt, one worker run per\nfiring. The prompt and memory never ship; the name is the creator's words.",
+      "properties": {
+        "created_by": {
+          "maxLength": 40,
+          "title": "Created By",
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 16,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "maxLength": 16,
+          "title": "Kind",
+          "type": "string"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Error"
+        },
+        "last_run_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Run At"
+        },
+        "last_run_code": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Run Code"
+        },
+        "last_run_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "queued",
+                "running",
+                "waiting",
+                "ready",
+                "merged",
+                "failed",
+                "cancelled",
+                "no_changes",
+                "done"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Run Status"
+        },
+        "name": {
+          "maxLength": 64,
+          "title": "Name",
+          "type": "string"
+        },
+        "next_due": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Due"
+        },
+        "output": {
+          "maxLength": 64,
+          "title": "Output",
+          "type": "string"
+        },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
+        "schedule": {
+          "maxLength": 100,
+          "title": "Schedule",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "active",
+            "paused"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "tz": {
+          "maxLength": 64,
+          "title": "Tz",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "state",
+        "schedule",
+        "tz",
+        "next_due",
+        "last_run_code",
+        "last_run_status",
+        "last_run_at",
+        "last_error",
+        "created_by",
+        "output"
+      ],
+      "title": "RegisteredJob",
+      "type": "object"
+    },
     "RepoItem": {
       "additionalProperties": false,
       "properties": {
@@ -2841,6 +3017,19 @@
           "maxLength": 100,
           "title": "Repo",
           "type": "string"
+        },
+        "requested_by": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Requested By"
         },
         "session_seconds": {
           "title": "Session Seconds",
@@ -3232,6 +3421,39 @@
         "series"
       ],
       "title": "SeriesWidget",
+      "type": "object"
+    },
+    "SlackStatus": {
+      "additionalProperties": false,
+      "description": "PER-295's adapter, as ``/api/channels`` reports it.",
+      "properties": {
+        "connected": {
+          "title": "Connected",
+          "type": "boolean"
+        },
+        "followed_threads": {
+          "title": "Followed Threads",
+          "type": "integer"
+        },
+        "last_event_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Event At"
+        }
+      },
+      "required": [
+        "connected",
+        "last_event_at",
+        "followed_threads"
+      ],
+      "title": "SlackStatus",
       "type": "object"
     },
     "Slots": {
@@ -3993,6 +4215,17 @@
     "brain_activity": {
       "$ref": "#/$defs/BrainActivity"
     },
+    "channels": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Channels"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "claude_brain": {
       "anyOf": [
         {
@@ -4050,6 +4283,13 @@
         }
       ],
       "default": null
+    },
+    "jobs": {
+      "items": {
+        "$ref": "#/$defs/RegisteredJob"
+      },
+      "title": "Jobs",
+      "type": "array"
     },
     "last_tick": {
       "anyOf": [
