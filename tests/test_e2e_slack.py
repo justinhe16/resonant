@@ -214,6 +214,122 @@ async def test_mention_thread_reply_and_approval_buttons(
         assert web.posts[-1].channel == "C0DIGEST"
 
 
+async def test_registered_job_from_slack(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-298: Brian's words add a job (asked with buttons, approved by his click; the reply
+    says the cron in words and the next time); run now starts a worker whose end text lands
+    in the thread; list, pause, resume and delete work from Slack."""
+    async with slack_daemon(tmp_path, resonant_home, chat, monkeypatch) as (w, d, web, socket):
+        job = {
+            "schedule": "0 9 * * 1",
+            "prompt": "check flaky CI and file tickets",
+            "name": "flaky CI",
+        }
+        w.claude(calls=[{"name": "add_job", "args": job}], answer="Asked: {r0}")
+        await socket.deliver(
+            mention(
+                BRIAN,
+                f"<@{BOT}> every Monday at 9 check flaky CI and file tickets",
+                team=TEAM_ID,
+                ts=ROOT,
+            )
+        )
+        await until(lambda: any(p.buttons for p in in_thread(web)), 60, "the add_job prompt")
+        prompt = next(p for p in in_thread(web) if p.buttons)
+        assert "every Monday at 09:00" in prompt.text
+        (row,) = d.conn.execute("SELECT id, code FROM approvals WHERE status = 'pending'")
+        await socket.deliver(
+            click(
+                BRIAN,
+                row["id"],
+                row["code"],
+                team=TEAM_ID,
+                channel="C0GENERAL",
+                ts=prompt.ts,
+                thread_ts=ROOT,
+                action_ts="1800000010.000001",
+            )
+        )
+        await until(
+            lambda: any(
+                p.text.startswith("Added J1 (flaky CI): every Monday at 09:00")
+                for p in in_thread(web)
+            ),
+            30,
+            "the added reply",
+        )
+        added = next(p.text for p in in_thread(web) if p.text.startswith("Added J1"))
+        assert "Next: Mon " in added and "Output: this thread." in added
+
+        clicks = iter(range(20, 40))
+
+        async def ask(call: dict[str, object], ts: str, expect: str) -> None:
+            """Brian asks in the thread (Claude calls ``call``). His turns are outside words
+            (PER-304), so a write asks first: his click approves it."""
+            w.claude(calls=[call], answer="{r0}")
+            n = len(web.posts)
+            await socket.deliver(
+                message(BRIAN, "cori, the job", team=TEAM_ID, ts=ts, thread_ts=ROOT)
+            )
+
+            def seen() -> bool:
+                return any(expect in p.text for p in in_thread(web, n))
+
+            def asked() -> bool:
+                return any(p.buttons for p in in_thread(web, n))
+
+            await until(lambda: seen() or asked(), 60, expect)
+            if not seen():
+                prompt = next(p for p in in_thread(web, n) if p.buttons)
+                (row,) = d.conn.execute(
+                    "SELECT id, code FROM approvals WHERE status = 'pending'"
+                ).fetchall()
+                await socket.deliver(
+                    click(
+                        BRIAN,
+                        row["id"],
+                        row["code"],
+                        team=TEAM_ID,
+                        channel="C0GENERAL",
+                        ts=prompt.ts,
+                        thread_ts=ROOT,
+                        action_ts=f"18000000{next(clicks)}.000001",
+                    )
+                )
+                await until(seen, 60, expect)
+
+        await ask({"name": "list_jobs", "args": {}}, "1700000020.000100", "flaky CI")
+        await ask(
+            {"name": "run_job_now", "args": {"id": "J1"}},
+            "1700000021.000100",
+            "J1 (flaky CI) started R1.",
+        )
+        await until(lambda: not w.run("R1").active, 60, "R1 to end")  # the fake ends it
+        # the run is Brian's, and its end text goes to the job's output: this thread
+        assert w.run("R1").principal == "brian"
+        await until(
+            lambda: any(p.text.startswith("R1") for p in in_thread(web)), 60, "R1's end text"
+        )
+        await ask(
+            {"name": "pause_job", "args": {"id": "J1"}},
+            "1700000022.000100",
+            "Paused J1 (flaky CI).",
+        )
+        await ask(
+            {"name": "resume_job", "args": {"id": "J1"}},
+            "1700000023.000100",
+            "Resumed J1 (flaky CI).",
+        )
+        await ask(
+            {"name": "delete_job", "args": {"id": "J1"}},
+            "1700000024.000100",
+            "Deleted J1 (flaky CI).",
+        )
+        state = d.conn.execute("SELECT state, created_by FROM registered_jobs").fetchone()
+        assert tuple(state) == ("deleted", "brian")
+
+
 async def test_the_hourly_heartbeat_posts_once_to_the_pulse_room(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:

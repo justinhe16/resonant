@@ -750,16 +750,18 @@ async def beat(h: Harness, due: datetime, *, owner: str | None = OWNER) -> dict[
 
 
 def registered_job(h: Harness, job_id: str, schedule: str, *, state: str = "active") -> None:
-    """A row of PER-298's ``registered_jobs`` (only the columns the heartbeat reads)."""
-    with atomic(h.db):
-        h.db.execute(
-            "CREATE TABLE IF NOT EXISTS registered_jobs (id TEXT PRIMARY KEY, kind TEXT, "
-            "schedule TEXT, tz TEXT, state TEXT)"
-        )
-        h.db.execute(
-            "INSERT INTO registered_jobs VALUES (?, 'schedule', ?, ?, ?)",
-            (job_id, schedule, TZ, state),
-        )
+    """A row of PER-298's ``registered_jobs`` through its store (``job_id`` is ``J<n>``)."""
+    from resonant.store import jobs as jobs_store
+
+    while True:  # ids below job_id are fillers, deleted at once
+        job = jobs_store.create(h.db, name=job_id, schedule=schedule, tz=TZ, prompt="p",
+                                repo=None, output="dm", created_by=OWNER, channel_ref=None,
+                                now=T9)  # fmt: skip
+        if job.id == job_id:
+            break
+        jobs_store.set_state(h.db, job.id, "deleted", T9, expect=("active",))
+    if state != "active":
+        jobs_store.set_state(h.db, job.id, state, T9, expect=("active",))  # type: ignore[arg-type]
 
 
 def running(h: Harness, n: int) -> list[str]:

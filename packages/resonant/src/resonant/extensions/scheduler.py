@@ -45,7 +45,9 @@ is ``extensions.notify.Notifier``'s, through the loop's router hook.
 
 Core jobs (``ext="core"``). ``CORE_JOBS`` is a tuple of factories, like ``BUILTIN_MODULES``:
 each gets ``CoreDeps`` at daemon start and returns a ``CoreJob`` (or None when disabled).
-A core job is trusted core code: L0 only, run inline without the gate, with no secrets.
+A core job is trusted core code: L0 only, run inline without the gate, with no secrets. A core job
+with ``quiet_idle`` (``core/registered_jobs``, PER-298) that returns ``{"quiet": true}`` records
+nothing but ``last_due``, and its missed due times are never audited.
 
 Panels (PER-280). An extension's dashboard panels (``Manifest.panels``) are L0 reads run
 inline like an L0 job, through the same ``_call`` (gate audit, secrets, redaction, timeout),
@@ -155,6 +157,10 @@ class CoreJob:
     # sender is core/pulse with the heartbeat on (PER-303): it posts only the room's "⏸ paused"
     # line and skips the owner pulse.
     runs_while_paused: bool = False
+    # PER-298: a run that returns ``{"quiet": true}`` (nothing to do) records nothing: no
+    # ``record_run``, no ``job.run`` audit; its missed due times aren't audited either
+    # (``core/registered_jobs`` polls every minute and decides each job's own).
+    quiet_idle: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,6 +208,14 @@ def mcp_drift_job(deps: CoreDeps) -> CoreJob | None:
     return factory(deps)
 
 
+def registered_jobs_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/registered_jobs`` (PER-298, ``resonant.registered_jobs``), imported late like
+    ``watches_job``."""
+    from resonant.registered_jobs import registered_jobs_job as factory
+
+    return factory(deps)
+
+
 def watches_job(deps: CoreDeps) -> CoreJob | None:
     """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
     gate and the router, which this module must not pull in at import time."""
@@ -219,6 +233,7 @@ CORE_JOBS: tuple[CoreJobFactory, ...] = (
     store_upkeep_job,
     remind_job,
     mcp_drift_job,
+    registered_jobs_job,
 )
 
 
@@ -232,6 +247,7 @@ class ScheduledJob:
     catchup: timedelta | None = None
     core: bool = False
     runs_while_paused: bool = False
+    quiet_idle: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -514,6 +530,7 @@ class Scheduler:
                         core.catchup,
                         True,
                         runs_while_paused=core.runs_while_paused,
+                        quiet_idle=core.quiet_idle,
                     )
                 )
         return cls(
@@ -686,7 +703,7 @@ class Scheduler:
         with transaction(self.conn):
             store.mark_due(self.conn, job.ext, job.job_id, d.last_due)
             self._audit_missed(job, d)
-            for due in d.skipped:
+            for due in () if job.quiet_idle else d.skipped:  # PER-298: a poll's are noise
                 self._audit(job, "job.skipped_paused", due)
             if d.outcome is Outcome.OVERLAP and d.due is not None:
                 self._audit(job, "job.overlap", d.due)
@@ -713,6 +730,8 @@ class Scheduler:
         )
 
     def _audit_missed(self, job: ScheduledJob, d: Decision) -> None:
+        if job.quiet_idle:
+            return  # PER-298: a poll's missed minutes mean nothing (it decides its own)
         for due in d.missed:
             self._audit(job, "job.missed", due, truncated=d.truncated)
 
@@ -1063,6 +1082,8 @@ class Scheduler:
             store.mark_due(self.conn, job.ext, job.job_id, d.last_due)
             self._audit_missed(job, d)
             match r.outcome:
+                case "ok" if job.quiet_idle and r.data == {"quiet": True}:
+                    pass  # PER-298: nothing to do, so nothing recorded but ``last_due``
                 case "ok":
                     store.record_run(self.conn, job.ext, job.job_id, at=now, outcome="ok", ok=True)
                     first = not job.core and take_baseline(self.conn, job.ext, job.job_id)

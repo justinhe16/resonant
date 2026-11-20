@@ -40,6 +40,7 @@ from resonant.principals import Principal, Principals, load_principals
 from resonant.runners.local import MODEL_RESULT_MAX_CHARS, LocalRunner
 from resonant.secrets import SecretStore
 from resonant.tools import ToolRegistry
+from resonant.tools import jobs as job_tools
 from resonant.tools import notes as notes_tools
 from resonant.tools import ops as ops_tools
 from resonant.tools import repos as repos_tools
@@ -157,6 +158,7 @@ def summary_actions(
         actions[(None, spec.name)] = trust_rule
     actions[(None, repos_tools.MERGE_CI_PR.name)] = repos_tools.summary_action
     actions[(None, watch_tools.CREATE_WATCH.name)] = watch_tools.summary_action
+    actions[(None, job_tools.ADD_JOB.name)] = job_tools.summary_action
     if registry is not None:
         reg = registry
 
