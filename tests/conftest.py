@@ -22,15 +22,30 @@ _REAL_HOMES = tuple(
 )
 # What no test may create, delete, change, run a process in or connect to: the live run
 # dirs, the owner's checkouts and Resonant's state (the daemon may be running beside us).
+# PER-290: Cori's too (``~/cori``: her run and code dirs), and every other instance's home
+# (``~/.resonant-<name>``, matched by prefix in ``protected_path``).
 PROTECTED = tuple(
     dict.fromkeys(
         root
         for h in _REAL_HOMES
-        for name in ("resonant-runs", "code", ".resonant")
+        for name in ("resonant-runs", "code", ".resonant", "cori")
         # the link and its target: ~/code may be a symlink to another volume
         for root in (os.path.join(h, name), os.path.realpath(os.path.join(h, name)))
     )
 )
+_INSTANCE_HOME_PREFIX = ".resonant-"
+
+
+def _instance_home(path: str) -> bool:
+    """``path`` is in some ``~/.resonant-<name>`` of a real home (PER-290)."""
+    for h in _REAL_HOMES:
+        if path.startswith(h + os.sep):
+            first = path[len(h) + 1 :].split(os.sep, 1)[0]
+            if first.startswith(_INSTANCE_HOME_PREFIX) and len(first) > len(_INSTANCE_HOME_PREFIX):
+                return True
+    return False
+
+
 # ... except the checkout these tests run from (a worker runs them in its worktree under
 # ~/code/.worktrees: pytest's cache, __pycache__, the venv) and the temp dir (a worker's
 # TMPDIR can be under its run dir in ~/resonant-runs).
@@ -61,7 +76,7 @@ def protected_path(raw: object) -> str | None:
     if not os.path.isabs(text):
         return None
     real = os.path.realpath(text)
-    if _under(real, PROTECTED) and not _under(real, _EXEMPT):
+    if (_under(real, PROTECTED) or _instance_home(real)) and not _under(real, _EXEMPT):
         return real
     return None
 
@@ -133,7 +148,8 @@ def user_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture(autouse=True)
 def never_the_real_dirs() -> Iterator[None]:
     """PER-271: fail any test that creates, deletes or changes anything under the real
-    ``~/resonant-runs``, ``~/code`` or ``~/.resonant``, runs a process there or opens its
+    ``~/resonant-runs``, ``~/code``, ``~/.resonant`` (PER-290: or ``~/.resonant-<name>``,
+    ``~/cori``), runs a process there or opens its
     sockets or DB (an audit hook sees every file write, removal, ``Popen`` and socket)."""
     touched.clear()
     yield
