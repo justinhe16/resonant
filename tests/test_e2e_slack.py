@@ -171,7 +171,14 @@ def in_thread(web: FakeSlackWeb, after: int = 0) -> list[Post]:
 async def test_mention_thread_reply_and_approval_buttons(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with slack_daemon(tmp_path, resonant_home, chat, monkeypatch) as (w, d, web, socket):
+    # tick_s: a button click resolves the gate without waking the loop, so the resumed task
+    # waits for the next tick (30 s by default, as long as the waits below)
+    async with slack_daemon(tmp_path, resonant_home, chat, monkeypatch, tick_s=1.0) as (
+        w,
+        d,
+        web,
+        socket,
+    ):
         assert d.stack is not None and d.stack.channel.names == ("slack",)
         slack = d.stack.channel.adapter("slack")
         assert isinstance(slack, SlackChannel) and slack.gate is d.state.components.gate  # type: ignore[union-attr]
@@ -279,7 +286,14 @@ async def test_registered_job_from_slack(
     """PER-298: Brian's words add a job (asked with buttons, approved by his click; the reply
     says the cron in words and the next time); run now starts a worker whose end text lands
     in the thread; list, pause, resume and delete work from Slack."""
-    async with slack_daemon(tmp_path, resonant_home, chat, monkeypatch) as (w, d, web, socket):
+    # tick_s: a button click resolves the gate without waking the loop, so the resumed task
+    # waits for the next tick (30 s by default, as long as the waits below)
+    async with slack_daemon(tmp_path, resonant_home, chat, monkeypatch, tick_s=1.0) as (
+        w,
+        d,
+        web,
+        socket,
+    ):
         job = {
             "schedule": "0 9 * * 1",
             "prompt": "check flaky CI and file tickets",
