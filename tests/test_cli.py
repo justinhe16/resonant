@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 from typer.testing import CliRunner
 
@@ -15,9 +17,10 @@ def test_help_lists_daemon_commands() -> None:
 
 def test_help_lists_the_instance_option() -> None:
     """PER-297: every command can target an instance (tests/test_instance.py has the matrix)."""
-    result = CliRunner().invoke(app, ["--help"])
+    result = CliRunner().invoke(app, ["--help"], env={"NO_COLOR": "1", "TERM": "dumb"})
     assert result.exit_code == 0
-    assert "--instance" in result.output
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # rich styles each part in CI
+    assert "--instance" in plain
 
 
 def test_instance_flag_and_env_must_agree(monkeypatch: pytest.MonkeyPatch) -> None:
