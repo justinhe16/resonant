@@ -914,6 +914,29 @@ async def test_sandbox_self_check_fails_closed(tmp_path: Path, db: sqlite3.Conne
     assert h.branches() == ["main"]
 
 
+class _Bridge:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bool]] = []
+
+    def forward(self, key: str, title: str, *, clear: bool = False) -> None:
+        self.calls.append((key, title, clear))
+
+
+async def test_an_urgent_failure_goes_to_the_owner_bridge(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-301: on an instance with notify_owner, a run's urgent failure is also forwarded to
+    personal Resonant (its own text is unchanged)."""
+    bridge = _Bridge()
+    h = build(tmp_path, db, scenario="error", bridge=bridge)
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed"
+    assert h.chan.texts() == [f"R1 (fix the flaky test) failed: {run.failure}"]
+    assert bridge.calls == [("run/R1", f"R1 failed: {run.failure}", False)]
+
+
 async def test_the_reply_is_code_built_and_clipped(tmp_path: Path, db: sqlite3.Connection) -> None:
     h = build(tmp_path, db, scenario="error")
     await h.start()

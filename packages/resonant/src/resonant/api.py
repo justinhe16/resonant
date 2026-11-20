@@ -14,6 +14,7 @@ Every response carries a strict CSP (scripts from this origin only, no framing) 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import re
 import sqlite3
@@ -23,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -33,14 +34,19 @@ from resonant.config import Settings, is_loopback
 from resonant.dashboard.diagram import cached_scan
 from resonant.dashboard.snapshot import Snapshot, build_snapshot, panel_day
 from resonant.extensions.panel_history import parse_day
+from resonant.gateway.channel import ChannelError
 from resonant.loop import Loop
 from resonant.monitor import channels_snapshot
+from resonant.notify_owner import MAX_BODY, bearer, parse_body, token_ref_for
+from resonant.notify_owner import PATH as NOTIFY_OWNER_PATH
 from resonant.redact import Redactor
+from resonant.secrets import SecretError, SecretMissing, SecretStore
 from resonant.status import collect_status
 from resonant.store import extensions as ext_store
 
 if TYPE_CHECKING:
     from resonant.components import Components
+    from resonant.extensions.pulse import Pulse
     from resonant.monitor import HealthMonitor
 
 # packages/resonant/src/resonant/api.py -> <repo>/dashboard/dist
@@ -73,6 +79,7 @@ class DaemonState:
     started_at: datetime
     components: Components | None = None  # set by the daemon after construction
     monitor: HealthMonitor | None = None  # set when the health monitor runs (iMessage on)
+    pulse: Pulse | None = None  # set when the channel stack runs (PER-301's notify-owner)
     # (monotonic time, ClaudeRunner.setup_gaps() list) of the last runner check
     runner_check: tuple[float, list[str]] | None = field(default=None, repr=False)
     runner_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -207,6 +214,54 @@ def _owner(state: DaemonState) -> str | None:
     return c.principals.owner if c is not None and c.principals_loaded else None
 
 
+def _secrets(state: DaemonState) -> SecretStore:
+    c = state.components
+    found = None if c is None else c.executor.secrets
+    return found if found is not None else SecretStore(service=state.settings.keychain_service)
+
+
+async def notify_owner(state: DaemonState, request: Request) -> JSONResponse:
+    """PER-301 ``POST /api/notify-owner`` (``resonant.notify_owner``): another instance's
+    urgent alert, texted to the owner as personal Resonant's own. 401 without a bearer token
+    or with the wrong one, 422 for any other body than the contract's (nothing stored), 404
+    when this daemon has no channel or no ``core/notify_token_<instance>``."""
+    token = bearer(request.headers.get("authorization"))
+    if token is None:
+        return JSONResponse({"detail": "missing bearer token"}, status_code=401)
+    length = request.headers.get("content-length")
+    if length is not None and length.isdigit() and int(length) > MAX_BODY:
+        return JSONResponse({"detail": f"body over {MAX_BODY} bytes"}, status_code=422)
+    raw = await request.body()
+    body = parse_body(raw)
+    if isinstance(body, str):
+        return JSONResponse({"detail": body}, status_code=422)
+    pulse = state.pulse
+    ref = token_ref_for(body.instance)
+    if pulse is None or ref is None or body.instance == state.settings.instance.name:
+        return JSONResponse({"detail": "not set up"}, status_code=404)
+    try:
+        expected = await _secrets(state).get(ref)
+    except SecretMissing:
+        return JSONResponse({"detail": "not set up"}, status_code=404)
+    except SecretError as e:
+        log.warning("notify-owner token unreadable: %s", e)
+        return JSONResponse({"detail": "keychain unavailable"}, status_code=503)
+    if not hmac.compare_digest(token.encode(), expected.encode()):
+        log.warning("notify-owner: wrong token for instance %s", body.instance)
+        return JSONResponse({"detail": "notify token mismatch"}, status_code=401)
+    try:
+        outcome, reason = await pulse.ingest_instance(
+            body.instance, body.key, body.title, clear=body.clear
+        )
+    except ValueError as e:  # the store's own checks (parse_body should have caught it)
+        return JSONResponse({"detail": str(e)[:200]}, status_code=422)
+    except ChannelError as e:  # stored untold: the instance's retry sends it
+        log.warning("notify-owner text failed: %s", type(e).__name__)
+        return JSONResponse({"detail": "channel unavailable"}, status_code=503)
+    log.info("notify-owner from %s: %s", body.instance, outcome)
+    return JSONResponse({"outcome": outcome, "reason": reason})
+
+
 def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="resonant", version=__version__, docs_url=None, redoc_url=None)
     app.add_middleware(LoopbackOnly)
@@ -266,6 +321,10 @@ def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> Fas
             }
             for s in state.components.registry.specs()
         ]
+
+    @app.post(NOTIFY_OWNER_PATH)
+    async def notify_owner_route(request: Request) -> JSONResponse:  # pyright: ignore[reportUnusedFunction]
+        return await notify_owner(state, request)
 
     @app.get("/api/channels")
     async def channels() -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]

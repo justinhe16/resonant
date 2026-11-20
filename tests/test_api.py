@@ -282,3 +282,30 @@ async def test_serves_the_committed_build(db: sqlite3.Connection) -> None:
     assert index.status_code == 200 and '<div id="root">' in index.text
     assert "<script>" not in index.text  # no inline script: the CSP allows none
     assert config == {"source": "local"}
+
+
+# --- PER-301: POST /api/notify-owner (the full contract: test_notify_owner.py) ------------
+
+
+async def test_notify_owner_needs_a_token_and_a_channel(db: sqlite3.Connection) -> None:
+    from resonant.secrets import FakeKeychain, SecretStore
+
+    settings = load_settings()
+    state = DaemonState(settings, db, Loop(db, {}, settings.loop, SlotPool(2, 1)), utcnow())
+    keychain = FakeKeychain(items={"core/notify_token_cori": "cori-token-0123456789"})
+    state.components = cast(
+        Components,
+        SimpleNamespace(executor=SimpleNamespace(secrets=SecretStore(keychain)), runners={}),
+    )
+    body = {"instance": "cori", "key": "k", "title": "t", "urgency": "urgent", "clear": False}
+    transport = httpx.ASGITransport(app=create_app(state))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        missing = await client.post("/api/notify-owner", json=body)
+        no_stack = await client.post(
+            "/api/notify-owner", json=body, headers={"Authorization": "Bearer x"}
+        )
+        remote = await client.post("/api/notify-owner", json=body, headers={"Host": "evil.example"})
+    assert missing.status_code == 401
+    assert no_stack.status_code == 404  # no channel stack: nothing can text the owner
+    assert remote.status_code == 403  # loopback only, like every route
+    assert db.execute("SELECT COUNT(*) FROM pulse_items").fetchone()[0] == 0

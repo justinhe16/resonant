@@ -41,6 +41,15 @@ ops:
 runner:
   self_repo: false                      # no "resonant" repo for her workers (GD-1)
 
+# PER-301: forward every urgent item to personal Resonant, which texts the owner over iMessage
+# ([Cori] 🔴 ...). The token is the same value in two Keychains, set by the owner:
+#   resonant --instance cori secret set core/notify_token    (here)
+#   resonant secret set core/notify_token_cori               (personal Resonant)
+# then `resonant --instance cori notify-owner test`.
+notify_owner:
+  url: http://127.0.0.1:7777            # personal Resonant's loopback API
+  token_ref: core/notify_token
+
 # --- added by later Phase 8 tickets; leave commented until they land ---------------------
 #
 # PER-291 (Cori's scope): worker and brain rules, scoped worker env, own Claude config dir

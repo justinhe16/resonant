@@ -728,6 +728,7 @@ Settings.daemon_label -> str
 - **CLI (PER-290).** `resonant pause --by <source>` engages the kill switch as `<source>` (`[a-z]+:[A-Za-z0-9@.+_-]{1,64}`, else exit 2). `resonant resume --if-by <source>` releases it only when `paused_by` is `<source>` (exit 3 and stays paused otherwise; `not paused` exits 4, shown as `Cori: wasn't paused`). A pause older than `paused_by` gets `unrecorded:before-sources` on the next engage, so a fan-out never claims it. A failed pre-migration backup is reported and the restarts still go ahead (the daily copies remain).
 - **Backups (PER-290).** A non-default instance names its copies `<name>-YYYY-MM-DD.db`; `copies`/`prune` take a `prefix` (`backup.prefix_of(settings)`), so two instances may share `backup.extra_dir`: each keeps and prunes only its own.
 - **Guards (PER-290).** The brain's shell never-list (`gate.shell.ShellPolicy(others=…)`, from `components.shell_policy`) refuses writes under this instance's home, every sibling's `RESONANT_HOME` and any `~/.resonant` / `~/.resonant-<name>` (except this brain's own `<home>/ask`). The restore guard (`cli._daemon_pids`) counts only `resonant daemon run` processes whose env picks this home (an unreadable env still counts). `tests/conftest.py` also guards `~/.resonant-*` and `~/cori`.
+- **Notify-owner bridge (PER-301).** An instance with `notify_owner:` forwards its urgent items to personal Resonant's `POST /api/notify-owner`, which texts them `[Cori] 🔴 …` over iMessage ([Notify-owner bridge](#notify-owner-bridge-resonantnotify_owner-per-301)). Tokens: `core/notify_token` in the instance's Keychain, the same value as `core/notify_token_<name>` in personal Resonant's.
 - **Not yet.** Worker and brain scope (PER-291); the relay keyed by instance (PER-304); Cori-only pause by an approver from Slack (PER-293).
 
 ## Phase 3 config: `resonant.config`
@@ -1090,8 +1091,11 @@ take_baseline(conn, ext, job_id) -> bool                 # once per job per inst
 ```python
 Pulse(conn, *, channel: Sender, recipients: Callable[[str], Sequence[str]],
       manifest_of: Callable[[str], Manifest | None], config: NotifyConfig | None = None,
-      clock=utcnow)
+      clock=utcnow, bridge: OwnerBridge | None = None)
     await .route(event) -> None       # ext.<name>.item events; raises ChannelError to retry
+    await .ingest_instance(instance, key, title, *, clear=False)
+        -> (Outcome, reason | None)   # PER-301: POST /api/notify-owner; sent|held|told|unreachable
+instance_source(name) -> "instance:<name>"; source_label(source) -> None | "Cori" | "<ext>"
 clamp(urgency, grant) -> Urgency      # urgent > normal > low
 notify.sent_in_hour(conn, ext, hour, dedupe_key=None) -> int   # shared immediate-send cap count
 ```
@@ -1105,6 +1109,7 @@ notify.sent_in_hour(conn, ext, hour, dedupe_key=None) -> int   # shared immediat
 - **Clear.** A `clear` of an item last stored urgent is treated as urgent (then clamped); a clear of a never-told item still sends. All recipients refused: `pulse.unreachable`, not marked told, stays pending.
 - **Rendering.** `pulse.render_item(item, mark='', max_chars=300)` / `notify.render_clean(name|None, clean_text, max_chars)` build `[name] <mark> <title>` from an already-clean title (no second clean; `core` items get no prefix). The hourly pulse should reuse them and keep every extension line prefixed.
 - **Normal, low, or already told**: nothing sent; normal and low are pending for the hourly pulse and the briefing.
+- **Another instance's alerts (PER-301).** `ingest_instance` stores an urgent item of source `instance:<name>` (title cleaned, default TTL) and takes the urgent path above with source `instance:<name>`: rendered `[Cori] 🔴 <title>` (`source_label`: the name capitalized, as `instance.display_name` defaults; `✓` for `clear`), once per fingerprint (a repeat is `told`), held while paused, muted (kv `ext.instance:cori.muted_until`: `/ext mute cori` once she has sent one) or over the per-hour cap (counted per `instance:<name>`), with `dedupe_key="pulse:urgent:instance:<name>:<key>:<fingerprint>:<recipient>"`. A `clear` for a key never stored sends nothing; a `clear` of an alert that was held and never texted closes it quietly (stored cleared and told, no ✓). Unlike an extension's urgent send, each sent text is recorded in `system_texts` (kind `pulse`, `outside`, ref = the dedupe key), so both brains see it in the transcript. On an instance with `notify_owner` (`bridge`), `route` also forwards each urgent item it would send (not when paused or muted there) as `forward("ext/<ext>/<key>", "<ext>: <title>", clear=)`.
 - **Shared cap.** `pulse.sent` and `ext.notify_sent` rows count together per extension per clock hour (distinct `idempotency_key`, so a retry never counts twice).
 - **Exactly once.** The event is stored before routing, the send is deduped by event id, `mark_told` runs after it. A crash between them: the retry re-upserts the same untold item, the channel drops the repeat send, `mark_told` runs.
 - **Install screen.** `manager.report_grant(manifest)` gives `reports: may text you any time (urgent)` (an escalation), `Reports: hourly updates (normal)` or `Reports: 8am briefing only (low)`; `update_lines` shows a grant change as `+`/`-` (urgent) or `~ <grant> (was: <old>)`; `manifest_sha` is over the raw manifest bytes, so any grant change forces re-approval. `ext validate` prints the grant too.
@@ -1358,7 +1363,8 @@ HealthMonitor(conn, *, model: ModelProber | None, channel: MonitoredChannel | No
               daemon_healthy: Callable[[], bool], db_path=None, model_meta=None, clock=utcnow,
               sleep=asyncio.sleep, disk_free=..., interval_s=60, ...,
               channels: Mapping[str, MonitoredChannel] | None = None,          # PER-292: adapters to check
-              channel_failures: Callable[[], Mapping[str, str]] | None = None)  # ChannelHub.failures
+              channel_failures: Callable[[], Mapping[str, str]] | None = None,  # ChannelHub.failures
+              bridge: OwnerBridge | None = None)  # PER-301: incidents to personal Resonant
     async def run() -> None            # evaluate() every interval_s until stop()
     async def evaluate() -> dict[check, CheckState]
     def deadman_reason() -> str | None
@@ -2048,6 +2054,7 @@ ChannelsConfig.enabled() -> tuple[str, ...]               # enabled channel name
 - `resonant secret set <ref>`: reads the value from a hidden prompt (asked twice) on a terminal, or one line of stdin otherwise, never from argv; stores it, reads it back and compares (a mismatch removes the item). 0 stored, 1 the entries or the read-back didn't match, 2 a bad ref or value, 75 the Keychain is unavailable. `resonant secret check <ref>`: a no-prompt read; prints `ok (no prompt)` and never the value; 0 ok, 1 missing, 75 unavailable. `resonant secret list [DIR…]`: the secrets declared by installed extensions (`~/.resonant/extensions/*/resonant.yaml`) and any given extension dirs, each `present` or `missing` (no value is read); 75 if the Keychain is unavailable. `resonant secret rm <ref>`: 0 removed, 1 not found, 75 unavailable.
 - `resonant ext panel-history <ext> <panel> [--rebuild [--since YYYY-MM-DD]]` (PER-286): lists a history panel's archived days (day, status, bytes, tries, last error); `--rebuild` queues every kept day (or those from `--since`, which must be inside `keep` and already ended) as `pending` again for the daemon to re-archive one at a time, keeping each old copy until then; audited `panel.history_rebuild`. 0 on success, 1 for an unknown extension or a panel without history or a `--since` outside the range, 2 for a malformed `--since` or `--since` without `--rebuild`. Owner-run; Claude may run it when asked.
 - `resonant ext add <source> [--adopt]`, `ext update <name>`, `ext remove <name> [--purge]`: 0 on success, 1 when refused (bad source, failed checks, wrong typed name, leftovers without `--adopt`, pins changed since the confirmation, not installed), 75 when the store is missing or behind or the Keychain is unavailable. `ext list [--json]`: name, status, source@commit, digest, whether the copy still matches (`ok`, `changed`, `missing`), tool and job counts. `ext validate <dir|file>`: 0 ok, 1 on any schema, name, directory or approver problem.
+- `resonant notify-owner test [--clear]` (PER-301, owner-run: it texts the owner): on an instance with `notify_owner`, POSTs the fixed test alert (`key notify-owner/test`, `TEST_TITLE`; `--clear` its all-clear) to personal Resonant with this instance's token. 0 when personal Resonant took it (prints `texted`, `held (<why>)`, `already told` or `stored, but no channel took the text`), 1 unreachable or refused (401 `notify token mismatch`, 404 `not set up there`, 422), 2 without `notify_owner` in the config, 75 when the Keychain can't be read.
 - `resonant eval router` is gone (PER-256).
 
 ## Local API
@@ -2063,6 +2070,32 @@ All endpoints are loopback only. Remote status goes through the push-only status
 | `GET /api/channels` | `[{name: "imessage", enabled, ok, last_read_at, last_selftest: {ok, at, detail} \| null}]`; `ok` and `last_read_at` are null without a live channel |
 | `GET /api/ext/<name>/panels/<id>/days/<YYYY-MM-DD>` | PER-286: one archived day of a history panel, read-only (`Cache-Control: no-store`): `{ext, panel, day, views, health, truncated, bytes, outside}`, every text through the snapshot's text pass again and no `local_url`. 404 for an unknown extension, panel (or one without `history`), a malformed day, and a day that was never archived, recorded none, or failed. Other methods: 405 |
 | `GET /api/tools` | registered tool specs: `[{name, extension, effect, level, description, args_schema}]` (`level` is the effective level) |
+| `POST /api/notify-owner` | PER-301, the notify-owner bridge ([below](#notify-owner-bridge-resonantnotify_owner-per-301)): another instance's urgent alert, texted to the owner as personal Resonant's own. `Authorization: Bearer <token>` matching `core/notify_token_<instance>` in this daemon's Keychain; body exactly `{instance, key ≤120 ([a-z0-9/._:-]), title ≤200, urgency: "urgent", clear: bool}` (≤2048 bytes). 200 `{outcome: sent\|held\|told\|unreachable, reason}`; 401 missing or wrong token (`{"detail": "notify token mismatch"}`); 422 any other body (a title with nothing printable after `clean_text` included; a `Content-Length` over the cap is refused before the body is read); 404 no token for that instance, the daemon's own name, or no channel stack; 503 Keychain or channel unavailable (stored untold, the retry sends). A refusal stores nothing |
+
+### Notify-owner bridge: `resonant.notify_owner` (PER-301)
+
+```python
+NotifyOwnerConfig(url="http://127.0.0.1:7777", token_ref="core/notify_token", timeout_s=5.0)
+    # Settings.notify_owner (None: no forwarding). Loopback http(s) base URL only; refused on the
+    # default instance (personal Resonant texts the owner; it never forwards to itself)
+NotifyOwnerBody(instance, key, title, urgency: Literal["urgent"], clear: bool = False)  # strict, extra=forbid
+parse_body(raw: bytes) -> NotifyOwnerBody | str          # str: the 422 reason
+token_ref_for(instance) -> "core/notify_token_<instance, - as _>" | None
+owner_key(raw) -> str                                    # a valid pulse key (long ones hashed)
+await post_alert(cfg, token, body, *, transport=None) -> Delivery(status | None, outcome, reason)
+await send_test(cfg, instance, secrets, *, clear=False) -> Delivery    # `resonant notify-owner test`
+OwnerBridge(conn, cfg, *, instance, secrets, channel=None, owner=None, clock=utcnow, transport=None)
+    .forward(key, title, *, clear=False) -> None   # sync, never raises; kv outbox, latest per key wins
+    await .flush() -> int                          # due entries once, oldest first; delivered count
+    await .run() / .stop()                         # the daemon's "notify-owner" task (Stack.bridge)
+    .pending() -> {key: entry}; .next_due_s() -> float
+```
+
+- **Outbox** (kv `notify_owner.outbox`): `{key: {title, clear, seq, queued_at, next_at, attempts}}`, at most 50 (the oldest dropped), an entry older than 24 h dropped undelivered. A flush writes back only entries whose `seq` is unchanged, so a `forward` during the POST is kept.
+- **Answers.** 2xx: removed (audit `notify_owner.sent`). 422: dropped (audit `notify_owner.refused`, a bug: retrying can't help). Anything else (unreachable, 401, 404, 5xx) or no token here: that entry and the rest of the due ones back off 5 s doubling to 300 s.
+- **One DM per problem** (kv `notify_owner.down` `{problem, since, told}`): `unreachable`, `mismatch` (401: "notify token mismatch: …"), `not_set_up` (404) or `no_token`, sent to the owner on this instance's own channel with `dedupe_key="notify-owner:<problem>:<since>"`; a failed DM is tried on the next flush, a refused one counts as told. A delivery clears it.
+- **Callers** (all only with `notify_owner` set): `Pulse.route` (above), `HealthMonitor` (an incident that reaches `alert_after`: `forward("health/<check>", "<check>: <detail>")`, its recovery `clear=True`; kv `notify_owner.health` lists the forwarded checks; independent of whether this instance's own channel can text) and `ClaudeRunner` (a run's `failed` end at level `now`: `forward("run/<code>", "<code> failed: <why>")`).
+- **Never logged at INFO:** titles (message bodies).
 
 ### Dashboard snapshot
 
