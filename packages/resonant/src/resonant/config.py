@@ -586,7 +586,8 @@ class HeartbeatConfig(_Section):
     (the default) is off."""
 
     room: str | None = None  # a ``channels.slack.rooms`` key (Cori: ``pulse``)
-    # Post inside ``pulse.quiet_hours`` too (false, the default: the room shows a gap-free line).
+    # true: skip ``pulse.quiet_hours`` like the owner pulse. false (the default): post through
+    # them, so the room shows a gap-free hourly line.
     quiet_hours: bool = False
 
     @field_validator("room")
