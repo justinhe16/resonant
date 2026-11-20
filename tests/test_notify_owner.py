@@ -209,6 +209,7 @@ async def test_a_mismatch_says_so(personal: Personal) -> None:
         body(clear="yes"),
         body(title=""),
         body(title="   "),
+        body(title="\u200b\u202e\x07"),  # cleans to nothing
         body(title="x" * 201),
         body(key="k" * 121),
         body(key="Bad Key"),
@@ -298,6 +299,18 @@ async def test_a_clear_for_something_never_said_is_silent(personal: Personal) ->
         r = await c.post(PATH, json=body(clear=True), headers=auth())
     assert r.json()["outcome"] == "told"
     assert personal.channel.texts == [] and stored(personal.db) == 0
+
+
+async def test_a_clear_of_a_held_alert_closes_it_quietly(personal: Personal) -> None:
+    kv_set(personal.db, "paused", True)
+    async with personal.client() as c:
+        await c.post(PATH, json=body(), headers=auth())
+        kv_set(personal.db, "paused", False)
+        r = await c.post(PATH, json=body(clear=True), headers=auth())
+    assert r.json()["outcome"] == "told"
+    assert personal.channel.texts == []  # no ✓ for something never texted
+    item = items.get(personal.db, "instance:cori", "ext/dori/inc-1")
+    assert item is not None and item.cleared and not item.changed
 
 
 async def test_the_brain_sees_the_text_in_its_transcript(personal: Personal) -> None:
@@ -480,6 +493,16 @@ async def test_a_422_is_dropped(cori_db: sqlite3.Connection) -> None:
     b.forward("k1", "t1")
     assert await b.flush() == 0
     assert b.pending() == {} and slack.texts == []
+
+
+async def test_a_title_with_nothing_printable_is_sent_as_urgent_alert(
+    cori_db: sqlite3.Connection,
+) -> None:
+    fake, clock, slack = FakePersonal(), Clock(), Channel()
+    b = bridge(cori_db, fake, clock, slack)
+    b.forward("k1", "\u200b\u202e")
+    await b.flush()
+    assert fake.bodies[0]["title"] == "urgent alert"
 
 
 async def test_old_alerts_expire(cori_db: sqlite3.Connection) -> None:

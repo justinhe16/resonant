@@ -55,6 +55,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 
 from resonant.config import NotifyOwnerConfig
+from resonant.extensions.notify import clean_text
 from resonant.gateway.channel import ChannelError, ChannelRefused
 from resonant.instance import NAME_RE
 from resonant.ops import Sender
@@ -113,14 +114,15 @@ def parse_body(raw: bytes) -> NotifyOwnerBody | str:
         return f"{where}: {errors[0]['msg']}"[:200]
     if not items.valid_key(body.key):
         return "key: want 1..120 characters of [a-z0-9/._:-]"
-    if not body.title.strip():
+    if not clean_text(body.title):  # what the text would say: nothing printable is blank
         return "title: must not be blank"
     return body
 
 
 def token_ref_for(instance: str) -> str | None:
     """Personal Resonant's Keychain ref for ``instance``'s token
-    (``core/notify_token_cori``), or None when the name can't make a ref."""
+    (``core/notify_token_cori``), or None when the name can't make a ref. ``-`` becomes
+    ``_`` (a ref name has no ``-``); instance names have no ``_``, so two can't collide."""
     try:
         return secret_ref("core", f"{TOKEN_NAME}_{instance.replace('-', '_')}")
     except InvalidSecretRef:
@@ -275,7 +277,9 @@ class OwnerBridge:
         """Queue one urgent alert for personal Resonant (the latest per key wins). Never
         raises: the alert is still on this instance's own pulse."""
         key = owner_key(key)
-        title = " ".join(title.split())[:TITLE_MAX] or "urgent alert"
+        title = " ".join(title.split())[:TITLE_MAX]
+        if not clean_text(title):  # personal Resonant would refuse it as blank
+            title = "urgent alert"
         now = self.clock()
         try:
             with atomic(self.conn):
@@ -315,7 +319,7 @@ class OwnerBridge:
             (k for k, e in box.items() if k not in expired and _when(e.get("next_at"), now) <= now),
             key=lambda k: str(box[k].get("queued_at")),
         )
-        done: dict[str, str | None] = dict.fromkeys(expired)  # key -> seq; None: drop as is
+        done = {k: str(box[k].get("seq")) for k in expired}  # key -> seq of the entry read
         backoff: dict[str, str] = {}
         delivered = 0
         problem: Problem | None = None
@@ -361,7 +365,7 @@ class OwnerBridge:
             self._recovered()
         return delivered
 
-    def _settle(self, done: dict[str, str | None], backoff: dict[str, str], now: datetime) -> None:
+    def _settle(self, done: dict[str, str], backoff: dict[str, str], now: datetime) -> None:
         """Apply a flush to the outbox as it is now: an entry ``forward`` replaced meanwhile
         (another seq) is left alone."""
         if not done and not backoff:
@@ -370,7 +374,7 @@ class OwnerBridge:
             with atomic(self.conn):
                 box = self._outbox()
                 for key, seq in done.items():
-                    if key in box and (seq is None or box[key].get("seq") == seq):
+                    if key in box and box[key].get("seq") == seq:
                         del box[key]
                 for key, seq in backoff.items():
                     entry = box.get(key)

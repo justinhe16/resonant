@@ -226,8 +226,15 @@ class Pulse:
         see it as Resonant's own turn. Returns the outcome and the hold reason."""
         source = instance_source(instance)
         now = self.clock()
-        if clear and items.get(self.conn, source, key) is None:
+        before = items.get(self.conn, source, key)
+        if clear and before is None:
             return "told", None  # an all-clear for something never said: nothing to say
+        if clear and before is not None and before.told_fingerprint is None:
+            # the alert was held and never texted: close it quietly, no ✓ for it
+            _change, item = items.upsert(self.conn, source, key, clean_text(title), "urgent",
+                                         None, True, items.DEFAULT_TTL_S, now, None)  # fmt: skip
+            items.mark_told(self.conn, [item], now)
+            return "told", None
         _change, item = items.upsert(
             self.conn, source, key, clean_text(title), "urgent", None, clear,
             items.DEFAULT_TTL_S, now, None,

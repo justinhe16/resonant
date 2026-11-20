@@ -37,8 +37,8 @@ from resonant.extensions.panel_history import parse_day
 from resonant.gateway.channel import ChannelError
 from resonant.loop import Loop
 from resonant.monitor import channels_snapshot
+from resonant.notify_owner import MAX_BODY, bearer, parse_body, token_ref_for
 from resonant.notify_owner import PATH as NOTIFY_OWNER_PATH
-from resonant.notify_owner import bearer, parse_body, token_ref_for
 from resonant.redact import Redactor
 from resonant.secrets import SecretError, SecretMissing, SecretStore
 from resonant.status import collect_status
@@ -228,6 +228,9 @@ async def notify_owner(state: DaemonState, request: Request) -> JSONResponse:
     token = bearer(request.headers.get("authorization"))
     if token is None:
         return JSONResponse({"detail": "missing bearer token"}, status_code=401)
+    length = request.headers.get("content-length")
+    if length is not None and length.isdigit() and int(length) > MAX_BODY:
+        return JSONResponse({"detail": f"body over {MAX_BODY} bytes"}, status_code=422)
     raw = await request.body()
     body = parse_body(raw)
     if isinstance(body, str):
@@ -250,6 +253,8 @@ async def notify_owner(state: DaemonState, request: Request) -> JSONResponse:
         outcome, reason = await pulse.ingest_instance(
             body.instance, body.key, body.title, clear=body.clear
         )
+    except ValueError as e:  # the store's own checks (parse_body should have caught it)
+        return JSONResponse({"detail": str(e)[:200]}, status_code=422)
     except ChannelError as e:  # stored untold: the instance's retry sends it
         log.warning("notify-owner text failed: %s", type(e).__name__)
         return JSONResponse({"detail": "channel unavailable"}, status_code=503)
