@@ -466,7 +466,7 @@ _MUTATIONS: dict[str, tuple[str, str, ProbeFn]] = {
     "securityd": ('(global-name-prefix "com.apple.securityd")', "", p_mach),
     "imessage": ('(global-name-prefix "com.apple.imagent")', "", p_mach),
     "signal": ("(deny signal (require-not (target same-sandbox)))", "", p_signal),
-    "port": ('(deny network-outbound (remote ip "*:7777"))', "", p_ports),
+    "port": ('(deny network-outbound (remote ip "*:@API_PORT@"))', "", p_ports),
 }
 
 
@@ -515,7 +515,7 @@ def test_self_check_passes(ctx: ProbeContext) -> None:
     [
         ('(global-name-prefix "com.apple.securityd")', "securityd"),
         (_STATE, ".resonant"),
-        ('(deny network-outbound (remote ip "*:7777"))', "7777"),
+        ('(deny network-outbound (remote ip "*:@API_PORT@"))', "7777"),
     ],
 )
 def test_self_check_fails_closed_when_a_deny_is_missing(

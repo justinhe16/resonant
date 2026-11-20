@@ -251,7 +251,9 @@ def build_components(
     handlers = register_builtins(
         registry, conn, state, principals=principals, ops_runner=ops_runner
     )
-    secret_store = secrets if secrets is not None else SecretStore()
+    secret_store = (
+        secrets if secrets is not None else SecretStore(service=settings.keychain_service)
+    )
     host = ExtensionHost.from_settings(settings, conn, registry, runner=ext_runner)
     host.secrets = secret_store
     host.owner = principals.owner if loaded else None  # PER-275: who is asked about MCP drift

@@ -27,6 +27,11 @@ def collect_status(
     now = utcnow()
     return {
         "version": __version__,
+        # PER-297: which instance answers (``resonant`` unless this home is another one's)
+        "instance": {
+            "name": settings.instance.name,
+            "display_name": settings.instance.display_name,
+        },
         "now": iso(now),
         "uptime_s": None if started_at is None else round((now - started_at).total_seconds()),
         "last_tick": None if last_tick is None else iso(last_tick),

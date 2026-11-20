@@ -22,7 +22,7 @@ import typer
 from pydantic import ValidationError
 
 from resonant import daemon as daemon_mod
-from resonant import killswitch, launchd
+from resonant import instance, killswitch, launchd
 from resonant.config import Settings, load_settings
 from resonant.extensions.checks import EXT_PATH, approver_errors, dir_errors, name_errors
 from resonant.extensions.manager import (
@@ -39,7 +39,6 @@ from resonant.extensions.mcp import pins_digest
 from resonant.extensions.pin import TreeError
 from resonant.gate import ApprovalResolution, PolicyGate
 from resonant.gate.codes import clean_external
-from resonant.launchd import DAEMON_LABEL
 from resonant.ops import (
     OpsRunner,
     SubprocessRunner,
@@ -89,6 +88,31 @@ EX_TEMPFAIL = 75
 _CLI_ACTOR = "owner:cli"
 
 
+@app.callback()
+def main(
+    instance_name: Annotated[
+        str | None,
+        typer.Option(
+            "--instance",
+            metavar="NAME",
+            help="The instance to act on (PER-297): resonant (~/.resonant, the default) or "
+            "another name (~/.resonant-<name>). Same as RESONANT_INSTANCE; an explicit "
+            "RESONANT_HOME still picks the home.",
+        ),
+    ] = None,
+) -> None:
+    """Resonant: an always-on personal agent harness."""
+    try:
+        want = instance.select(instance_name)
+        if want is not None:
+            # every load_settings() below, and any child this CLI starts, sees the same name
+            os.environ[instance.INSTANCE_ENV] = want
+        instance.check_home(instance.resolve_home(), want)
+    except instance.InstanceError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+
+
 def _db(settings: Settings) -> sqlite3.Connection:
     return open_db(settings.db_path)
 
@@ -110,6 +134,9 @@ def daemon_install(
 ) -> None:
     """Install and start the LaunchAgents (daemon, Ollama if available, and keep-awake)."""
     settings = load_settings()
+    if problem := _port_problem(settings):
+        typer.echo(f"error: {problem}; set api.port in {settings.home / 'config.yaml'}", err=True)
+        raise typer.Exit(1)
     try:
         if ollama:
             if path := launchd.find_ollama():
@@ -126,6 +153,28 @@ def daemon_install(
         raise typer.Exit(1) from None
 
 
+def _port_problem(settings: Settings) -> str | None:
+    """Why ``api.port`` can't be this instance's (PER-297): something else listens on it.
+    This instance's own running daemon (its /api/status names it) is a reinstall, not a
+    clash; a daemon from before instances answers without a name and counts as
+    ``resonant``."""
+    host, port = settings.api.host, settings.api.port
+    try:
+        if not instance.port_in_use(host, port):
+            return None
+    except OSError as e:
+        return f"can't check api.port {port} on {host} ({type(e).__name__})"
+    live = _fetch_status(settings)
+    if live is not None:
+        raw = live.get("instance")
+        named = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+        owner = named.get("name", instance.DEFAULT_INSTANCE)
+        if owner == settings.instance.name:
+            return None
+        return f"api.port {port} on {host} is in use by instance {owner}"
+    return f"api.port {port} on {host} is already in use"
+
+
 @daemon_app.command("uninstall")
 def daemon_uninstall(
     ollama: Annotated[bool, typer.Option(help="Also remove the Ollama LaunchAgent.")] = True,
@@ -134,7 +183,7 @@ def daemon_uninstall(
     ] = True,
 ) -> None:
     """Stop and remove the LaunchAgents."""
-    labels = [launchd.DAEMON_LABEL] + ([launchd.OLLAMA_LABEL] if ollama else [])
+    labels = [load_settings().daemon_label] + ([launchd.OLLAMA_LABEL] if ollama else [])
     labels += [launchd.CAFFEINATE_LABEL] if keep_awake else []
     for label in labels:
         removed = launchd.uninstall(label)
@@ -186,11 +235,18 @@ def status(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
         except StoreUnavailableError as e:
             data = {"error": str(e), "tasks": {}, "waiting": {}}
     data["daemon"] = "up" if live else "down"
-    data["launchd_loaded"] = launchd.is_loaded(launchd.DAEMON_LABEL)
+    data["launchd_loaded"] = launchd.is_loaded(settings.daemon_label)
+    # PER-297: the instance this CLI read (the live daemon's own answer wins when it has one)
+    data.setdefault(
+        "instance",
+        {"name": settings.instance.name, "display_name": settings.instance.display_name},
+    )
     up = live is not None
     if as_json:
         typer.echo(json.dumps(data, indent=2))
         raise typer.Exit(0 if up else 1)
+    named = cast(dict[str, Any], data["instance"]) if isinstance(data["instance"], dict) else {}
+    typer.echo(f"instance    {named.get('name')} ({named.get('display_name')})")
     typer.echo(f"daemon      {'up' if up else 'DOWN'} (launchd: {data['launchd_loaded']})")
     if "error" in data:
         typer.echo(f"store       {data['error']}")
@@ -247,8 +303,8 @@ def _daemon_running(settings: Settings) -> str | None:
     would be restarted), or None."""
     if _fetch_status(settings) is not None:
         return "the daemon is running (its API answers)"
-    if launchd.is_loaded(launchd.DAEMON_LABEL):
-        return f"the daemon's LaunchAgent ({launchd.DAEMON_LABEL}) is loaded"
+    if launchd.is_loaded(settings.daemon_label):
+        return f"the daemon's LaunchAgent ({settings.daemon_label}) is loaded"
     if pids := _daemon_pids():
         return f"a `resonant daemon run` process is running (pid {pids[0]})"
     return None
@@ -749,11 +805,12 @@ def _restart_daemon(settings: Settings, conn: sqlite3.Connection, owner: str, no
         return
     mark_restart(conn, by=owner, commit=None, now=utcnow(), note=note)
     try:
-        _restart_runner().spawn_detached(restart_later_argv(DAEMON_LABEL))
+        _restart_runner().spawn_detached(restart_later_argv(settings.daemon_label))
     except OSError as e:
         clear_restart(conn)
         typer.echo(f"warning: couldn't start the restart helper ({type(e).__name__})", err=True)
-        typer.echo(f"Restart it yourself: {' '.join(kickstart_argv(DAEMON_LABEL))}", err=True)
+        argv = kickstart_argv(settings.daemon_label)
+        typer.echo(f"Restart it yourself: {' '.join(argv)}", err=True)
         return
     typer.echo("Restarting the daemon; it texts you when it's back.")
 
@@ -1037,8 +1094,9 @@ def ext_panel_history(
 secret_app = typer.Typer(
     no_args_is_help=True,
     help=(
-        "Extension and runner secrets in the login Keychain (service resonant, account "
-        "<ext>/<name>; the runner's are runner/<name>)."
+        "Extension and runner secrets in the login Keychain (service resonant, or "
+        "resonant-<name> for another instance; account <ext>/<name>; the runner's are "
+        "runner/<name>)."
     ),
 )
 app.add_typer(secret_app, name="secret")
@@ -1048,8 +1106,9 @@ SecretRef = Annotated[
 
 
 def _secret_store() -> SecretStore:
-    """The store the ``secret`` commands use. Tests swap in one over a ``FakeKeychain``."""
-    return SecretStore()
+    """The store the ``secret`` commands use: this instance's Keychain service. Tests swap
+    in one over a ``FakeKeychain``."""
+    return SecretStore(service=load_settings().keychain_service)
 
 
 def _stdin_is_tty() -> bool:
@@ -1177,6 +1236,7 @@ def secret_list(
         return
     store = _secret_store()
     unavailable = False
+    present = 0
     for ref, problem in refs:
         state = problem
         if state is None:
@@ -1184,7 +1244,10 @@ def secret_list(
                 state = "present" if asyncio.run(store.exists(ref)) else "missing"
             except SecretError as e:
                 state, unavailable = e.reason, True
+        present += state == "present"
         typer.echo(f"  {ref:<40} {state}")
+    # PER-297: which Keychain service was asked, so a changed secrets.service explains itself
+    typer.echo(f"{present} of {len(refs)} present (service {store.service})")
     if unavailable:
         raise typer.Exit(EX_TEMPFAIL)
 

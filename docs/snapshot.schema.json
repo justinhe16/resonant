@@ -1156,6 +1156,29 @@
       "title": "HealthRow",
       "type": "object"
     },
+    "Instance": {
+      "additionalProperties": false,
+      "description": "Which instance took the snapshot (PER-297, ``resonant.instance``).",
+      "properties": {
+        "display_name": {
+          "maxLength": 40,
+          "minLength": 1,
+          "title": "Display Name",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "display_name"
+      ],
+      "title": "Instance",
+      "type": "object"
+    },
     "Job": {
       "additionalProperties": false,
       "properties": {
@@ -4016,6 +4039,17 @@
       },
       "title": "Health",
       "type": "array"
+    },
+    "instance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Instance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "last_tick": {
       "anyOf": [

@@ -206,6 +206,7 @@ from resonant.sandbox import (
     wrap,
 )
 from resonant.sandbox.probes import cached_self_check
+from resonant.sandbox.profile import API_PORT
 from resonant.secrets import (
     CLAUDE_MISSING,
     GITHUB_APP_KEY_REF,
@@ -947,6 +948,7 @@ class ClaudeRunner:
         rc_off_timeout_s: float = RC_OFF_TIMEOUT_S,
         end_grace_s: float = END_GRACE_S,
         voice: Voice | None = None,
+        api_port: int = API_PORT,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -977,14 +979,17 @@ class ClaudeRunner:
 
         PER-273: ``voice`` writes the prose of a run's outcome text (``brain/voice.py``): the
         code-built text stays the fallback and the ⚠ lines, side effects and the closing
-        line stay code-built. None: every text is code-built."""
+        line stay code-built. None: every text is code-built.
+
+        PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies."""
         self.conn = conn
+        self.api_port = api_port
         self.cfg = runner
         self.channel = channel
         self.secrets = secrets
         self.tz = ZoneInfo(timezone)
         self.max_runs = max_runs
-        self.workspace = workspace or Workspace(runner, conn)
+        self.workspace = workspace or Workspace(runner, conn, api_port=api_port)
         self.resolver = Resolver(conn)
         self._github: Callable[[RunnerSecrets], GitHub] = github or self._gh_github
         self.app = github_app or (
@@ -2154,6 +2159,7 @@ class ClaudeRunner:
             write_paths=tuple(writes),
             ctl_root=self.ctl_root,
             ctl_dir=self.ctl_root / p.code,
+            api_port=self.api_port,
         )
 
     def _cached_self_check(self, params: SandboxParams) -> tuple[bool, str]:
@@ -3830,7 +3836,9 @@ def cleanup_job(deps: CoreDeps) -> CoreJob | None:
         )
         for error in result.errors:
             log.warning("run cleanup: %s", error)
-        workspace = Workspace(cfg, conn)  # its checkout locks are the runner's (per loop)
+        workspace = Workspace(
+            cfg, conn, api_port=deps.settings.api.port
+        )  # its checkout locks are the runner's (per loop)
         cutoff = time.time() - cfg.keep_days * 86400
         removed = 0
         for code, at in sorted(ended.items()):

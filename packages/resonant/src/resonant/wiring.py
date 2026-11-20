@@ -454,7 +454,7 @@ def build_imessage_stack(
         ClaudeVoice(
             conn,
             cfg=settings.brain.voice,
-            secrets=components.executor.secrets or SecretStore(),
+            secrets=components.executor.secrets or SecretStore(service=settings.keychain_service),
             cwd=settings.home / "voice",
             guard=settings.runner.guard,
             timezone=settings.timezone,
@@ -467,7 +467,7 @@ def build_imessage_stack(
         conn,
         runner=settings.runner,
         channel=channel,
-        secrets=components.executor.secrets or SecretStore(),
+        secrets=components.executor.secrets or SecretStore(service=settings.keychain_service),
         timezone=settings.timezone,
         max_runs=max(1, settings.claude.max_concurrent - settings.claude.reserved_oncall_slots),
         create_task=loop.create_task,
@@ -481,6 +481,7 @@ def build_imessage_stack(
         owner=owner_name,
         self_repo=settings.ops.repo_path,
         voice=voice,
+        api_port=settings.api.port,  # PER-297: the thin guard denies this instance's port
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
@@ -492,7 +493,7 @@ def build_imessage_stack(
         scope=AskScope.from_settings(settings),  # the read tools' roots and deny list (BR-2)
         ask_root=settings.home / "ask",
         channel=channel,
-        secrets=components.executor.secrets or SecretStore(),
+        secrets=components.executor.secrets or SecretStore(service=settings.keychain_service),
         owner=components.principals.owner,
         guard=settings.runner.guard,
         timezone=settings.timezone,

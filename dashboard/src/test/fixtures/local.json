@@ -3,6 +3,10 @@
   "tier": "local",
   "taken_at": "2026-10-16T09:00:00Z",
   "version": "3ef397a1",
+  "instance": {
+    "name": "resonant",
+    "display_name": "Resonant"
+  },
   "started_at": "2026-10-15T21:14:00Z",
   "last_tick": "2026-10-16T08:59:58Z",
   "autonomy": "on",

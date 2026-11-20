@@ -169,9 +169,15 @@ def _no_render(d: dict[str, Any]) -> str:
     raise ValueError("fast-path command has a tool but no template")
 
 
+def _display_name(value: Any) -> str:
+    """PER-297: the instance's display name from the status (``Resonant`` when absent)."""
+    name = _as_dict(value).get("display_name")
+    return name if isinstance(name, str) and name else "Resonant"
+
+
 def render_status(d: dict[str, Any]) -> str:
     parts = [
-        f"Resonant up {_duration(d.get('uptime_s'))}",
+        f"{_display_name(d.get('instance'))} up {_duration(d.get('uptime_s'))}",
         f"{d.get('inflight', '?')} in flight",
         f"autonomy {d.get('autonomy', '?')}",
         "paused" if d.get("paused") is True else "not paused",

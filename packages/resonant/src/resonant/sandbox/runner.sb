@@ -129,5 +129,6 @@
 (deny mach-task-name)
 
 ;; ---- network: everything except the daemon's API port, on every address ------------------
-(deny network-outbound (remote ip "*:7777"))
-(deny network-bind (local ip "*:7777"))
+;; The port is the instance's api.port (an int that profile.render puts in; default 7777).
+(deny network-outbound (remote ip "*:@API_PORT@"))
+(deny network-bind (local ip "*:@API_PORT@"))

@@ -304,3 +304,25 @@ def test_brain_voice_defaults_and_bounds(resonant_home: Path) -> None:
     ok = load_settings(brain={"voice": {"enabled": False, "kinds": ["pulse"], "daily_cap": 0}})
     assert ok.brain.voice.enabled is False and ok.brain.voice.kinds == ["pulse"]
     assert ok.brain.voice.daily_cap == 0  # no cap
+
+
+def test_no_instance_block_keeps_every_name(resonant_home: Path) -> None:
+    """PER-297: without an ``instance:`` block the instance is ``resonant`` and every derived
+    name is the pre-instance one (tests/test_instance.py pins the rest)."""
+    s = load_settings()
+    assert (s.instance.name, s.instance.display_name) == ("resonant", "Resonant")
+    assert s.daemon_label == "com.resonant.daemon"
+    assert s.keychain_service == "resonant"
+    assert s.api.port == 7777
+
+
+def test_cori_example_config_is_valid(resonant_home: Path) -> None:
+    (resonant_home / "config.yaml").write_text((REPO / "config/cori.example.yaml").read_text())
+    s = load_settings()
+    assert (s.instance.name, s.api.port, s.keychain_service) == ("cori", 7778, "resonant-cori")
+
+
+def test_instance_name_must_be_a_slug(resonant_home: Path) -> None:
+    (resonant_home / "config.yaml").write_text("instance:\n  name: Cori.Bot\n")
+    with pytest.raises(ValidationError, match="slug"):
+        load_settings()

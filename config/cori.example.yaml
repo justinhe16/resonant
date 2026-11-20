@@ -1,0 +1,61 @@
+# Cori: a second Resonant instance on the same Mac user (Phase 8, PER-297).
+# Copy to ~/.resonant-cori/config.yaml, then target it with `resonant --instance cori ...`
+# or RESONANT_INSTANCE=cori. Non-secret settings only: Cori's secrets live in the login
+# Keychain under the service resonant-cori (`resonant --instance cori secret list`).
+#
+# What the instance name derives (resonant/instance.py; docs/interfaces.md "Instances"):
+#   home ~/.resonant-cori, LaunchAgent com.resonant.cori.daemon, Keychain service
+#   resonant-cori, runner.work_dir ~/cori/runs, runner.code_dir ~/cori/code,
+#   runner.cache_dir ~/cori/runs/.cache. Set any of these explicitly only to move it.
+# Anything not set here takes the same default as personal Resonant (config/resonant.example.yaml).
+
+instance:
+  name: cori
+  display_name: Cori
+
+timezone: America/Los_Angeles
+dry_run: false
+
+api:
+  host: 127.0.0.1
+  port: 7778                            # personal Resonant has 7777; install refuses a bound port
+
+claude:
+  max_concurrent: 5
+  reserved_oncall_slots: 1
+
+channels:
+  imessage:
+    enabled: false                      # Cori talks in Slack (PER-292, PER-295), never iMessage
+
+# --- added by later Phase 8 tickets; leave commented until they land ---------------------
+#
+# PER-290 (two daemons, one checkout): shared agents stay personal Resonant's, and code
+# deploys come from personal Resonant.
+# power:
+#   keep_awake: false
+# model:
+#   manage: false
+# ops:
+#   self_update: false
+# runner:
+#   self_repo: false
+#
+# PER-291 (Cori's scope): worker and brain rules, scoped worker env, own Claude config dir
+# and a read scope without anything personal.
+# runner:
+#   instructions_file: ~/resonant/config/cori/worker-rules.md
+#   claude_config_dir: ~/cori/claude
+#   session_env:
+#     FLY_API_TOKEN: dori/fly_staging_token
+#     VERCEL_TOKEN: dori/vercel_token
+#     SUPABASE_ACCESS_TOKEN: dori/supabase_staging_token
+#     PROD_RO_DATABASE_URL: dori/prod_ro_url
+#     STAGING_DATABASE_URL: dori/staging_url
+#     APP_STORE_CONNECT_API_KEY_ID: dori/asc_key_id
+#     APP_STORE_CONNECT_API_ISSUER_ID: dori/asc_issuer
+#     APP_STORE_CONNECT_API_KEY_CONTENT: dori/asc_key
+# brain:
+#   instructions_file: ~/resonant/config/cori/brain-rules.md
+#   read_roots: [~/cori/code, ~/.resonant-cori/logs]
+#   read_deny: [~/code, ~/resonant, ~/.resonant, ~/trade-jev, ~/Documents, ~/Library, ~/.ssh, ~/.config, ~/.fly]

@@ -38,6 +38,7 @@ from voice_script import Script, scripted_voice
 
 from resonant import killswitch
 from resonant.config import (
+    ApiConfig,
     GitHubAppConfig,
     LoopConfig,
     RunnerConfig,
@@ -665,7 +666,7 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     assert not h.checkout().exists() and h.branches() == ["main"]
     # cleanup after keep_days removes the scratch dir
     runs_store.update(db, "R1", ended_at=utcnow() - timedelta(days=8))
-    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg), conn=db)
+    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg, api=ApiConfig()), conn=db)
     job = claude_mod.cleanup_job(cast(Any, deps))
     assert job is not None
     out = await job.run({}, cast(Any, None))
@@ -1877,7 +1878,7 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
     await h.drain()
     fresh = await h.start()
     assert h.code_dir(code).exists()
-    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg), conn=db)
+    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg, api=ApiConfig()), conn=db)
     job = claude_mod.cleanup_job(cast(Any, deps))
     assert job is not None and job.id == "run-cleanup"
     await job.run({}, cast(Any, None))
@@ -1894,7 +1895,7 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
     assert (h.checkout() / "README.md").exists()  # the checkout is never deleted
     assert h.run(fresh).status == "queued"  # active runs are never touched
     empty = h.cfg.model_copy(update={"repos": {}})
-    deps2 = SimpleNamespace(settings=SimpleNamespace(runner=empty), conn=db)
+    deps2 = SimpleNamespace(settings=SimpleNamespace(runner=empty, api=ApiConfig()), conn=db)
     assert claude_mod.cleanup_job(cast(Any, deps2)) is not None  # dirs exist: still cleaned
     bare = empty.model_copy(
         update={
@@ -1904,7 +1905,7 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
         }
     )
     repo_store.forget(db, "proj")
-    deps3 = SimpleNamespace(settings=SimpleNamespace(runner=bare), conn=db)
+    deps3 = SimpleNamespace(settings=SimpleNamespace(runner=bare, api=ApiConfig()), conn=db)
     assert claude_mod.cleanup_job(cast(Any, deps3)) is None
 
 

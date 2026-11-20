@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
-API_PORT = 7777
+API_PORT = 7777  # the default instance's api.port; SandboxParams.api_port carries the real one
 GIT_NAME = "Resonant runner"
 GIT_EMAIL = "resonant-runner@users.noreply.github.com"
 
@@ -48,6 +48,7 @@ SYSTEM_ONLY_TOOLS = frozenset({"git"})
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
 
+_API_PORT = "@API_PORT@"  # an int, the one value spliced into the text (checked in render)
 _PLACEHOLDERS = {
     "protect": ";; @PROTECT@",
     "deny_read": ";; @DENY_READ@",
@@ -117,6 +118,9 @@ class SandboxParams:
     # own (``<work_dir>/.ctl/R<n>``). Both or neither; they need ``work_dir``.
     ctl_root: Path | None = None
     ctl_dir: Path | None = None
+    # the daemon's API port (``api.port``; PER-297: each instance has its own), denied on
+    # every address
+    api_port: int = API_PORT
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -179,6 +183,7 @@ class SandboxParams:
             write_paths=writes,
             ctl_root=ctl_root,
             ctl_dir=ctl_dir,
+            api_port=self.api_port,
         )
 
 
@@ -360,6 +365,11 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
                     CTL_RUN=str(p.run_dir))  # fmt: skip
         lines["ctl"] = list(_CTL_RULES)
     text = template_text()
+    if not (isinstance(p.api_port, int) and 0 < p.api_port < 65536):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise SandboxError(f"api_port {p.api_port!r} isn't a port")
+    if _API_PORT not in text:
+        raise SandboxError(f"runner.sb lost its {_API_PORT} placeholder")
+    text = text.replace(_API_PORT, str(p.api_port))
     for key, placeholder in _PLACEHOLDERS.items():
         if placeholder not in text:
             raise SandboxError(f"runner.sb lost its {placeholder} placeholder")

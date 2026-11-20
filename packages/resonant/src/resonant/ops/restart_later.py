@@ -2,7 +2,8 @@
 
 Spawned in a new session by the ops tools, so it outlives the daemon it restarts. It
 sleeps ``delay_s`` (0..60), then runs ``launchctl kickstart -k gui/<uid>/<label>`` with a
-timeout. Only the two ops labels are accepted. It prints nothing and never uses a shell.
+timeout. Only ops labels are accepted (Ollama's, or an instance's daemon). It prints
+nothing and never uses a shell.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from resonant.ops import KICKSTART_TIMEOUT_S, LABELS, kickstart_argv
+from resonant.ops import KICKSTART_TIMEOUT_S, is_ops_label, kickstart_argv
 
 MAX_DELAY_S = 60.0
 
@@ -25,7 +26,7 @@ def main(
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 2 or args[0] not in LABELS:
+    if len(args) != 2 or not is_ops_label(args[0]):
         return 2
     try:
         delay = float(args[1])
