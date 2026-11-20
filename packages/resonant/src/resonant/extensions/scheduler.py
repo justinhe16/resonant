@@ -700,7 +700,7 @@ class Scheduler:
         with transaction(self.conn):
             store.mark_due(self.conn, job.ext, job.job_id, d.last_due)
             self._audit_missed(job, d)
-            for due in d.skipped:
+            for due in () if job.quiet_idle else d.skipped:  # PER-298: a poll's are noise
                 self._audit(job, "job.skipped_paused", due)
             if d.outcome is Outcome.OVERLAP and d.due is not None:
                 self._audit(job, "job.overlap", d.due)

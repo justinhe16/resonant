@@ -289,11 +289,24 @@ async def post(
 
 
 def busy(conn: sqlite3.Connection, job: store.Job) -> bool:
-    """The job's previous run is still queued, running or waiting."""
-    if job.last_run_code is None:
-        return False
-    run = runs_store.get(conn, job.last_run_code)
-    return run is not None and run.active
+    """The job's previous run is still queued, running or waiting, or a start is in flight.
+    Any active run linked to the job counts (also one whose start never got recorded as
+    ``last_run_code``)."""
+    if job.id in _starting:
+        return True
+    if job.last_run_code is not None:
+        run = runs_store.get(conn, job.last_run_code)
+        if run is not None and run.active:
+            return True
+    return any(
+        (link := store.run_link(conn, r.code)) is not None and link.job == job.id
+        for r in runs_store.active(conn)
+    )
+
+
+# Jobs whose run is being started right now (this process): a tick and a ``run_job_now``, or
+# two of those, never start two runs of one job at once.
+_starting: set[str] = set()
 
 
 async def start(
@@ -305,10 +318,37 @@ async def start(
     channel: Channel | None,
     now: datetime,
     manual: bool = False,
+    by: str | None = None,
 ) -> tuple[bool, str]:
-    """Start one run of ``job`` (its due time already claimed, or ``run_job_now``). Returns
-    ``(started, sentence)``."""
+    """Start one run of ``job`` (its due time already claimed, or ``run_job_now`` by
+    ``by``). Returns ``(started, sentence)``."""
+    if job.id in _starting:
+        return False, f"{job.id} is starting a run already."
+    _starting.add(job.id)
+    try:
+        return await _start(conn, job, runner=runner, principals=principals, channel=channel,
+                            now=now, manual=manual, by=by)  # fmt: skip
+    finally:
+        _starting.discard(job.id)
+
+
+async def _start(
+    conn: sqlite3.Connection,
+    job: store.Job,
+    *,
+    runner: JobRunner | None,
+    principals: Principals,
+    channel: Channel | None,
+    now: datetime,
+    manual: bool,
+    by: str | None,
+) -> tuple[bool, str]:
+    who: dict[str, Any] = {"manual": True, "by": by} if manual else {}
     principal = principal_for(job, principals)
+    if principal != job.created_by:
+        with atomic(conn):
+            audit(conn, "regjob.principal_changed", requested_by=principal, job=job.id,
+                  creator=job.created_by)  # fmt: skip
     if job.repo is not None and repos_store.find(conn, job.repo) is None:
         why = f"its repo {job.repo} is gone"
         store.set_state(conn, job.id, "paused", now, expect=("active",), error=why)
@@ -321,7 +361,7 @@ async def start(
         why = "the Claude runner isn't running"
         store.refused(conn, job.id, why, now)
         with atomic(conn):
-            audit(conn, "regjob.refused", requested_by=principal, job=job.id, reason=why)
+            audit(conn, "regjob.refused", requested_by=principal, job=job.id, reason=why, **who)
         return False, f"{job.id} didn't start: {why}."
     from resonant.runners.claude import Refused
 
@@ -340,12 +380,12 @@ async def start(
         store.refused(conn, job.id, result.reason, now)
         with atomic(conn):
             audit(conn, "regjob.refused", requested_by=principal, job=job.id,
-                  reason=result.reason[:120])  # fmt: skip
+                  reason=result.reason[:120], **who)  # fmt: skip
         return False, f"{job.id} didn't start: {result.reason}"
     store.started(conn, job.id, result.code, now)
     with atomic(conn):
         audit(conn, "regjob.started", requested_by=principal, job=job.id, run=result.code,
-              manual=manual)  # fmt: skip
+              **who)  # fmt: skip
     return True, f"{job.id} ({job.name}) started {result.code}."
 
 
@@ -367,6 +407,12 @@ async def tick(
             schedule = parse_schedule(job.schedule, job.tz)
         except CronError as e:
             store.set_state(conn, job.id, "paused", now, expect=("active",), error=str(e))
+            with atomic(conn):
+                audit(conn, "regjob.paused", requested_by=job.created_by, job=job.id,
+                      reason="bad_schedule")  # fmt: skip
+            principal = principal_for(job, principals)
+            text = f"{job.id} ({job.name}) paused itself: its schedule no longer parses ({e})."
+            await post(channel, job, principal, text, key=f"regjob:{job.id}:bad_schedule")
             continue
         d = decide(
             schedule,

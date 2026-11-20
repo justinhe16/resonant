@@ -527,3 +527,80 @@ async def test_a_jobs_end_text_goes_to_its_room(db: sqlite3.Connection) -> None:
     me = SimpleNamespace(conn=db, channel=no_room, _send_run=sender(no_room))
     await ClaudeRunner._send_end(me, run_for(store.RunLink("J1", "digest")), "R4 done")  # type: ignore[arg-type]
     assert [(p, t) for p, t, _ in no_room.sent] == [("brian", "R4 done")]
+
+
+def test_the_approval_shows_the_whole_prompt(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    long = "check flaky CI. " * 80  # 1280 chars: what runs unattended is what is approved
+    heading = job_tools.summary_action(
+        Intent.for_tool(
+            job_tools.ADD_JOB,
+            task_id=task_of(db, "brian"),
+            principal="brian",
+            args={"schedule": "0 9 * * 1", "prompt": long},
+        )
+    )
+    assert heading is not None and "(+" in heading and "more chars)" in heading
+    assert heading.count("check flaky CI.") >= 60
+
+
+async def test_a_linked_run_counts_as_busy_and_starts_dont_overlap(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    await add(components, db)
+    job = store.get(db, "J1")
+    assert job is not None and not rj.busy(db, job)
+    run = runs_store.create(db, repo="", ask="x", principal="brian", session_id="s", max_seconds=60)
+    store.link_run(db, run.code, store.RunLink("J1"))  # started, but never recorded
+    assert rj.busy(db, job)
+    runs_store.finish(db, run.code, "done")
+    assert not rj.busy(db, job)
+    rj._starting.add("J1")  # pyright: ignore[reportPrivateUsage]
+    try:
+        ok, text = await rj.start(
+            db,
+            job,
+            runner=FakeRunner(db),
+            principals=components.principals,
+            channel=None,
+            now=NOW,
+            manual=True,
+            by="justin",
+        )
+    finally:
+        rj._starting.discard("J1")  # pyright: ignore[reportPrivateUsage]
+    assert not ok and text == "J1 is starting a run already."
+
+
+async def test_manual_runs_audit_who(components: Components, db: sqlite3.Connection) -> None:
+    await add(components, db)
+    components.runners["claude"] = FakeRunner(db)  # type: ignore[assignment]
+    await call(components, "run_job_now", {"id": "J1"}, task_of(db, "justin"))
+    (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'regjob.started'")
+    assert '"by": "justin"' in row[0] and '"manual": true' in row[0]
+
+
+async def test_a_paused_instance_with_no_jobs_records_nothing(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    from resonant import killswitch
+
+    killswitch.engage(db, actor="test")
+    sched = Scheduler.from_components(
+        settings,
+        db,
+        components,
+        started_at=NOW,
+        core_jobs=(rj.registered_jobs_job,),
+        clock=clock,
+        channel=cast(Any, Recorder()),
+    )
+    before = db.execute("SELECT MAX(id) FROM audit_log").fetchone()[0]
+    for minute in range(1, 4):
+        clock.now = NOW + timedelta(minutes=minute)
+        await sched.tick(clock.now)
+        await sched.drain()
+    rows = db.execute("SELECT action FROM audit_log WHERE id > ?", (before,)).fetchall()
+    assert [r[0] for r in rows if r[0].startswith("job.")] == []
+    await sched.aclose()

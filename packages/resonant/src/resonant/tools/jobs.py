@@ -37,7 +37,8 @@ from resonant_sdk import Effect, Level, ToolSpec
 GRANT = "jobs"
 SCHEDULE_MAX = 100
 OUTPUT_MAX = 40
-PROMPT_SHOWN = 80
+PROMPT_SHOWN = 80  # list_jobs
+PROMPT_ASKED = 1000  # the add_job approval: what runs unattended, shown nearly whole
 JOBS_SHOWN = 25
 
 
@@ -151,9 +152,11 @@ def summary_action(intent: Intent) -> str | None:
     output = a.get("output")
     out = _clip(output, OUTPUT_MAX) if isinstance(output, str) and output.strip() else "thread"
     when = rj.describe(" ".join(schedule.split()))
+    flat = clean_external(prompt)
+    more = f" (+{len(flat) - PROMPT_ASKED + 1} more chars)" if len(flat) > PROMPT_ASKED else ""
     return (
         f"{head}: {when} ({_clip(schedule, SCHEDULE_MAX)}), start a run{where}: "
-        f'"{_clip(prompt, PROMPT_SHOWN)}", output to {out}'
+        f'"{_clip(prompt, PROMPT_ASKED)}"{more}, output to {out}'
     )
 
 
@@ -356,7 +359,7 @@ class _Tools:
     async def run_now(
         self, args: dict[str, Any], call: CallContext | None = None
     ) -> dict[str, Any]:
-        del call
+        by, _ = self._caller(call)
         job = self._job(RUN_JOB_NOW.name, args)
         if job.state != "active":
             return {"id": job.id, "started": False,
@@ -378,6 +381,7 @@ class _Tools:
             channel=channel,
             now=self.ctx.clock(),
             manual=True,
+            by=by,
         )
         out: dict[str, Any] = {"id": job.id, "started": ok, "text": text}
         if ok:
