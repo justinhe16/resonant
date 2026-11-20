@@ -564,7 +564,7 @@ def resume(
     ] = None,
 ) -> None:
     """Release the kill switch. On personal Resonant it resumes the siblings it paused."""
-    from resonant.ops.siblings import EXIT_KEPT
+    from resonant.ops.siblings import EXIT_KEPT, EXIT_NOT_PAUSED
 
     settings = load_settings()
     conn = _db(settings)
@@ -572,7 +572,7 @@ def resume(
         _source(if_by)
         if kv_get(conn, "paused") is not True:
             typer.echo("not paused")
-            return
+            raise typer.Exit(EXIT_NOT_PAUSED)
         source = killswitch.paused_by(conn)
         if source != if_by:
             typer.echo(f"still paused: paused by {source or 'someone else'}, not {if_by}")

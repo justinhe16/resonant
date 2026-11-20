@@ -53,6 +53,8 @@ PRINT_TIMEOUT_S = 10.0
 BACKUP_TIMEOUT_S = 90.0
 # ``resonant resume --if-by``: the pause in force isn't from that source, so it stays.
 EXIT_KEPT = 3
+# ``resonant resume --if-by``: it wasn't paused at all.
+EXIT_NOT_PAUSED = 4
 
 KillSwitchFanOut = Callable[[bool], Coroutine[Any, Any, list[str]]]
 
@@ -101,6 +103,8 @@ async def resume_siblings(runner: OpsRunner, siblings: Sequence[Sibling]) -> lis
         rc, why = await _cli(runner, s, "resume", "--if-by", SIBLING_SOURCE)
         if rc == 0:
             lines.append(f"{s.display_name}: resumed")
+        elif rc == EXIT_NOT_PAUSED:
+            lines.append(f"{s.display_name}: wasn't paused")
         elif rc == EXIT_KEPT:
             lines.append(
                 f"{s.display_name}: still paused (not paused by {instance.DEFAULT_DISPLAY_NAME})"
@@ -268,6 +272,7 @@ __all__ = [
     "BACKUP_TIMEOUT_S",
     "CLI_TIMEOUT_S",
     "EXIT_KEPT",
+    "EXIT_NOT_PAUSED",
     "PRINT_TIMEOUT_S",
     "KillSwitchFanOut",
     "StoreBackup",

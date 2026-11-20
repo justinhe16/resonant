@@ -450,7 +450,7 @@ def test_cli_kill_fans_out_and_personal_pauses_even_when_cori_fails(
 def test_pause_and_resume_if_by_on_the_cli(resonant_home: Path) -> None:
     conn = open_db(resonant_home / "resonant.db")
     r = CliRunner().invoke(cli.app, ["resume", "--if-by", "sibling:resonant"])
-    assert r.exit_code == 0 and "not paused" in r.output
+    assert r.exit_code == sib.EXIT_NOT_PAUSED and "not paused" in r.output
     assert CliRunner().invoke(cli.app, ["pause", "--by", "not a source"]).exit_code == 2
     killswitch.engage(conn, actor=OWNER)
     r = CliRunner().invoke(cli.app, ["resume", "--if-by", "sibling:resonant"])
@@ -654,3 +654,16 @@ def test_restore_guard_ignores_the_other_instances_daemon(
     monkeypatch.setattr(psutil, "process_iter", lambda attrs: iter(procs))  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
     assert cli._daemon_pids(user_home / ".resonant") == [102, 103]  # pyright: ignore[reportPrivateUsage]
     assert cli._daemon_pids(cori_home) == [101, 103]  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_pause_older_than_sources_is_never_claimed(cori_home: Path) -> None:
+    conn = cori_db(cori_home)
+    with transaction(conn):
+        kv_set(conn, "paused", True)  # paused before paused_by existed
+    fan = sib.kill_switch_fan_out("resonant", CliOpsRunner())
+    assert fan is not None
+    await fan(True)
+    assert killswitch.paused_by(conn) == killswitch.UNRECORDED_SOURCE
+    assert await fan(False) == ["Cori: still paused (not paused by Resonant)"]
+    killswitch.release(conn, actor=OWNER)
+    assert await fan(False) == ["Cori: wasn't paused"]

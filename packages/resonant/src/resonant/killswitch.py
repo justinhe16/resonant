@@ -36,6 +36,7 @@ PauseHook = Callable[[sqlite3.Connection, bool], None]
 _hooks: list[PauseHook] = []
 PAUSED_BY_KEY = "paused_by"
 SIBLING_SOURCE = "sibling:resonant"  # personal Resonant's /kill, fanned out (PER-290)
+UNRECORDED_SOURCE = "unrecorded:before-sources"  # a pause older than paused_by
 
 
 def add_pause_hook(hook: PauseHook) -> Callable[[], None]:
@@ -66,8 +67,10 @@ def engage(conn: sqlite3.Connection, *, actor: str, reason: str | None = None) -
     first source stays)."""
     with atomic(conn):
         before = _state(conn)
-        if kv_get(conn, "paused") is not True or not isinstance(paused_by(conn), str):
+        if kv_get(conn, "paused") is not True:
             kv_set(conn, PAUSED_BY_KEY, actor)
+        elif paused_by(conn) is None:  # paused before sources were recorded: not this actor's
+            kv_set(conn, PAUSED_BY_KEY, UNRECORDED_SOURCE)
         kv_set(conn, "autonomy", "off")
         kv_set(conn, "paused", True)
         audit(conn, "killswitch.engage", requested_by=actor, reason=reason, before=before)

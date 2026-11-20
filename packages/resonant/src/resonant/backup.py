@@ -84,7 +84,6 @@ TIMEOUT_S = 900.0
 DAILY = "daily"
 PRE_RESTORE = "pre-restore"
 DEFAULT_PREFIX = "resonant"
-NAME_RE = re.compile(r"^resonant-(\d{4}-\d{2}-\d{2})\.db$")  # the default instance's
 LOCK_NAME = ".lock"
 SUNDAY = 6
 ERROR_MAX = 160

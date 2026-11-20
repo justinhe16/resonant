@@ -15,13 +15,13 @@ Lifecycle (the daemon drives it)::
     await stack.aclose()     # close the model client's HTTP pool
 
 Step limit. ``LocalRunner`` defaults to ``max_step_s=30`` but one step can run one tool for
-up to its ``timeout_s`` (``update_resonant``: 360s; an extension tool at most 300s; job specs
-never run in a chat step, so they don't count). A step limit below that would cancel a
-slow-but-healthy step mid-``/update`` into an ambiguous outcome. So the step limit is the
-longest tool timeout plus slack (``local_step_limit``; PER-256: the local runner makes no
-model call, the brain's one triage call adds ``model.timeout_s``, ``brain_step_limit``): the
-executor times out first and the user always gets an answer; the loop's stuck check stays a
-backstop for a wedged step.
+up to its ``timeout_s`` (``update_resonant``: 590s with the sibling slack of PER-290; an
+extension tool at most 300s; job specs never run in a chat step, so they don't count). A
+step limit below that would cancel a slow-but-healthy step mid-``/update`` into an ambiguous
+outcome. So the step limit is the longest tool timeout plus slack (``local_step_limit``;
+PER-256: the local runner makes no model call, the brain's one triage call adds
+``model.timeout_s``, ``brain_step_limit``): the executor times out first and the user always
+gets an answer; the loop's stuck check stays a backstop for a wedged step.
 
 Back up. After a restart the owner asked for (``restart_resonant``, ``update_resonant``),
 ``IMessageStack.start`` sends ``Back up (<commit>), down Ns`` once (``resonant.ops.back_up``).
