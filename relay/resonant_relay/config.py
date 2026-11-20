@@ -6,8 +6,8 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -20,6 +20,47 @@ _KEY_CHARS = re.compile(r"^[A-Za-z0-9._-]+$")
 _HOST = re.compile(r"^[a-z0-9.-]+$")
 _TOPIC = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DURATION = re.compile(r"^(\d+)\s*([smh]?)$")
+# The same rule as relay_private.ingest_tokens.instance and the daemon's instance.name.
+_INSTANCE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+DEFAULT_INSTANCE = "resonant"
+CHANNELS = ("ntfy", "webhook", "slack")
+SLACK_HOST = "hooks.slack.com"
+
+
+def instance_env(prefix: str, instance: str) -> str:
+    """`RELAY_NOTIFY_CORI` for ("RELAY_NOTIFY_", "cori"); a '-' becomes '_'."""
+    return prefix + instance.upper().replace("-", "_")
+
+
+def parse_instances(raw: str) -> tuple[str, ...]:
+    """RELAY_INSTANCES: a comma list of instance names, `resonant` when unset."""
+    names: list[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if not _INSTANCE.match(name):
+            raise ConfigError(
+                "RELAY_INSTANCES must be instance names (a lowercase letter, then up to 31 "
+                "lowercase letters, digits or '-'), comma-separated"
+            )
+        if name not in names:
+            names.append(name)
+    return tuple(names) or (DEFAULT_INSTANCE,)
+
+
+def check_slack_webhook(name: str, raw: str) -> str:
+    """A Slack Incoming Webhook URL: https on hooks.slack.com, nothing else. The value is a
+    secret, so no message here contains it."""
+    url = raw.strip()
+    if any(c in url for c in " \n\r\t"):
+        raise ConfigError(f"{name} has characters a URL can't contain")
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise ConfigError(f"{name} must be https")
+    if parts.hostname != SLACK_HOST or parts.port or parts.username or parts.password:
+        raise ConfigError(f"{name} must be a Slack Incoming Webhook on {SLACK_HOST}")
+    return url
 
 
 def parse_duration(name: str, raw: str) -> float:
@@ -101,12 +142,29 @@ class Settings:
     ntfy_topic: str = field(default="", repr=False)
     ntfy_token: str = field(default="", repr=False)
     webhook_url: str = field(default="", repr=False)
+    # Instances (PER-305): which to watch and where each one's alerts go.
+    instances: tuple[str, ...] = (DEFAULT_INSTANCE,)
+    # Instance -> channel names ("ntfy", "webhook", "slack"); every watched instance has one.
+    notify: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: {})
+    # Instance -> its own Slack Incoming Webhook URL (SLACK_WEBHOOK_<INSTANCE>), a secret.
+    slack_webhooks: Mapping[str, str] = field(default_factory=lambda: {}, repr=False)
+
+    def global_channels(self) -> tuple[str, ...]:
+        """The channels set up for everything: ntfy and/or the generic webhook."""
+        return tuple(
+            c for c, on in (("ntfy", self.ntfy_topic), ("webhook", self.webhook_url)) if on
+        )
+
+    def channels_for(self, instance: str) -> tuple[str, ...]:
+        return self.notify.get(instance) or self.global_channels()
 
     def secrets(self) -> list[str]:
         """Values that must never reach a log line."""
-        return [
-            s for s in (self.status_token, self.read_key, self.ntfy_topic, self.ntfy_token) if s
-        ] + ([self.webhook_url] if self.webhook_url else [])
+        return (
+            [s for s in (self.status_token, self.read_key, self.ntfy_topic, self.ntfy_token) if s]
+            + ([self.webhook_url] if self.webhook_url else [])
+            + [u for u in self.slack_webhooks.values() if u]
+        )
 
 
 def load(env: Mapping[str, str]) -> Settings:
@@ -162,7 +220,49 @@ def load(env: Mapping[str, str]) -> Settings:
         raise ConfigError("NTFY_TOPIC must be 1-64 letters, digits, '-' or '_'")
     if settings.stale_after < 2 * settings.check_every:
         raise ConfigError("STALE_AFTER must be at least twice CHECK_EVERY")
-    return settings
+    return _with_instances(settings, get)
+
+
+def _with_instances(settings: Settings, get: Callable[[str], str]) -> Settings:
+    """RELAY_INSTANCES, each instance's SLACK_WEBHOOK_<INSTANCE> and RELAY_NOTIFY_<INSTANCE>.
+
+    An instance's channels default to the global ones (today's behaviour) plus `slack` when
+    its own Slack webhook is set, so a missing Slack secret only means no Slack posts. An
+    explicit RELAY_NOTIFY_<INSTANCE> must name only channels that are set up."""
+    instances = parse_instances(get("RELAY_INSTANCES"))
+    slack: dict[str, str] = {}
+    for inst in instances:
+        name = instance_env("SLACK_WEBHOOK_", inst)
+        if raw := get(name):
+            slack[inst] = check_slack_webhook(name, raw)
+    glob = settings.global_channels()
+    notify: dict[str, tuple[str, ...]] = {}
+    for inst in instances:
+        name = instance_env("RELAY_NOTIFY_", inst)
+        raw = get(name)
+        if not raw:
+            notify[inst] = glob + (("slack",) if inst in slack else ())
+            continue
+        chosen: list[str] = []
+        for part in raw.split(","):
+            ch = part.strip().lower()
+            if not ch:
+                continue
+            if ch not in CHANNELS:
+                raise ConfigError(f"{name} lists an unknown channel (use ntfy, webhook, slack)")
+            if ch == "slack" and inst not in slack:
+                raise ConfigError(
+                    f"{name} lists slack but {instance_env('SLACK_WEBHOOK_', inst)} is not set"
+                )
+            if ch in ("ntfy", "webhook") and ch not in glob:
+                need = "NTFY_TOPIC" if ch == "ntfy" else "WEBHOOK_URL"
+                raise ConfigError(f"{name} lists {ch} but {need} is not set")
+            if ch not in chosen:
+                chosen.append(ch)
+        if not chosen:
+            raise ConfigError(f"{name} must list at least one channel")
+        notify[inst] = tuple(chosen)
+    return replace(settings, instances=instances, notify=notify, slack_webhooks=slack)
 
 
 def _missing(name: str) -> str:

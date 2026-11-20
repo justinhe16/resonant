@@ -1,4 +1,5 @@
-"""Alert channels: ntfy (push to the phone) and a generic JSON webhook (plan §1 D6)."""
+"""Alert channels: ntfy (push to the phone), a generic JSON webhook (plan §1 D6) and a Slack
+Incoming Webhook for one instance (PER-305: Cori's alerts in #voyager-pulse)."""
 
 from __future__ import annotations
 
@@ -21,6 +22,11 @@ class Alert:
     title: str
     message: str
     at: datetime
+    # The instance the incident is about; None for read_error (about the relay itself).
+    instance: str | None = None
+    # One code-built line naming the instance ("Cori: no snapshot for 7m (last 14:02 UTC)"),
+    # what Slack posts. Empty means the title is used.
+    summary: str = ""
 
 
 class Notifier(Protocol):
@@ -67,4 +73,26 @@ class WebhookNotifier:
             "message": alert.message,
             "at": alert.at.isoformat(),
         }
+        if alert.instance is not None:
+            body["instance"] = alert.instance
         self._send(self._url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+
+
+class SlackWebhookNotifier:
+    """POSTs `{"text": "🔴 Cori: …"}` to one instance's Slack Incoming Webhook. The URL is a
+    secret (config.check_slack_webhook checked it); it is never logged, and http.HttpError
+    messages never contain it."""
+
+    def __init__(self, instance: str, url: str, send: Sender = http.send):
+        self.name = f"slack:{instance}"
+        self._url = url
+        self._send = send
+
+    def send(self, alert: Alert) -> None:
+        mark = "🔴" if alert.event == "open" else "✅"
+        text = f"{mark} {alert.summary or alert.title}"
+        self._send(
+            self._url,
+            json.dumps({"text": text}).encode(),
+            {"Content-Type": "application/json; charset=utf-8"},
+        )
