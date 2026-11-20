@@ -14,7 +14,8 @@ system text the brains see, PER-268):
 - PER-292: the prompt to the asking task's own principal goes to that task's thread
   (``thread_of``); every other approver gets it in their own conversation.
 - PER-294: ``in_thread`` overrides that pair: a worker's trust check goes to the run's thread,
-  addressed to the run's requester (``trust.checks``).
+  addressed to the run's requester (``trust.checks``); a worker's ``resonant request`` too
+  (PER-296, ``runners.worker_requests``), addressed to an approver.
 
 ``remind_due`` (PER-261, the ``core/remind`` job, every minute) sends each prompt one
 reminder at half its TTL, to whoever got it: ``[A7] still waiting, expires in 15 min``. A
@@ -112,12 +113,17 @@ async def prompt_approvers(
     task_id: str,
     now: Callable[[], datetime],
     in_thread: tuple[str, MessageRef] | None = None,
+    summary: str | None = None,
 ) -> PromptResult:
     """Prompt every approver; see the module docstring for the failure rules. ``in_thread``
     (PER-294): ``(approver, thread)``, the one approver whose prompt goes in that thread
-    (default: the asking task's principal, in its thread)."""
+    (default: the asking task's principal, in its thread). ``summary`` (PER-296, code-built)
+    replaces the gate's in the prompt text (a worker's request says which run asks)."""
+    prompt = approval_prompt(decision)
+    if summary is not None:
+        prompt = replace(prompt, summary=summary, phrased=False)
     return await _prompt(
-        conn, channel, approval_prompt(decision), decision.approvers, (decision.approval_id,),
+        conn, channel, prompt, decision.approvers, (decision.approval_id,),
         task_id=task_id, now=now, in_thread=in_thread,
     )  # fmt: skip
 

@@ -17,21 +17,36 @@ of Slack. Nothing reaches the network.
   matching at once.
 - PER-303: with ``pulse.heartbeat.room: pulse`` the daemon's own ``core/pulse`` job posts the
   hourly alive line to ``#voyager-pulse`` (``channels.slack.rooms.pulse``) once per hour.
+- PER-296: Brian starts a run in the thread; its worker runs ``resonant request
+  dori.prod_deploy --arg commit=abc``. The approval is posted in the run's thread with
+  buttons; Miu's click changes nothing, Brian's runs the deploy once, and the run resumes with
+  the result.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
-from test_e2e_runner import FakeChatDB, RunModel, World, attach_claude, chat, make_world
+from test_e2e_runner import (
+    REPO,
+    FakeChatDB,
+    RunModel,
+    World,
+    attach_claude,
+    chat,
+    make_world,
+    settled,
+)
 from test_runner_claude import until
 
 from resonant.config import ChannelsConfig, PulseConfig
 from resonant.daemon import Daemon
+from resonant.e2e.extensions import install_fixture
 from resonant.executor import CallContext
 from resonant.extensions.pulse_job import pulse_job
 from resonant.extensions.scheduler import CoreDeps
@@ -50,6 +65,7 @@ from resonant.ops.fakes import FakeOpsRunner
 from resonant.secrets import SecretStore
 from resonant.store import approvals as ap
 from resonant.store import jobs as jobs_store
+from resonant.store.db import open_db
 from resonant.tools.notes import SCOPE as NOTES_SCOPE
 
 __all__ = ["chat"]  # the fixture
@@ -64,6 +80,26 @@ principals:
   miu: {{identities: ["slack:{MIU}"]}}
 """
 
+DORI = """\
+name: dori
+version: 1
+description: DORI deploys (a test fixture).
+tools:
+  prod_deploy:
+    description: Deploy voyager-service to production.
+    run: ./cli.py {commit}
+    effect: write
+    level: L1
+    args: {commit: string}
+    worker_requestable: true
+"""
+DORI_CLI = r"""
+import json, os, sys
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploys.log"), "a") as f:
+    f.write(sys.argv[1] + "\n")
+print(json.dumps({"deployed": sys.argv[1], "version": "v142"}))
+"""
+
 
 @contextlib.asynccontextmanager
 async def slack_daemon(
@@ -71,11 +107,14 @@ async def slack_daemon(
     home: Path,
     chat: FakeChatDB,
     mp: pytest.MonkeyPatch,
+    extra: list[str] | None = None,
     *,
     heartbeat: bool = False,
     tick_s: float | None = None,
 ) -> AsyncGenerator[tuple[World, Daemon, FakeSlackWeb, FakeSlackSocket]]:
-    w = make_world(tmp_path, home, chat, mp, scenario="happy", runner_opts={"ask_block_s": 0.5})
+    """``extra``: the fake worker's options; with them the dori extension is installed too."""
+    w = make_world(tmp_path, home, chat, mp, scenario="happy", runner_opts={"ask_block_s": 0.5},
+                   extra=extra or [])  # fmt: skip
     (home / "principals.yaml").write_text(PRINCIPALS)
     channels = ChannelsConfig.model_validate(
         {
@@ -96,6 +135,12 @@ async def slack_daemon(
     w.keychain.items.update(
         {"slack/bot_token": "xoxb-e2e-fake", "slack/app_token": "xapp-e2e-fake"}
     )
+    if extra:
+        conn = open_db(w.settings.db_path)
+        try:
+            install_fixture(w.settings, conn, DORI, {"cli.py": DORI_CLI})
+        finally:
+            conn.close()
     web, socket = FakeSlackWeb(team_id=TEAM_ID, bot_user_id=BOT), FakeSlackSocket()
     mp.setattr(slack_module, "sdk_transport", FakeSlackTransport(web, socket))
     daemon = w.daemon = Daemon(
@@ -535,3 +580,71 @@ async def test_a_channel_watcher_from_slack(
             "SELECT COUNT(*) FROM audit_log WHERE action = 'watch.started'"
         ).fetchone()[0]
         assert started == 2
+
+
+REQUEST = "dori.prod_deploy commit=abc"
+
+
+async def test_a_workers_request_is_approved_in_the_runs_thread_and_runs_once(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with slack_daemon(
+        tmp_path,
+        resonant_home,
+        chat,
+        monkeypatch,
+        extra=["--request", "dori.prod_deploy commit=abc"],
+    ) as (w, d, web, socket):
+        await socket.deliver(
+            mention(
+                BRIAN, f"<@{BOT}> /run {REPO} fix the typo in the README", team=TEAM_ID, ts=ROOT
+            )
+        )
+        await until(lambda: any(p.buttons for p in in_thread(web)), 60, "the request's prompt")
+        prompt = next(p for p in in_thread(web) if p.buttons)
+        assert prompt.text.startswith("[") and "R1 (for Brian) asks for dori: " in prompt.text
+        assert '"ship the fix"' in prompt.text and "This can't be undone" in prompt.text
+        (row,) = d.conn.execute(
+            "SELECT id, code, approvers, requested_by FROM approvals WHERE status = 'pending'"
+        ).fetchall()
+        assert (row["approvers"], row["requested_by"]) == ('["justin", "brian"]', "brian")
+        await until(settled(w, "R1", "waiting"), 20, "the request wait")
+        calls = json.loads((w.tmp() / "cli.json").read_text())
+        assert calls[0]["argv"][:4] == ["request", "dori.prod_deploy", "--arg", "commit=abc"]
+        assert calls[0]["rc"] == 3  # no decision within the CLI's wait
+        deploys = w.settings.extensions_dir / "dori" / "deploys.log"
+
+        # Miu's click changes nothing; Brian's runs the deploy once
+        await socket.deliver(
+            click(
+                MIU,
+                row["id"],
+                row["code"],
+                team=TEAM_ID,
+                channel="C0GENERAL",
+                ts=prompt.ts,
+                thread_ts=ROOT,
+                action_ts="1800000001.000001",
+            )
+        )
+        a = ap.get_approval(d.conn, row["id"])
+        assert a is not None and a.status == "pending" and not deploys.exists()
+        await socket.deliver(
+            click(
+                BRIAN,
+                row["id"],
+                row["code"],
+                team=TEAM_ID,
+                channel="C0GENERAL",
+                ts=prompt.ts,
+                thread_ts=ROOT,
+                action_ts="1800000002.000001",
+            )
+        )
+        await until(lambda: any("opened PR #41" in p.text for p in in_thread(web)), 60, "the end")
+        assert deploys.read_text() == "abc\n"
+        prompts = [c["prompt"] for c in json.loads((w.tmp() / "argv.json").read_text())]
+        assert prompts[1].startswith(
+            "Your request (dori.prod_deploy commit=abc): Approved by Brian: Done: "
+        ), prompts[1]
+        assert '"version": "v142"' in prompts[1]

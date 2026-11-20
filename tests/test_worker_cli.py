@@ -27,6 +27,7 @@ from resonant.runners.worker_cli import (
     Ask,
     Reply,
     Request,
+    ToolRequest,
     WorkerServer,
     descends_from,
     parse_request,
@@ -339,11 +340,60 @@ def test_parse_request_validates() -> None:
         {"cmd": "check", "system": "s", "action": "a", "what": "w", "cost_usd": float("nan")},
         {"cmd": "note", "text": "n", "urgent": "yes"},
         {"cmd": "rm"},
+        {"cmd": "request", "tool": "prod_deploy"},  # no extension
+        {"cmd": "request", "tool": "dori.prod_deploy", "args": ["commit=abc"]},
+        {"cmd": "request", "tool": "dori.prod_deploy", "args": {"commit": 1}},
+        {"cmd": "request", "tool": "dori.prod_deploy", "reason": "x" * 400},
         [],
     ]
     for bad in bads:
         with pytest.raises(worker_cli.BadRequest):
             parse_request(bad)
+
+
+def test_parse_request_reads_a_tool_request() -> None:
+    req = {"cmd": "request", "tool": " dori.prod_deploy ", "args": {"commit": "abc"},
+           "reason": " hotfix "}  # fmt: skip
+    assert parse_request(req) == ToolRequest("dori", "prod_deploy", (("commit", "abc"),), "hotfix")
+    assert parse_request({"cmd": "request", "tool": "a.b"}) == ToolRequest("a", "b")
+
+
+async def test_the_shims_request_lists_tools_and_sends_key_values(tmp_path: Path) -> None:
+    """PER-296: ``resonant request --help`` lists the instance's requestable tools; ``--arg
+    k=v`` pairs and ``--reason`` reach the socket as a ``ToolRequest``."""
+    ctl = worker_cli.make_ctl_dir(tmp_path / "w", "R1")
+    token = worker_cli.write_token(ctl)
+    tools = [("dori.prod_deploy", "Deploy DORI to production.")]
+    shim = worker_cli.write_shim(tmp_path / "bin", ctl, 5.0, sys.executable, requestable=tools)
+
+    def run(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=30)
+
+    helped = await asyncio.to_thread(run, "request", "--help")
+    assert helped.returncode == 0
+    assert "dori.prod_deploy  Deploy DORI to production." in helped.stdout
+    bad = await asyncio.to_thread(run, "request", "dori.prod_deploy", "--arg", "commit")
+    assert bad.returncode == 2 and "key=value" in bad.stdout
+    seen: list[Request] = []
+
+    async def handle(req: Request, gone: asyncio.Future[None]) -> Reply:
+        seen.append(req)
+        return Reply("Approved by Brian: Done.", 0)
+
+    server = WorkerServer(ctl, token, handle, lambda pid: True)
+    await server.start()
+    try:
+        done = await asyncio.to_thread(
+            run, "request", "dori.prod_deploy", "--arg", "commit=a=b", "--arg", "build=7",
+            "--reason", "hotfix",
+        )  # fmt: skip
+    finally:
+        await server.close()
+    assert (done.returncode, done.stdout.strip()) == (0, "Approved by Brian: Done.")
+    assert seen == [ToolRequest("dori", "prod_deploy", (("commit", "a=b"), ("build", "7")),
+                                "hotfix")]  # fmt: skip
+    none_here = worker_cli.shim_text(ctl, 5.0, sys.executable)
+    assert "REQUESTABLE = []" in none_here
 
 
 def test_descends_from_needs_the_same_leader() -> None:

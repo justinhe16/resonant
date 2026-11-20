@@ -1,5 +1,5 @@
 """Registered jobs (migration 032, PER-298): cron plus a prompt, one worker run per firing.
-PER-299 (migration 033) adds watchers: ``kind = 'watch'``, a Slack channel (``watch_channel``)
+PER-299 (migration 034) adds watchers: ``kind = 'watch'``, a Slack channel (``watch_channel``)
 and a filter (``filter_json``) in place of a schedule (``schedule`` is ``''``); each matching
 message starts one run (``resonant/channel_watchers.py``). ``watchers(conn, channel)`` lists
 the active ones of a channel; ``generation()`` moves on every create and state change in this

@@ -1,6 +1,6 @@
 """Channel watchers (PER-299): "whenever someone posts a bug in #support, triage it".
 
-A watcher is a registered job (``store/jobs.py``, migration 033) with ``kind = 'watch'``: a
+A watcher is a registered job (``store/jobs.py``, migration 034) with ``kind = 'watch'``: a
 Slack channel (``watch_channel``), a filter (``filter_json``) and a prompt. It is event
 driven: each matching message starts one Claude worker run as the watcher's creator. Approvers
 add one with ``add_job{channel, filter, prompt}`` (``tools/jobs.py``; the bot must be in the
@@ -11,10 +11,13 @@ channel, else "invite @Cori first"); list, pause, resume and delete work as for 
 - ``contains``: any of these words or phrases (case-insensitive);
 - ``from``: the sender is one of these (a Slack user id, ``slack:<U>``, a principal name or a
   display name);
-- ``regex``: at most ``REGEX_MAX`` (200) characters, matched with a timeout guard: nested
-  quantifiers and backreferences are refused when the watcher is made, the input is bounded
-  by ``channels.slack.max_body_chars`` and a match runs in a worker thread for at most
-  ``REGEX_TIMEOUT_S`` (a slow one is a no match, audited ``watch.regex_slow``);
+- ``regex``: at most ``REGEX_MAX`` (200) characters, matched with a timeout guard: risky
+  shapes (a quantified group that ends in a quantifier or holds an alternation, a group
+  repeated ``{n,}``, two ``.*``/``.+`` in a row, backreferences) are refused when the watcher
+  is made; a match runs in a separate helper process (:class:`RegexWorker`: CPython's ``re``
+  holds the GIL, so a thread can't be timed out) over at most ``REGEX_INPUT_MAX`` characters,
+  and one that takes over ``REGEX_TIMEOUT_S`` kills the helper and is a no match (audited
+  ``watch.regex_slow``; a new helper starts on the next match);
 - ``include_replies``: thread replies match too (default: only top-level messages);
 - then ``ask``: an optional yes/no from the local triage model over the wrapped message (a
   late, failed or bad answer is a no, audited ``watch.ask_failed``). There is no Claude call
@@ -33,8 +36,9 @@ dedupe_key="slack:<ch>:<ts>:J<n>")``, so a redelivered message starts nothing tw
 
 **Run** (:meth:`ChannelWatchers.route`, the loop's router hook for ``watch_match``): the
 watcher must still be active (a delete or pause stops matching at once), then ``ask``, then
-the rate cap (at most ``watchers.max_per_hour`` runs per watcher in the last hour, counted
-since its last resume; the next match pauses it with one note to its output), then
+the rate cap (at most ``watchers.max_per_hour`` runs started per watcher in the last hour,
+counted since its last resume in kv ``watch.recent:<J>``, so a restart keeps it; the next
+match pauses it with one note to its output), then
 ``start_run(repo, <prompt + the message wrapped untrusted>, principal=<creator, or the owner
 once the creator is gone>, report="now", channel_ref=<the message's thread for output
 thread>, job=RunLink(id, room, tainted=True))``. The run is **tainted from the start**: its
@@ -43,26 +47,36 @@ makes every ``resonant check`` ask (no trust rule allows it) and gives its ask n
 restart``/``update`` allowance. Output: ``thread`` (the matched message's thread), ``dm`` (the
 creator) or ``room:<key>``.
 
+The run is still an unguarded worker (the owner's choice): the taint makes every gated step
+ask, but a worker that obeys an injected line can still run a shell command itself. The
+prompt's wording, Cori's worker rules (PER-291) and the scoped worker env are the defense
+there, not a sandbox.
+
 Message bodies are PII: logs and audit rows carry ids, lengths and reasons, never text.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
+import os
 import re
+import signal
 import sqlite3
-from collections import deque
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from resonant import registered_jobs as rj
+from resonant.gate.codes import clean_external
 from resonant.router.prefixes import UNTRUSTED_RULE, wrap_untrusted
 from resonant.store import jobs as store
 from resonant.store.audit import audit
-from resonant.store.db import atomic, iso, utcnow
+from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant_sdk import Event
 
 if TYPE_CHECKING:
@@ -80,17 +94,25 @@ TERM_MAX = 100  # characters per contains term
 FROM_MAX = 20
 ASK_MAX = 300
 REGEX_MAX = 200
-REGEX_TIMEOUT_S = 0.05
+REGEX_TIMEOUT_S = 0.25  # per match, in the helper process (its round trip included)
+BOOT_TIMEOUT_S = 10.0  # the helper's start, apart from a match's timeout
+REGEX_INPUT_MAX = 4000  # characters of the message a regex sees
+SENDER_MAX = 40  # characters of a sender's name in the run's ask
+RECENT_KV = "watch.recent:"  # + job id: the start times inside the rate window
 RATE_WINDOW = timedelta(hours=1)
 ASK_MESSAGE_CHARS = 2000  # of the message the local model sees
 MAX_ASK = 4000  # ClaudeRunner's MAX_ASK
 CONTAINS_SHOWN = 3
 CHANNEL_NAME_KEY = "_channel_name"  # kept in filter_json beside the filter (list_jobs shows it)
 
-# A group that ends in a quantifier and is itself quantified: ``(a+)+``, ``(.*)*``,
-# ``(\w+\s?)+``, ``(x{2,})*``. The classic catastrophic-backtracking shape (the timeout guard
-# covers what this misses, like overlapping alternations).
+# Shapes that backtrack badly: a quantified group that ends in a quantifier (``(a+)+``,
+# ``(\w+\s?)+``, ``(x{2,})*``) or holds an alternation (``(a|aa)+``), a group repeated
+# ``{n,}``/``{n,m}`` (``(.*a){20}``), and two unbounded wildcards in a row (``.*.*``). The
+# helper process's timeout covers what these miss.
 _NESTED = re.compile(r"[+*}?]\)\??[+*{]")
+_ALTERNATION = re.compile(r"\([^()]*\|[^()]*\)\??[+*{]")
+_GROUP_REPEAT = re.compile(r"\)\{\d+,?\d*\}")
+_WILDCARDS = re.compile(r"\.[*+]\??.*\.[*+]")
 _BACKREF = re.compile(r"\\[1-9]|\(\?P=")
 
 
@@ -146,8 +168,12 @@ def check_regex(pattern: str) -> re.Pattern[str]:
     characters, invalid, nested quantifiers (``(a+)+``) or backreferences."""
     if not pattern or len(pattern) > REGEX_MAX:
         raise FilterError(f"filter regex is 1 to {REGEX_MAX} characters")
-    if _NESTED.search(pattern):
+    if _NESTED.search(pattern) or _GROUP_REPEAT.search(pattern):
         raise FilterError("filter regex has a nested quantifier like (a+)+; simplify it")
+    if _ALTERNATION.search(pattern):
+        raise FilterError("filter regex repeats an alternation like (a|b)+; use contains")
+    if _WILDCARDS.search(pattern):
+        raise FilterError("filter regex has two wildcards like .*.*; simplify it")
     if _BACKREF.search(pattern):
         raise FilterError("filter regex can't use backreferences")
     try:
@@ -226,15 +252,109 @@ def code_match(f: Filter, text: str, senders: Iterable[str]) -> bool:
     return True
 
 
+_HELPER = """
+import json, re, sys
+cache = {}
+for line in sys.stdin:
+    req = json.loads(line)
+    p = cache.get(req["p"])
+    if p is None:
+        p = cache[req["p"]] = re.compile(req["p"], re.IGNORECASE)
+    sys.stdout.write("1\\n" if p.search(req["t"]) else "0\\n")
+    sys.stdout.flush()
+"""
+
+
+class RegexWorker:
+    """Matches in a helper process (``python -I``), one at a time; a match over the timeout
+    kills the helper (the next match starts a new one). CPython's ``re`` holds the GIL, so
+    a match in a thread would stall the daemon; a process can be killed."""
+
+    def __init__(self) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+        self._lock = asyncio.Lock()
+
+    async def _start(self) -> asyncio.subprocess.Process:
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            proc = self._proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-I", "-c", _HELPER,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )  # fmt: skip
+            # wait for it to boot (outside the per-match timeout): one trivial match
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(b'{"p": "x", "t": ""}\n')
+            async with asyncio.timeout(BOOT_TIMEOUT_S):
+                await proc.stdin.drain()
+                if await proc.stdout.readline() != b"0\n":
+                    raise OSError("regex helper didn't start")
+        return proc
+
+    async def search(self, pattern: str, text: str, *, timeout_s: float) -> bool | None:
+        """True or False; None when it took longer than ``timeout_s`` (or the helper
+        failed): the helper is then killed."""
+        async with self._lock:
+            try:
+                proc = await self._start()
+                assert proc.stdin is not None and proc.stdout is not None
+                line = json.dumps({"p": pattern, "t": text[:REGEX_INPUT_MAX]}) + "\n"
+                proc.stdin.write(line.encode())
+                async with asyncio.timeout(timeout_s):
+                    await proc.stdin.drain()
+                    answer = await proc.stdout.readline()
+            except (TimeoutError, OSError, ValueError, AssertionError):
+                await self.aclose()
+                return None
+            if answer not in (b"0\n", b"1\n"):
+                await self.aclose()
+                return None
+            return answer == b"1\n"
+
+    async def aclose(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None or proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+    def kill_now(self) -> None:
+        """Kill the helper without the event loop (it may be closed): a new loop's first
+        match starts a new one."""
+        proc, self._proc = self._proc, None
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(OSError):
+                os.kill(proc.pid, signal.SIGKILL)
+
+
+_worker: tuple[asyncio.AbstractEventLoop, RegexWorker] | None = None
+
+
+def _loop_worker() -> RegexWorker:
+    """The helper of the running event loop (a process and a lock belong to one loop)."""
+    global _worker
+    loop = asyncio.get_running_loop()
+    if _worker is None or _worker[0] is not loop:
+        if _worker is not None:
+            _worker[1].kill_now()
+        _worker = (loop, RegexWorker())
+    return _worker[1]
+
+
 async def regex_match(
     pattern: re.Pattern[str], text: str, *, timeout_s: float = REGEX_TIMEOUT_S
 ) -> bool | None:
-    """``pattern.search(text)`` in a worker thread, at most ``timeout_s``: None when slow."""
-    try:
-        found = await asyncio.wait_for(asyncio.to_thread(pattern.search, text), timeout_s)
-    except TimeoutError:
-        return None
-    return found is not None
+    """``pattern`` (compiled by :func:`check_regex`) searched in ``text`` in the helper
+    process, at most ``timeout_s``: None when slow."""
+    return await _loop_worker().search(pattern.pattern, text, timeout_s=timeout_s)
+
+
+async def close_regex_worker() -> None:
+    """Stop the helper (daemon shutdown, tests)."""
+    if _worker is not None and _worker[0] is asyncio.get_running_loop():
+        await _worker[1].aclose()
 
 
 @dataclass(frozen=True)
@@ -375,7 +495,6 @@ class ChannelWatchers:
         self.slack = slack
         self.clock = clock
         self.index = WatchIndex(conn)
-        self._recent: dict[str, deque[datetime]] = {}
 
     def _audit(self, action: str, **detail: Any) -> None:
         with atomic(self.conn):
@@ -443,26 +562,36 @@ class ChannelWatchers:
             return False
         return True
 
-    def _capped(self, job: store.Job, now: datetime) -> bool:
-        """``max_per_hour`` runs already in the last hour (counted since its last resume:
-        resuming moves ``last_due`` to then). Records this one when not capped."""
+    def _recent(self, job: store.Job, now: datetime) -> list[datetime]:
+        """The runs started inside the rate window (the last hour, counted since its last
+        resume: resuming moves ``last_due`` to then), from kv (a restart keeps them)."""
         since = now - RATE_WINDOW
         if job.last_due is not None and job.last_due > since:
             since = job.last_due
-        recent = self._recent.setdefault(job.id, deque())
-        while recent and recent[0] < since:
-            recent.popleft()
-        if len(recent) >= self.config.max_per_hour:
-            return True
-        recent.append(now)
-        return False
+        raw: object = kv_get(self.conn, RECENT_KV + job.id)
+        out: list[datetime] = []
+        for v in cast(list[object], raw) if isinstance(raw, list) else []:
+            with contextlib.suppress(TypeError, ValueError):
+                at = datetime.fromisoformat(cast(str, v))
+                if at >= since:
+                    out.append(at)
+        return out
+
+    def _capped(self, job: store.Job, now: datetime) -> bool:
+        return len(self._recent(job, now)) >= self.config.max_per_hour
+
+    def _count(self, job: store.Job, now: datetime) -> None:
+        recent = [*self._recent(job, now), now][-self.config.max_per_hour :]
+        with atomic(self.conn):
+            kv_set(self.conn, RECENT_KV + job.id, [iso(t) for t in recent])
 
     async def _pause(self, job: store.Job, principal: str, now: datetime) -> None:
         cap = self.config.max_per_hour
         why = f"more than {cap} matches in an hour"
         if not store.set_state(self.conn, job.id, "paused", now, expect=("active",), error=why):
             return  # paused by another match first: one note
-        self._recent.pop(job.id, None)
+        with atomic(self.conn):
+            kv_set(self.conn, RECENT_KV + job.id, [])
         self._audit("watch.paused", requested_by=principal, job=job.id, reason="rate_cap",
                     max_per_hour=cap)  # fmt: skip
         text = (
@@ -505,7 +634,8 @@ class ChannelWatchers:
                 "thread": f"{channel}:{thread_ts}",
                 "ref": ref,
             }
-        sender = _str(payload, "sender") or _str(payload, "identity") or "someone"
+        sender = clean_external(_str(payload, "sender") or "")[:SENDER_MAX].strip()
+        sender = sender or _str(payload, "identity") or "someone"
         result = await runner.start_run(
             job.repo,
             run_ask(job, sender=sender, channel=channel, text=text),
@@ -520,6 +650,7 @@ class ChannelWatchers:
                         reason=result.reason[:120])  # fmt: skip
             return
         store.started(self.conn, job.id, result.code, now)
+        self._count(job, now)  # only a started run counts against the cap
         self._audit("watch.started", requested_by=principal, job=job.id, run=result.code,
                     ref=ref, length=len(text))  # fmt: skip
         log.info("watcher %s started %s (%d chars)", job.id, result.code, len(text))
@@ -536,9 +667,11 @@ __all__ = [
     "ChannelWatchers",
     "Filter",
     "FilterError",
+    "RegexWorker",
     "WatchIndex",
     "Watcher",
     "check_regex",
+    "close_regex_worker",
     "code_match",
     "describe",
     "job_filter",

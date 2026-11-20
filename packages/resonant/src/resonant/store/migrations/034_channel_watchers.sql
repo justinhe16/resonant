@@ -1,4 +1,4 @@
--- 033: channel watchers (PER-299, ``resonant/channel_watchers.py``; ``store/jobs.py``).
+-- 034: channel watchers (PER-299, ``resonant/channel_watchers.py``; ``store/jobs.py``).
 -- A watcher is a ``registered_jobs`` row with ``kind = 'watch'``: a Slack channel, a filter and
 -- a prompt. Each matching message in ``watch_channel`` (a Slack channel id, ``C…``/``G…``)
 -- starts one Claude worker run as ``created_by``. ``schedule`` is '' for a watcher.

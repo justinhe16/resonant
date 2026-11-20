@@ -108,7 +108,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 from resonant.backup import health_check as backup_health
 from resonant.brain.facts import FactStore, facts_dir
-from resonant.channel_watchers import WATCH_EVENT, ChannelWatchers
+from resonant.channel_watchers import WATCH_EVENT, ChannelWatchers, close_regex_worker
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
 from resonant.executor import ToolFailed
@@ -146,8 +146,10 @@ from resonant.runners.reminder import ReminderRunner
 from resonant.runners.voice import ClaudeVoice
 from resonant.runners.watch import WatchRunner
 from resonant.runners.worker_desk import SelfOps
+from resonant.runners.worker_requests import WorkerRequests
 from resonant.secrets import SecretStore
 from resonant.store.db import utcnow
+from resonant.toolcore import ToolCore
 from resonant.tools.ops import Ops
 from resonant.trust.checks import TrustChecks
 from resonant_sdk import Event, ToolSpec
@@ -314,6 +316,7 @@ class Stack:
         created it."""
         if self.brain is not None:
             await self.brain.aclose()  # background history folds use the model
+        await close_regex_worker()  # PER-299: the watchers' regex helper process
         close, self._close_model = self._close_model, None
         if close is not None:
             await close()
@@ -576,6 +579,14 @@ def build_stack(
         else None
     )
     components.voice = voice
+    # PER-296: a worker's `resonant request` calls a worker_requestable extension tool through
+    # the gate as the run's requester; its approval is asked in the run's thread
+    requests = WorkerRequests(
+        conn,
+        core=ToolCore(conn, registry=components.registry, gate=gate, executor=components.executor),
+        channel=channel,
+        principals=components.principals,
+    )
     claude = ClaudeRunner(
         conn,
         runner=settings.runner,
@@ -600,6 +611,7 @@ def build_stack(
         resonant_home=settings.home,
         instance=settings.instance.name,
         bridge=bridge,
+        requests=requests,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude

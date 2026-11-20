@@ -26,6 +26,9 @@ Invariants, enforced here at registration:
   a template can't hide what a call does. An arg outside ``[...]`` that is missing falls
   back to the arg list. Write it as what the tool
   would do, lower case: it follows "OK to", "Couldn't" and "Dry run: would".
+- ``worker_requestable=True`` (PER-296) marks an extension tool a Claude worker may ask for
+  with ``resonant request <ext>.<tool>``: the call goes through the gate as the run's
+  requester, and the approval is asked in the run's thread. Only extension tools carry it.
 - ``grant`` names a builtin a member may request through ``grants: {"builtin:<grant>":
   [request]}`` (``resonant.principals``). Only global L0 reads can carry one.
 """
@@ -129,6 +132,7 @@ class ToolSpec(BaseModel):
     taint_exempt: bool = False
     grant: str | None = Field(default=None, pattern=GRANT_PATTERN)
     approval_summary: str | None = None
+    worker_requestable: bool = False  # PER-296: ``resonant request`` may name it
 
     @model_validator(mode="after")
     def _invariants(self) -> Self:
@@ -151,6 +155,8 @@ class ToolSpec(BaseModel):
             self.extension is not None or self.effect is not Effect.READ or self.secrets
         ):
             raise ValueError(f"{self.name}: only builtin L0 reads can carry a member grant")
+        if self.worker_requestable and self.extension is None:
+            raise ValueError(f"{self.name}: only extension tools can be worker requestable")
         return self
 
     @property
