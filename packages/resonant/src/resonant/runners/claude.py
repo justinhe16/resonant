@@ -244,6 +244,7 @@ from resonant_sdk import Event
 if TYPE_CHECKING:
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
+    from resonant.notify_owner import OwnerBridge
 
 log = logging.getLogger(__name__)
 
@@ -963,6 +964,7 @@ class ClaudeRunner:
         end_grace_s: float = END_GRACE_S,
         voice: Voice | None = None,
         api_port: int = API_PORT,
+        bridge: OwnerBridge | None = None,
         resonant_home: Path | None = None,
         instance: str = inst.DEFAULT_INSTANCE,
     ) -> None:
@@ -999,11 +1001,15 @@ class ClaudeRunner:
 
         PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies.
 
+        PER-301: ``bridge`` (an instance with ``notify_owner``) also forwards a run's urgent
+        failure to personal Resonant, which texts the owner.
+
         PER-291: ``resonant_home`` (default ``$RESONANT_HOME`` or ``~/.resonant``) and
         ``instance`` are put in every session's environment (``RESONANT_HOME``,
         ``RESONANT_INSTANCE``), so a stray real ``resonant`` call targets this instance."""
         self.conn = conn
         self.api_port = api_port
+        self.bridge = bridge
         self.resonant_home = resonant_home or default_resonant_home()
         self.instance = instance
         self._warned: set[str] = set()  # PER-291: ⚠ lines the owner already got this process
@@ -3537,6 +3543,8 @@ class ClaudeRunner:
                 level = "now"
             self.reports.audit_report(run, event, level)
             item = self.reports.ended(run, title, urgent=event == "failed" or warned)
+            if self.bridge is not None and event == "failed" and level == "now":
+                self.bridge.forward(f"run/{run.code}", title)  # PER-301
             if level == "digest":
                 self._unrevoked.pop(run.code, None)  # the line carries the warning
                 return

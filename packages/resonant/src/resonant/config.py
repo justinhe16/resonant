@@ -123,6 +123,35 @@ class ApiConfig(_Section):
         return v
 
 
+class NotifyOwnerConfig(_Section):
+    """PER-301: an instance that isn't personal Resonant (Cori) forwards its urgent items to
+    personal Resonant's ``POST /api/notify-owner``, which texts the owner over iMessage
+    (``resonant.notify_owner``). Absent: nothing is forwarded."""
+
+    url: str = "http://127.0.0.1:7777"  # personal Resonant's loopback API
+    # This instance's Keychain item with the shared token; personal Resonant holds the same
+    # value as ``core/notify_token_<this instance>``.
+    token_ref: str = "core/notify_token"  # noqa: S105 - a Keychain ref, not a value
+    timeout_s: float = Field(default=5.0, gt=0, le=30)
+
+    @field_validator("url")
+    @classmethod
+    def _loopback_url(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not is_loopback(parsed.hostname or ""):
+            raise ValueError("notify_owner.url must be an http URL on a loopback host")
+        if parsed.path not in ("", "/") or parsed.query or parsed.username or parsed.password:
+            raise ValueError("notify_owner.url is the API's base URL, like http://127.0.0.1:7777")
+        return v.rstrip("/")
+
+    @field_validator("token_ref")
+    @classmethod
+    def _ref(cls, v: str) -> str:
+        from resonant.secrets import validate_ref
+
+        return validate_ref(v)
+
+
 class HealthConfig(_Section):
     healthchecks_url: str | None = None
     ping_every_s: float = Field(default=60.0, gt=0)
@@ -1150,6 +1179,8 @@ class Settings(BaseSettings):
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     trust: TrustConfig = Field(default_factory=TrustConfig)
     brain: BrainConfig = Field(default_factory=BrainConfig)
+    # PER-301: another instance's bridge to personal Resonant (None: no forwarding)
+    notify_owner: NotifyOwnerConfig | None = None
 
     @field_validator("home")
     @classmethod
@@ -1256,6 +1287,16 @@ class Settings(BaseSettings):
                     raise ValueError(
                         f"brain.read_roots entry {root} is inside instance {owner}'s home"
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _notify_owner_elsewhere(self) -> Self:
+        """PER-301: personal Resonant is the one that texts the owner; it never forwards to
+        itself."""
+        if self.notify_owner is not None and inst.is_default(self.instance.name):
+            raise ValueError(
+                f"notify_owner is for another instance; {inst.DEFAULT_INSTANCE} texts the owner"
+            )
         return self
 
     @model_validator(mode="after")

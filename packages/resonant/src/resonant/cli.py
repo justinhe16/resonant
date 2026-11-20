@@ -1541,6 +1541,58 @@ def selftest_imessage(
         raise typer.Exit(1)
 
 
+# --- notify-owner (PER-301) --------------------------------------------------------------
+
+notify_owner_app = typer.Typer(
+    no_args_is_help=True,
+    help="Another instance's bridge to personal Resonant's texts (notify_owner in config).",
+)
+app.add_typer(notify_owner_app, name="notify-owner")
+
+
+@notify_owner_app.command("test")
+def notify_owner_test(
+    clear: Annotated[
+        bool, typer.Option("--clear", help="Send the test alert's all-clear instead.")
+    ] = False,
+) -> None:
+    """Send a fixed test alert through personal Resonant (owner-run; it texts you). Run it on
+    the instance with notify_owner set, e.g. `resonant --instance cori notify-owner test`.
+    A repeat sends nothing until `--clear` has closed the last one. Exit 0 when personal
+    Resonant took it, else 1."""
+    import asyncio
+
+    from resonant.notify_owner import send_test
+
+    settings = load_settings()
+    cfg = settings.notify_owner
+    if cfg is None:
+        typer.echo("error: notify_owner isn't set in this instance's config", err=True)
+        raise typer.Exit(2)
+    store = _secret_store()
+    try:
+        d = asyncio.run(send_test(cfg, settings.instance.name, store, clear=clear))
+    except SecretError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
+    if d.status is None:
+        typer.echo(f"personal Resonant unreachable at {cfg.url} ({d.reason})", err=True)
+        raise typer.Exit(1)
+    if not d.ok:
+        why = {401: "notify token mismatch", 404: "not set up there", 422: "refused as invalid"}
+        typer.echo(
+            f"personal Resonant answered {d.status}: {why.get(d.status, d.reason)}", err=True
+        )
+        raise typer.Exit(1)
+    said = {
+        "sent": "texted",
+        "held": f"held ({d.reason}); the hourly pulse carries it",
+        "told": "already told: nothing sent (send --clear, then test again)",
+        "unreachable": "stored, but no channel took the text",
+    }
+    typer.echo(f"personal Resonant: {said.get(d.outcome or '', d.outcome)}")
+
+
 # --- evals -----------------------------------------------------------------------------
 
 eval_app = typer.Typer(no_args_is_help=True, help="Evals on your own sets (see evals/README.md).")

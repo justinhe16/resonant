@@ -48,13 +48,16 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from resonant.gateway.channel import ChannelError, MessageRef, SelfTestResult
 from resonant.models import ProbeResult
 from resonant.principals import KNOWN_CHANNELS
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
+
+if TYPE_CHECKING:
+    from resonant.notify_owner import OwnerBridge
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +68,7 @@ EXT_CHECK_PREFIX = "ext:"
 MODEL_PROBE_KV = "model.probe"  # same key and shape as `resonant model probe`
 SELFTEST_KV = "imessage.selftest"  # written by IMessageChannel.self_test
 DEAD_LETTER_ACTION = "event.dead_letter"
+BRIDGED_KV = "notify_owner.health"  # PER-301: checks whose incident went to personal Resonant
 
 GB = 1024**3
 _MAX_DETAIL = 120
@@ -312,8 +316,10 @@ class HealthMonitor:
         backup_check: Callable[[datetime], CheckResult | None] | None = None,
         channels: Mapping[str, MonitoredChannel] | None = None,
         channel_failures: Callable[[], Mapping[str, str]] | None = None,
+        bridge: OwnerBridge | None = None,
     ) -> None:
         self.conn = conn
+        self.bridge = bridge
         self.model = model
         self.channel = channel
         self.channels: dict[str, MonitoredChannel] = (
@@ -625,7 +631,27 @@ class HealthMonitor:
         names = list(self.channels) or ["imessage"]
         return any((s := self.states.get(n)) is None or s.state != "degraded" for n in names)
 
+    def _bridge(self, states: dict[str, CheckState]) -> None:
+        """PER-301: an instance with ``notify_owner`` forwards each incident that reaches
+        ``alert_after`` (and its recovery) to personal Resonant, whatever its own channel can
+        do. Which checks were forwarded is kv ``notify_owner.health``."""
+        if self.bridge is None:
+            return
+        raw: object = kv_get(self.conn, BRIDGED_KV)
+        was = {str(n) for n in cast(list[Any], raw)} if isinstance(raw, list) else set[str]()
+        now_bridged = set(was)
+        for name, s in states.items():
+            if s.state == "degraded" and s.consecutive >= self.alert_after and name not in was:
+                self.bridge.forward(f"health/{name}", scrub(f"{name}: {s.detail or 'degraded'}"))
+                now_bridged.add(name)
+            elif s.state == "ok" and name in was:
+                self.bridge.forward(f"health/{name}", f"{name} is healthy again", clear=True)
+                now_bridged.discard(name)
+        if now_bridged != was:
+            self._kv_write(BRIDGED_KV, sorted(now_bridged))
+
     async def _notify(self, states: dict[str, CheckState], now: datetime) -> None:
+        self._bridge(states)
         if not self._can_text_owner():
             return
         changed = False

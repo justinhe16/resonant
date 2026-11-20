@@ -126,6 +126,7 @@ from resonant.gateway.imessage.sender import OsaRunner
 from resonant.loop import Loop, NewTask
 from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor, MonitoredChannel
+from resonant.notify_owner import OwnerBridge
 from resonant.ops import SubprocessRunner, back_up
 from resonant.ops.siblings import kill_switch_fan_out
 from resonant.principals import Principals
@@ -223,6 +224,7 @@ class Stack:
     notifier: Notifier | None = None
     extensions: ExtensionHost | None = None  # gets ``alert`` once the channel is up
     pulse: Pulse | None = None
+    bridge: OwnerBridge | None = None  # PER-301: notify_owner set (the daemon runs it)
     trust: TrustChecks | None = None  # workers' ``resonant check`` (EM-3 calls request_check)
     brain: BrainRunner | None = None  # runner="brain" (BR-1)
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
@@ -453,12 +455,26 @@ def build_stack(
         manifest_of=(lambda _ext: None) if host is None else host.manifest,
         config=settings.extensions.notify,
     )
+    # PER-301: an instance with notify_owner forwards its urgent items to personal Resonant
+    bridge = (
+        None
+        if settings.notify_owner is None
+        else OwnerBridge(
+            conn,
+            settings.notify_owner,
+            instance=settings.instance.name,
+            secrets=components.executor.secrets or SecretStore(service=settings.keychain_service),
+            channel=channel,
+            owner=components.principals.owner if components.principals_loaded else None,
+        )
+    )
     pulse = Pulse(
         conn,
         channel=channel,
         recipients=recipients,
         manifest_of=(lambda _ext: None) if host is None else host.manifest,
         config=settings.extensions.notify,
+        bridge=bridge,
     )
     loop.router = route_event(router.route, notifier, pulse)
     jobs = JobRunner(
@@ -523,6 +539,7 @@ def build_stack(
         # PER-291: a stray real `resonant` call from a worker targets this instance
         resonant_home=settings.home,
         instance=settings.instance.name,
+        bridge=bridge,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
@@ -601,6 +618,7 @@ def build_stack(
         # PER-292: one check per adapter (every adapter reports health and self-tests)
         channels=cast("Mapping[str, MonitoredChannel]", channel.adapters),
         channel_failures=lambda: channel.failures,
+        bridge=bridge,
         owner=owner,
         daemon_healthy=daemon_healthy,
         db_path=settings.db_path,
@@ -633,6 +651,7 @@ def build_stack(
         claude=claude,
         notifier=notifier,
         pulse=pulse,
+        bridge=bridge,
         trust=trust,
         brain=brain,
         extensions=components.extensions,
