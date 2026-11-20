@@ -24,10 +24,12 @@ directory (``git -C <dir>`` does the same for that segment). Then:
   read (``echo x | sh``) is a compound write as before.
 - **never** (refused outright, never asked): ``resonant secret ...``, ``resonant ext
   add|update``, ``security`` (the login keychain), a write under ``RESONANT_HOME`` (except
-  the brain's own scratch dir), ``kill``/``pkill``/``killall`` of the daemon (or of every
-  process: ``kill -1``), and ``launchctl`` stopping or removing it. Checked in every
-  segment, inside ``sh -c``/``eval`` strings and behind wrappers (``env``, ``sudo``,
-  ``xargs``, ``uv run``...).
+  the brain's own scratch dir) or under any other instance's home (PER-290: every
+  ``~/.resonant-<name>``, ``~/.resonant`` from another instance, and each sibling's
+  ``RESONANT_HOME``, so neither brain can write the other's store or config),
+  ``kill``/``pkill``/``killall`` of the daemon (or of every process: ``kill -1``), and
+  ``launchctl`` stopping or removing it. Checked in every segment, inside ``sh -c``/``eval``
+  strings and behind wrappers (``env``, ``sudo``, ``xargs``, ``uv run``...).
 - **L3** (runs, reports; asks when the turn is tainted): one simple command that is local
   branch work (``git add``, ``commit``, ``fetch``, ``switch``, ``stash``, ``checkout -b``,
   a new branch or tag), ``git push`` of a branch that isn't the default one (no force, no
@@ -222,7 +224,9 @@ _GREP_VALUES = frozenset({"-e", "--regexp", "-g", "--glob", "-t", "--type", "-m"
                           "-C"})  # fmt: skip
 _REMOTE = re.compile(r'^\s*\[remote "([^"]+)"\]', re.M)
 UNKNOWN_CWD = "?"  # the shell's directory after a cd we couldn't follow
-_HOMEISH = re.compile(r"(^|/)(\.resonant|Keychains)(/|$)")
+_HOMEISH = re.compile(r"(^|/)(\.resonant(-[a-z][a-z0-9-]*)?|Keychains)(/|$)")
+# An instance's default home, as the first part of a path under the user's home (PER-290).
+_INSTANCE_HOME = re.compile(r"\.resonant(-[a-z][a-z0-9-]{0,31})?")
 _CWD_RESET = re.compile(r"Shell cwd was reset to (/[^\n]+)")
 _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 HOME_WRITE = "writes under ~/.resonant or the keychains aren't allowed"
@@ -285,7 +289,9 @@ class ShellPolicy:
     ``read_ok(path)``: a path the read tools may read (the read roots, off the deny list).
     ``home``: ``RESONANT_HOME`` (writes under it are never allowed) and ``scratch``: the
     brain's own dir under it (``<RESONANT_HOME>/ask``) and the system temp dirs, where a
-    write is L3 like a worktree's. ``daemon_pid``: a ``kill`` of it is never allowed."""
+    write is L3 like a worktree's. ``daemon_pid``: a ``kill`` of it is never allowed.
+    ``others``: the sibling instances' homes (PER-290), never written either, like every
+    ``~/.resonant`` / ``~/.resonant-<name>``."""
 
     def __init__(
         self,
@@ -296,14 +302,17 @@ class ShellPolicy:
         user_home: Path | None = None,
         daemon_pid: int | None = None,
         temps: Sequence[Path] | None = None,
+        others: Sequence[Path] = (),
     ) -> None:
         self.read_ok = read_ok
         self.home = _real(str(home))
+        self.others = tuple(dict.fromkeys(_real(str(p)) for p in others))
         self.own = tuple(dict.fromkeys(_real(str(p)) for p in scratch))
         tmp = _temp_dirs() if temps is None else temps
         self.scratch = tuple(dict.fromkeys([*self.own, *(_real(str(p)) for p in tmp)]))
         self.user_home = str(user_home or Path.home())
         self.keychains = _real(os.path.join(self.user_home, "Library", "Keychains"))
+        self.user_real = _real(self.user_home)
         self.daemon_pid = daemon_pid if daemon_pid is not None else os.getpid()
 
     # -- the bridge's entry point --
@@ -644,10 +653,20 @@ class ShellPolicy:
         return None
 
     def _under_home(self, real: str) -> bool:
-        """Never written: ``RESONANT_HOME`` (but the brain's own dir) and the keychains."""
-        if _within(real, self.keychains):
+        """Never written: ``RESONANT_HOME`` (but the brain's own dir), every instance's home
+        (PER-290: the siblings' and any ``~/.resonant[-<name>]``) and the keychains."""
+        if _within(real, self.keychains) or any(_within(real, o) for o in self.others):
             return True
-        return _within(real, self.home) and not any(_within(real, s) for s in self.own)
+        if any(_within(real, s) for s in self.own):
+            return False
+        return _within(real, self.home) or self._instance_home(real)
+
+    def _instance_home(self, real: str) -> bool:
+        """``real`` is in ``~/.resonant`` or some ``~/.resonant-<name>``."""
+        if not _within(real, self.user_real) or real == self.user_real:
+            return False
+        first = real[len(self.user_real.rstrip("/")) + 1 :].split("/", 1)[0]
+        return _INSTANCE_HOME.fullmatch(first) is not None
 
     def _writes_home(self, seg: _Seg, *, known: bool = True) -> bool:
         """A write that touches ``RESONANT_HOME`` or the keychains: run from inside it, or

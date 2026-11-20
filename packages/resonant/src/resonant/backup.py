@@ -20,6 +20,11 @@ Retention (:func:`keep_days`): the newest ``backup.keep_daily`` (7) copies plus 
 deleted. Anything else, such as a pre-migration copy taken by hand at deploy time or the
 ``backups/pre-restore/`` copies ``restore`` makes, is never touched.
 
+Names per instance (PER-290): the default instance's copies are ``resonant-YYYY-MM-DD.db`` as
+always; any other instance names its copies ``<name>-YYYY-MM-DD.db`` (``cori-…``), and
+listing and pruning match only the instance's own prefix (``prefix_of``), so two instances
+may share a ``backup.extra_dir`` and each keeps and prunes only its own files.
+
 ``backup.extra_dir`` (off by default): the verified copy is also copied there (temp name,
 integrity check, rename, 0600) with the same retention. The directory must already exist,
 so an unmounted disk is a reported failure rather than a folder on the boot disk. Resonant
@@ -78,7 +83,7 @@ CATCHUP = timedelta(hours=20)  # the daemon was down at 03:30: catch up later th
 TIMEOUT_S = 900.0
 DAILY = "daily"
 PRE_RESTORE = "pre-restore"
-NAME_RE = re.compile(r"^resonant-(\d{4}-\d{2}-\d{2})\.db$")
+DEFAULT_PREFIX = "resonant"
 LOCK_NAME = ".lock"
 SUNDAY = 6
 ERROR_MAX = 160
@@ -109,8 +114,18 @@ def integrity_check(conn: sqlite3.Connection) -> str:
 # --- names, dates, retention -----------------------------------------------------------
 
 
-def backup_name(day: date) -> str:
-    return f"resonant-{day.isoformat()}.db"
+def name_re(prefix: str = DEFAULT_PREFIX) -> re.Pattern[str]:
+    """``<prefix>-YYYY-MM-DD.db``, matched whole."""
+    return re.compile(rf"^{re.escape(prefix)}-(\d{{4}}-\d{{2}}-\d{{2}})\.db$")
+
+
+def prefix_of(settings: Settings) -> str:
+    """The instance's copy prefix: ``resonant`` for the default instance, else its name."""
+    return settings.instance.name
+
+
+def backup_name(day: date, prefix: str = DEFAULT_PREFIX) -> str:
+    return f"{prefix}-{day.isoformat()}.db"
 
 
 def local_day(now: datetime, tz: str) -> date:
@@ -125,16 +140,18 @@ def pre_restore_dir(settings: Settings) -> Path:
     return settings.backups_dir / PRE_RESTORE
 
 
-def copies(directory: Path) -> list[tuple[date, Path]]:
-    """``(day, path)`` of every regular ``resonant-YYYY-MM-DD.db`` file, newest first.
-    Symlinks and anything else are ignored (and so never pruned)."""
+def copies(directory: Path, prefix: str = DEFAULT_PREFIX) -> list[tuple[date, Path]]:
+    """``(day, path)`` of every regular ``<prefix>-YYYY-MM-DD.db`` file, newest first.
+    Symlinks and anything else (another instance's copies too) are ignored, and so never
+    pruned."""
+    pattern = name_re(prefix)
     found: list[tuple[date, Path]] = []
     try:
         entries = list(directory.iterdir())
     except FileNotFoundError:
         return []
     for p in entries:
-        m = NAME_RE.fullmatch(p.name)
+        m = pattern.fullmatch(p.name)
         if m is None or p.is_symlink() or not p.is_file():
             continue
         try:
@@ -152,9 +169,11 @@ def keep_days(days: Iterable[date], *, keep_daily: int, keep_weekly: int) -> set
     return set(ordered[: max(keep_daily, 0)]) | set(sundays[: max(keep_weekly, 0)])
 
 
-def prune(directory: Path, *, keep_daily: int, keep_weekly: int) -> list[Path]:
-    """Delete the copies :func:`keep_days` doesn't keep; returns what was deleted."""
-    found = copies(directory)
+def prune(
+    directory: Path, *, keep_daily: int, keep_weekly: int, prefix: str = DEFAULT_PREFIX
+) -> list[Path]:
+    """Delete the ``prefix`` copies :func:`keep_days` doesn't keep; returns what was deleted."""
+    found = copies(directory, prefix)
     keep = keep_days((d for d, _ in found), keep_daily=keep_daily, keep_weekly=keep_weekly)
     removed: list[Path] = []
     for day, path in found:
@@ -332,9 +351,9 @@ def _describe(e: BaseException) -> str:
     return _clip(str(e) if isinstance(e, BackupError) else f"{type(e).__name__}: {e}")
 
 
-def _prune(directory: Path, keep: dict[str, int]) -> tuple[list[str], str | None]:
+def _prune(directory: Path, keep: dict[str, int], prefix: str) -> tuple[list[str], str | None]:
     try:
-        return [p.name for p in prune(directory, **keep)], None
+        return [p.name for p in prune(directory, **keep, prefix=prefix)], None
     except OSError as e:
         return [], _describe(e)
 
@@ -350,7 +369,8 @@ def create_backup(
     start = time.monotonic()
     daily = daily_dir(settings)
     try:
-        name = backup_name(local_day(now, settings.timezone))
+        prefix = prefix_of(settings)
+        name = backup_name(local_day(now, settings.timezone), prefix)
         ensure_dir(settings.backups_dir)
         ensure_dir(daily)
     except (OSError, ValueError) as e:
@@ -358,7 +378,7 @@ def create_backup(
     with _locked(daily):
         path = make_copy(settings.db_path, daily, name, check=check)
         keep = {"keep_daily": cfg.keep_daily, "keep_weekly": cfg.keep_weekly}
-        pruned, prune_error = _prune(daily, keep)
+        pruned, prune_error = _prune(daily, keep, prefix)
         extra: Path | None = None
         extra_error: str | None = None
         if cfg.extra_dir is not None:
@@ -367,7 +387,7 @@ def create_backup(
             except BackupError as e:
                 extra_error = _describe(e)
             else:
-                _, extra_prune_error = _prune(cfg.extra_dir, keep)
+                _, extra_prune_error = _prune(cfg.extra_dir, keep, prefix)
                 prune_error = prune_error or extra_prune_error
         try:
             size = path.stat().st_size
@@ -716,6 +736,8 @@ __all__ = [
     "health_check",
     "keep_days",
     "make_copy",
+    "name_re",
+    "prefix_of",
     "prune",
     "restore",
     "run_backup",

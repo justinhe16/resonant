@@ -59,3 +59,27 @@ def test_reads_and_temp_paths_are_not_flagged(
     sys.audit("subprocess.Popen", "git", ["git", "log", "HEAD~1"], str(tmp_path), None)
     sys.audit("os.mkdir", str(Path(__file__).parent / "__pycache__"), 0o777, -1)  # this checkout
     assert live_dir_touches == []
+
+
+def test_every_instance_home_and_coris_dirs_are_caught(
+    real_home: Path, live_dir_touches: list[str]
+) -> None:
+    """PER-290: ``~/.resonant-<name>`` (any instance's home) and ``~/cori`` (Cori's run and
+    code dirs) are guarded like ``~/.resonant``."""
+    sys.audit("sqlite3.connect", str(real_home / ".resonant-cori" / "resonant.db"))
+    sys.audit("open", str(real_home / ".resonant-cori" / "config.yaml"), "w", os.O_WRONLY)
+    sys.audit("os.mkdir", str(real_home / ".resonant-other" / "logs"), 0o700, -1)
+    sys.audit("os.mkdir", str(real_home / "cori" / "runs" / "R1"), 0o700, -1)
+    sys.audit("subprocess.Popen", "git", ["git", "status"], str(real_home / "cori" / "code"), None)
+    caught = list(live_dir_touches)
+    live_dir_touches.clear()
+    assert len(caught) == 5, caught
+
+
+def test_names_that_only_look_like_an_instance_home_are_not_flagged(
+    real_home: Path, live_dir_touches: list[str]
+) -> None:
+    sys.audit("os.mkdir", str(real_home / ".resonant-"), 0o700, -1)  # no name after the dash
+    sys.audit("os.mkdir", str(real_home / "notes" / ".resonant-cori"), 0o700, -1)  # not ~/
+    sys.audit("os.mkdir", str(real_home / "coriander"), 0o700, -1)
+    assert live_dir_touches == []

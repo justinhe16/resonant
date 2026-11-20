@@ -632,6 +632,10 @@ class Scheduler:
     async def tick(self, now: datetime) -> None:
         """One scheduler pass over every job (see the module docstring)."""
         paused = read_paused(self.conn)
+        if self._paused is not None and paused != self._paused:
+            # PER-290: another process paused or resumed this instance (``resonant kill``,
+            # personal Resonant's fan-out): the hooks end runs and the brain session now.
+            killswitch.fire_hooks(self.conn, paused)
         self._apply_pause(paused)
         for job in self.jobs:
             try:
