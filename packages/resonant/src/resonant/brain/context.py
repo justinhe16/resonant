@@ -44,7 +44,7 @@ from datetime import datetime
 
 from resonant.brain.briefing import gather_briefing, known_notes, last_talked, since_notes
 from resonant.brain.facts import FactStore, render_index
-from resonant.brain.history import History, replayed
+from resonant.brain.history import History, named, replayed
 from resonant.brain.text import flat
 from resonant.config import Settings
 from resonant.loop.slots import SlotPool
@@ -234,6 +234,7 @@ def build_context(
     last_tick: datetime | None = None,
     slots: SlotPool | None = None,
     runner_missing: Sequence[str] | None = None,
+    conversation: str | None = None,
 ) -> BrainContext:
     """The brain's prompt for ``principal``'s message ``text`` (the event ``event_id``; None
     when it has no stored event, then there is no history and no notes).
@@ -249,9 +250,12 @@ def build_context(
     notes: list[str] = []
     known: list[str] = []
     if event_id is not None:
+        # PER-294: a thread's own history (``conversation``); None: the principal's.
         history = replayed(conn, principal, before_event_id=event_id, source=source,
-                           window=settings.brain.taint_hops)  # fmt: skip
-        since = last_talked(conn, principal, before_event_id=event_id, source=source)
+                           window=settings.brain.taint_hops, conversation=conversation,
+                           speaker=named(principals.display))  # fmt: skip
+        since = last_talked(conn, principal, before_event_id=event_id, source=source,
+                            conversation=conversation)  # fmt: skip
         if since is not None:
             notes = since_notes(conn, owner=owner, since=since, now=now, tz=settings.timezone)
         known = known_notes(conn, owner=owner, now=now, tz=settings.timezone,

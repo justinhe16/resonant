@@ -131,10 +131,13 @@ class FakeWorkers:
     messages: list[tuple[str, str]] = field(default_factory=list[Any])
 
     def run(self, code: str, *, repo: str = "dori", principal: str = OWNER,
-            status: str = "running") -> None:  # fmt: skip
+            status: str = "running", requested_by: str | None = None,
+            thread: str | None = None) -> None:  # fmt: skip
         self.runs[code] = SimpleNamespace(
             code=code, repo=repo, principal=principal, status=status,
             active=status in ("queued", "running", "waiting"),
+            requester=requested_by or principal,
+            channel_ref=None if thread is None else {"channel": "slack", "thread": thread},
         )  # fmt: skip
 
     def ask(self, code: str, question: str, options: tuple[str, ...] = (), *,
@@ -581,3 +584,89 @@ async def test_answers_that_mention_progress_are_still_answers(rig: Callable[...
     r.workers.ask("R4", "Which DB?")
     long = "use sqlite, and whatever is going on in the db is fine, what's the worker doing anyway"
     assert await r.free(long) == "→ R4"
+
+
+# --- PER-294: threads first; the requester and approvers answer -------------------------------
+
+TEAM = Principals(principals={
+    OWNER: Principal(role="owner", identities=("slack:U1",)),
+    "brian": Principal(role="approver", identities=("slack:U2",)),
+    "miu": Principal(identities=("slack:U3",)),
+})  # fmt: skip
+SLACK_IDS = {OWNER: "slack:U1", "brian": "slack:U2", "miu": "slack:U3"}
+
+
+def team_rig(db: sqlite3.Connection, pick: tuple[str, float] | None = None) -> Rig:
+    workers, brain, now = FakeWorkers(), Brain(pick), [T0 + timedelta(minutes=5)]
+    relay = Relay(db, principals=TEAM, model=brain, workers=lambda: workers,
+                  clock=lambda: now[0])  # fmt: skip
+    return Rig(relay, workers, brain, now)
+
+
+def slack_event(r: Rig, text: str, who: str, thread: str | None) -> Event:
+    return Event(source="slack", type="message", principal=who,
+                 payload={"text": text, "identity": SLACK_IDS[who], "thread": thread},
+                 occurred_at=r.now[0])  # fmt: skip
+
+
+async def team_route(r: Rig, text: str, who: str, thread: str | None) -> str | None:
+    event = slack_event(r, text, who, thread)
+    got = r.relay.direct(event, text, who, r.relay.take_stash(who))
+    if got is None:
+        got = await r.relay.free(event, text, who, "question")
+    return None if got is None else got.reply
+
+
+async def test_a_member_in_the_runs_thread_is_refused(db: sqlite3.Connection) -> None:
+    r = team_rig(db, pick=("R1", 0.9))
+    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.ask("R1", "Which DB?")
+    refusal = "Only Brian or Justin can answer R1."
+    assert await team_route(r, "postgres", "miu", "T-1") == refusal
+    assert await team_route(r, "R1 postgres", "miu", "T-1") == refusal
+    assert await team_route(r, "tell R1 to hurry", "miu", None) is None  # not its thread
+    assert r.workers.answers == [] and r.workers.messages == []
+
+
+@pytest.mark.parametrize("who", ["brian", OWNER])
+async def test_the_requester_and_an_approver_answer_in_the_thread(
+    db: sqlite3.Connection, who: str
+) -> None:
+    r = team_rig(db, pick=("R1", 0.9))
+    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.ask("R1", "Which DB?")
+    assert await team_route(r, "postgres", who, "T-1") == "→ R1"
+    assert r.workers.answers == [("R1", "postgres", 1)]
+
+
+async def test_a_reply_is_matched_by_thread_first(db: sqlite3.Connection) -> None:
+    """Two runs' questions open in two threads: a reply in one thread is that run's answer,
+    with no "For R1 or R2?"."""
+    r = team_rig(db)  # the brain is down: no pick by content
+    r.workers.run("R1", thread="T-1")
+    r.workers.run("R2", thread="T-2")
+    r.workers.ask("R1", "Which DB?")
+    r.workers.ask("R2", "Ship it?")
+    assert await team_route(r, "yes", OWNER, "T-2") == "→ R2"
+    assert await team_route(r, "sqlite", OWNER, "T-1") == "→ R1"
+    assert [a[0] for a in r.workers.answers] == ["R2", "R1"]
+
+
+async def test_an_approver_answers_anothers_run_only_by_code_outside_its_thread(
+    db: sqlite3.Connection,
+) -> None:
+    r = team_rig(db, pick=("R1", 0.9))
+    r.workers.run("R1", thread="T-1")  # the owner's run
+    r.workers.ask("R1", "Which DB?")
+    assert await team_route(r, "postgres", "brian", "T-9") is None  # not taken for R1
+    assert await team_route(r, "R1 postgres", "brian", "T-9") == "→ R1"
+
+
+async def test_a_bystanders_small_talk_in_the_thread_routes_normally(
+    db: sqlite3.Connection,
+) -> None:
+    r = team_rig(db)  # the brain is down: no sure pick
+    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.ask("R1", "Which DB?")
+    assert await team_route(r, "ok thanks", "miu", "T-1") is None
+    assert r.workers.answers == []

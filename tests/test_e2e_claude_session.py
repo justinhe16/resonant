@@ -31,9 +31,10 @@ import pytest
 from resonant import killswitch
 from resonant.config import ClaudeSessionConfig, load_settings
 from resonant.daemon import Daemon
-from resonant.e2e import RecordingOsaRunner, ScriptedModel, fake_claude, wait_until
+from resonant.e2e import FakeChannel, RecordingOsaRunner, ScriptedModel, fake_claude, wait_until
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop.types import NewTask, Task
+from resonant.principals import load_principals
 from resonant.runners.ask import AskRunner, AskScope, Queued
 from resonant.runners.ask_tools import NOT_BOUND, ClaudeTools, McpServer
 from resonant.runners.brain import BrainRunner
@@ -57,6 +58,12 @@ principals:
     grants:
       "builtin:files": [request]
 """
+# PER-294: the same team on a fake Slack adapter only (iMessage off)
+SLACK_PRINCIPALS = """\
+principals:
+  justin: {role: owner, identities: ["slack:U1"]}
+  brian: {role: approver, identities: ["slack:U2"]}
+"""
 FAKE = Path(fake_claude.__file__)
 TOKEN = "sk-ant-oat01-FAKETOKENVALUE0123456789"
 ACK = "on it, checking"
@@ -79,6 +86,7 @@ class World:
     asks: AskRunner
     plan: Path
     notes: Path
+    slack: FakeChannel | None = None
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -171,14 +179,18 @@ async def start(
     session: dict[str, Any] | None = None,
     ask: dict[str, Any] | None = None,
     asks_kw: dict[str, Any] | None = None,
+    slack: bool = False,
 ) -> AsyncGenerator[World]:
-    (home / "principals.yaml").write_text(PRINCIPALS)
+    """``slack`` (PER-294): over ``FakeChannel("slack")`` only, with ``SLACK_PRINCIPALS``."""
+    (home / "principals.yaml").write_text(SLACK_PRINCIPALS if slack else PRINCIPALS)
     code = tmp_path / "code"
     code.mkdir(exist_ok=True)
     settings = load_settings(
         dry_run=False,
         api={"port": free_port()},
-        channels={
+        channels={}
+        if slack
+        else {
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
         runner={"code_dir": code},
@@ -190,7 +202,9 @@ async def start(
     )
     osa = RecordingOsaRunner()
     model = ScriptedModel()
-    daemon = Daemon(settings, model=model, osa_runner=osa)
+    fake = FakeChannel("slack", load_principals(home / "principals.yaml")) if slack else None
+    daemon = Daemon(settings, model=model, osa_runner=osa,
+                    channels=None if fake is None else {"slack": fake})  # fmt: skip
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     kv_set(daemon.conn, "autonomy", "on")
     kv_set(daemon.conn, "paused", False)
@@ -230,7 +244,7 @@ async def start(
     run = asyncio.create_task(daemon.run())
     channel = daemon.imessage.channel
     await wait_until(lambda: channel.health()["last_read_at"] is not None, 10)
-    w = World(daemon, osa, chat, model, asks, plan, notes)
+    w = World(daemon, osa, chat, model, asks, plan, notes, fake)
     try:
         yield w
     finally:
@@ -983,3 +997,53 @@ async def test_the_daemon_runs_the_ask_startup_before_the_loop(
         # start() returns once the chat reader is up; the startup runs just after it
         await wait_until(lambda: bool(calls), 10)
         assert calls == [True]
+
+
+# --- PER-294: one thread is one conversation -----------------------------------------------
+
+
+async def test_two_threads_asked_at_once_each_get_their_own_transcript(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Over Slack, the owner notes in two threads and Brian asks in one of them (fast-path
+    replies, not turns); then a hard text
+    in each thread, at once. The one serial session gets two turns, each headed by its thread
+    and carrying only that thread's delta; each answer goes back to its thread."""
+    async with start(resonant_home, chat, tmp_path, slack=True) as w:
+        fake = w.slack
+        assert fake is not None
+
+        async def said(n: int) -> None:
+            await fake.wait_for(n, 20)
+
+        assert fake.inject("U1", "/note alpha")  # thread slack-in:1
+        await said(1)
+        assert fake.inject("U1", "/note beta")  # thread slack-in:2
+        await said(2)
+        assert fake.inject("U2", "/approvals", thread="slack-in:1")
+        await said(3)
+        w.model.triage = CLAUDE
+        w.claude(answer="Answer to {n}")
+        assert fake.inject("U1", "status A?", thread="slack-in:1")
+        assert fake.inject("U1", "status B?", thread="slack-in:2")
+        await said(5)
+        await w.settled()
+        turns = w.session()["messages"]
+        (a,) = [m for m in turns if m.endswith("status A?")]
+        (b,) = [m for m in turns if m.endswith("status B?")]
+        # (the session's first turn is primed first, from that thread's records)
+        assert "Thread: slack-in:1 · from: Justin (owner)\nSince we last spoke" in a
+        assert "Thread: slack-in:2 · from: Justin (owner)\nSince we last spoke" in b
+        assert "Justin: /note alpha" in a and "Brian: /approvals" in a
+        assert "Resonant: Nothing is waiting for approval." in a
+        assert "beta" not in a
+        assert "Justin: /note beta" in b
+        assert "alpha" not in b and "/approvals" not in b
+        answers = [m for m in fake.sent if m.text.startswith("Answer to")]
+        assert sorted((m.thread or "") for m in answers) == ["slack-in:1", "slack-in:2"]
+        # the session's own (owner-only) cursor is untouched; each thread has its own
+        from resonant.runners.ask import SINCE_KV
+        from resonant.store.db import kv_get
+
+        assert kv_get(w.conn, SINCE_KV) is None
+        assert kv_get(w.conn, f"{SINCE_KV}:slack-in:1") is not None

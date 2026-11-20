@@ -596,6 +596,7 @@ def build_stack(
         # PER-291: the instance's Claude config dir and the brain's instructions file
         claude_config_dir=settings.runner.claude_config_dir,
         instructions_file=settings.brain.instructions_file,
+        principals=components.principals,  # PER-294: a turn's header names who wrote
     )
     components.runners[asks.name] = asks
     loop.runners[asks.name] = asks

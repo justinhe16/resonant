@@ -7,6 +7,8 @@ import sqlite3
 from datetime import timedelta
 from importlib import resources
 from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from brain_seed import OWNER, SummaryModel, message
 
@@ -24,7 +26,10 @@ from resonant.brain.history import (
     replayed,
 )
 from resonant.models import ModelUnavailableError
+from resonant.principals import Principal, Principals
 from resonant.store import brain as store
+from resonant.store import db as db_mod
+from resonant.store import system_texts
 from resonant.store.db import (
     connect,
     latest_version,
@@ -46,7 +51,7 @@ def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
 
 
 def test_migration_015(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 29
+    assert schema_version(db) == latest_version() == 30
     cols = {r["name"] for r in db.execute("PRAGMA table_info(brain_summaries)")}
     assert cols == {"principal", "summary", "through_event_id", "folded", "source", "updated_at"}
 
@@ -240,7 +245,7 @@ def test_migration_017_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 29
+    assert schema_version(conn) == 30
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -400,7 +405,7 @@ def test_migration_018_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 29
+    assert schema_version(conn) == 30
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -686,3 +691,98 @@ def test_since_last_shows_a_one_shot_answer_and_a_local_reply_but_not_a_session_
     assert "Resonant: Looking into it." in got.text and "answered: It is 42" in got.text
     assert "On it." not in got.text and "session said" not in got.text
     assert got.text.count("<since_last>") == 1  # an item can't close or fake the tag
+
+
+# --- PER-294: one thread is one conversation -----------------------------------------------------
+
+BRIAN = "brian"
+
+
+def _said(messages: list[Any]) -> list[str]:
+    return [str(t["content"]) for t in messages]
+
+
+def test_each_thread_reads_only_its_own_transcript(db: sqlite3.Connection) -> None:
+    """Two threads at once: each one's history holds its own messages (any sender, named),
+    its tasks' system texts, and nothing from the other thread or the owner's own thread."""
+    now = utcnow()
+    message(db, "owner's own chat", reply="own reply", at=now - timedelta(minutes=9))
+    a1 = message(db, "deploy the api?", reply="Which env?", thread="T-A", source="slack",
+                 at=now - timedelta(minutes=8))  # fmt: skip
+    message(db, "staging first", reply="OK", thread="T-B", source="slack", principal=BRIAN,
+            at=now - timedelta(minutes=7))  # fmt: skip
+    message(db, "prod please", reply="Noted", thread="T-A", source="slack", principal=BRIAN,
+            at=now - timedelta(minutes=6))  # fmt: skip
+    system_texts.record(db, OWNER, "run", "R1 opened PR #3", ref="ra", task_id=task_of(db, a1),
+                        now=now - timedelta(minutes=5))  # fmt: skip
+    a_now = message(db, "and the docs?", thread="T-A", source="slack", at=now)
+    b_now = message(db, "done?", thread="T-B", source="slack", at=now)
+    display = Principals(principals={
+        OWNER: Principal(role="owner", identities=("slack:U1",)),
+        BRIAN: Principal(role="approver", identities=("slack:U2",)),
+    }).display  # fmt: skip
+    a = _said(replayed(db, OWNER, before_event_id=a_now, conversation="T-A",
+                       speaker=history.named(display)).messages)  # fmt: skip
+    assert a == [
+        "<message>Justin: deploy the api?</message>",
+        "Which env?",
+        "<message>Brian: prod please</message>",
+        "Noted",
+        "R1 opened PR #3",
+    ]
+    b = _said(replayed(db, OWNER, before_event_id=b_now, conversation="T-B",
+                       speaker=history.named(display)).messages)  # fmt: skip
+    assert b == ["<message>Brian: staging first</message>", "OK"]
+    # the owner's own conversation: as before, without the threads or their system texts
+    own = _said(replayed(db, OWNER, before_event_id=None).messages)
+    assert own == ["<message>owner's own chat</message>", "own reply"]
+
+
+def test_a_threads_delta_names_senders_and_notes_older_messages(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    for i in range(12):
+        who = BRIAN if i % 2 else OWNER
+        message(db, f"line {i}", reply=f"ok {i}", thread="T-A", source="slack", principal=who,
+                at=now - timedelta(minutes=30 - i))  # fmt: skip
+    current = message(db, "so?", thread="T-A", source="slack", at=now)
+    delta = history.since_last(db, OWNER, after_event_id=None, before_event_id=current,
+                               since=now - timedelta(hours=1), tz=ZoneInfo("UTC"),
+                               conversation="T-A",
+                               speaker=lambda who: (who or "?").title())  # fmt: skip
+    assert delta is not None
+    lines = [ln for ln in delta.text.splitlines() if ln.startswith("- ")]
+    assert lines[0] == f"- {history.OLDER_NOTE}"
+    assert len(lines) == history.SINCE_ITEMS + 1
+    assert lines[-2].endswith("Brian: line 11") and lines[-4].endswith("Justin: line 10")
+    assert lines[-1].endswith("Resonant: ok 11")
+    # the owner's own conversation has none of it
+    nothing = history.since_last(db, OWNER, after_event_id=None, before_event_id=None,
+                                 since=now - timedelta(hours=1), tz=ZoneInfo("UTC"))  # fmt: skip
+    assert nothing is None
+
+
+async def test_a_thread_folds_into_its_own_summary(db: sqlite3.Connection) -> None:
+    for i in range(KEEP_EXCHANGES + FOLD_BATCH):
+        message(db, f"t {i}", reply=f"r {i}", thread="T-A", source="slack")
+    assert not fold_due(db, OWNER)  # the owner's own conversation is empty
+    assert fold_due(db, OWNER, conversation="T-A")
+    result = await fold(db, SummaryModel("thread summary"), OWNER, conversation="T-A")
+    assert result is not None and result.saved
+    assert store.get_summary(db, OWNER) is None
+    saved = store.get_summary(db, history.summary_key(OWNER, "T-A"))
+    assert saved is not None and saved.summary == "thread summary"
+
+
+def test_migration_030_backfills_task_conversations(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "m.db")
+    migrate(conn, [m for m in db_mod._migrations() if m[0] <= 29])  # pyright: ignore[reportPrivateUsage]
+    conn.execute(
+        "INSERT INTO tasks (id, kind, runner, priority, channel_ref, trace_id, created_at,"
+        " updated_at) VALUES ('t1', 'chat', 'local', 1, ?, 'x', 'n', 'n'),"
+        " ('t2', 'chat', 'local', 1, ?, 'x', 'n', 'n')",
+        ('{"channel": "slack", "thread": "T-A"}', '{"channel": "imessage", "thread": null}'),
+    )
+    conn.commit()
+    assert migrate(conn) == 30
+    got = dict(conn.execute("SELECT id, conversation FROM tasks").fetchall())
+    assert got == {"t1": "T-A", "t2": None}
