@@ -67,6 +67,7 @@ from resonant.store.db import (
     StoreUnavailableError,
     atomic,
     iso,
+    kv_get,
     latest_version,
     open_db,
     open_existing,
@@ -132,21 +133,27 @@ def daemon_install(
         bool, typer.Option(help="Also install the Ollama LaunchAgent if ollama is on PATH.")
     ] = True,
 ) -> None:
-    """Install and start the LaunchAgents (daemon, Ollama if available, and keep-awake)."""
+    """Install and start the LaunchAgents (daemon, Ollama if available, and keep-awake).
+
+    The shared agents (Ollama, keep-awake) are the default instance's: any other instance
+    installs only its own daemon and never touches them (PER-290)."""
     settings = load_settings()
     if problem := _port_problem(settings):
         typer.echo(f"error: {problem}; set api.port in {settings.home / 'config.yaml'}", err=True)
         raise typer.Exit(1)
+    shared = instance.is_default(settings.instance.name)
     try:
-        if ollama:
+        if ollama and settings.model.manage:
             if path := launchd.find_ollama():
                 typer.echo(f"installed {launchd.install(launchd.ollama_plist(settings, path))}")
             else:
                 typer.echo("ollama not found on PATH; skipping Ollama LaunchAgent")
         if settings.power.keep_awake:
             typer.echo(f"installed {launchd.install(launchd.caffeinate_plist())}")
-        elif launchd.uninstall(launchd.CAFFEINATE_LABEL):
+        elif shared and launchd.uninstall(launchd.CAFFEINATE_LABEL):
             typer.echo(f"{launchd.CAFFEINATE_LABEL}: removed (power.keep_awake is false)")
+        if not shared:
+            typer.echo("Ollama and keep-awake: personal Resonant owns them; left as they are")
         typer.echo(f"installed {launchd.install(launchd.daemon_plist(settings))}")
     except launchd.LaunchctlError as e:
         typer.echo(f"error: {e}", err=True)
@@ -175,13 +182,13 @@ def _port_problem(settings: Settings) -> str | None:
     return f"api.port {port} on {host} is already in use"
 
 
-def _uninstall_label() -> str:
-    """The daemon label to remove. A config that no longer loads must not block uninstall:
-    then the label comes from the instance name asked for (or the default)."""
+def _uninstall_name() -> str:
+    """The instance to uninstall. A config that no longer loads must not block uninstall:
+    then it is the instance name asked for (or the default)."""
     try:
-        return load_settings().daemon_label
+        return load_settings().instance.name
     except ValueError:  # pydantic's ValidationError and InstanceError are ValueErrors
-        return instance.daemon_label(instance.requested() or instance.DEFAULT_INSTANCE)
+        return instance.requested() or instance.DEFAULT_INSTANCE
 
 
 @daemon_app.command("uninstall")
@@ -191,9 +198,13 @@ def daemon_uninstall(
         bool, typer.Option(help="Also remove the keep-awake (caffeinate) LaunchAgent.")
     ] = True,
 ) -> None:
-    """Stop and remove the LaunchAgents."""
-    labels = [_uninstall_label()] + ([launchd.OLLAMA_LABEL] if ollama else [])
-    labels += [launchd.CAFFEINATE_LABEL] if keep_awake else []
+    """Stop and remove the LaunchAgents. Any instance but the default removes only its own
+    daemon: Ollama and keep-awake are personal Resonant's (PER-290)."""
+    name = _uninstall_name()
+    labels = [instance.daemon_label(name)]
+    if instance.is_default(name):
+        labels += [launchd.OLLAMA_LABEL] if ollama else []
+        labels += [launchd.CAFFEINATE_LABEL] if keep_awake else []
     for label in labels:
         removed = launchd.uninstall(label)
         typer.echo(f"{label}: {'removed' if removed else 'not installed'}")
@@ -319,13 +330,16 @@ def _daemon_running(settings: Settings) -> str | None:
     return None
 
 
-def _daemon_pids() -> list[int]:
+def _daemon_pids(home: Path | None = None) -> list[int]:
     """Processes of this user running ``resonant daemon run`` (a foreground daemon, or one
-    whose API is hung), other than this one."""
+    whose API is hung), other than this one, for ``home`` (default: this CLI's,
+    ``instance.resolve_home``). PER-290: another instance's daemon (the home its env picks)
+    doesn't count; a process whose env can't be read still does."""
     import psutil
 
     found: list[int] = []
     me = os.getpid()
+    want = os.path.realpath(home if home is not None else instance.resolve_home())
     for proc in psutil.process_iter(["pid", "uids", "cmdline"]):
         try:
             info = proc.info
@@ -336,9 +350,23 @@ def _daemon_pids() -> list[int]:
             continue
         if info.get("pid") == me or uids is None or uids.real != os.getuid():
             continue
-        if is_daemon_argv(argv):
-            found.append(int(info["pid"]))
+        if not is_daemon_argv(argv):
+            continue
+        if (theirs := _process_home(proc)) is not None and theirs != want:
+            continue  # another instance's daemon
+        found.append(int(info["pid"]))
     return found
+
+
+def _process_home(proc: Any) -> str | None:
+    """The Resonant home a process runs (from its env), or None when it can't be told."""
+    import psutil
+
+    try:
+        env = cast(dict[str, str], proc.environ())
+        return os.path.realpath(instance.resolve_home(env))
+    except (psutil.Error, OSError, ValueError):
+        return None
 
 
 def is_daemon_argv(argv: list[str]) -> bool:
@@ -409,7 +437,7 @@ def backup_list() -> None:
     if cfg.extra_dir is not None:
         dirs.append(("extra", cfg.extra_dir))
     for label, directory in dirs:
-        found = backup.copies(directory)
+        found = backup.copies(directory, backup.prefix_of(settings))
         typer.echo(f"{label} ({directory}): {len(found) or 'none'}")
         sundays = backup.keep_days(
             (d for d, _ in found if d.weekday() == backup.SUNDAY),
@@ -472,20 +500,89 @@ def backup_restore(
     typer.echo("next: resonant daemon install, resonant status, then /resume when it looks right")
 
 
+def _siblings_runner() -> OpsRunner:
+    """Runs the sibling instances' CLIs (PER-290). Tests swap in a ``FakeOpsRunner``."""
+    return SubprocessRunner()
+
+
+def _fan_out(settings: Settings, paused: bool) -> None:
+    """PER-290: personal Resonant's kill switch also pauses (or resumes) the siblings."""
+    import asyncio
+
+    from resonant.ops.siblings import kill_switch_fan_out
+
+    fan = kill_switch_fan_out(settings.instance.name, _siblings_runner())
+    if fan is not None:
+        for line in asyncio.run(fan(paused)):
+            typer.echo(line)
+
+
+_SOURCE = r"[a-z]+:[A-Za-z0-9@.+_-]{1,64}"
+
+
+def _source(value: str) -> str:
+    """A pause source (``sibling:resonant``), else exit 2."""
+    import re
+
+    if not re.fullmatch(_SOURCE, value):
+        typer.echo(f"error: {value!r} isn't a source like sibling:resonant", err=True)
+        raise typer.Exit(2)
+    return value
+
+
 @app.command()
 def kill(
     reason: Annotated[str | None, typer.Option(help="Recorded in the audit log.")] = None,
 ) -> None:
-    """Engage the kill switch: autonomy off, everything paused."""
-    killswitch.engage(_db(load_settings()), actor=_CLI_ACTOR, reason=reason)
+    """Engage the kill switch: autonomy off, everything paused. On personal Resonant it
+    pauses every sibling instance too."""
+    settings = load_settings()
+    killswitch.engage(_db(settings), actor=_CLI_ACTOR, reason=reason)
     typer.echo("kill switch ENGAGED: autonomy off, critical jobs and on-call paused")
+    _fan_out(settings, True)
 
 
 @app.command()
-def resume() -> None:
-    """Release the kill switch."""
-    killswitch.release(_db(load_settings()), actor=_CLI_ACTOR)
+def pause(
+    by: Annotated[str, typer.Option("--by", help="Who paused it, e.g. sibling:resonant.")],
+) -> None:
+    """Engage the kill switch on behalf of ``--by`` (personal Resonant's /kill runs this in
+    each sibling, PER-290). Already paused: the first source stays."""
+    by = _source(by)
+    killswitch.engage(_db(load_settings()), actor=by, reason=f"paused by {by}")
+    typer.echo(f"kill switch ENGAGED (by {by})")
+
+
+@app.command()
+def resume(
+    if_by: Annotated[
+        str | None,
+        typer.Option(
+            "--if-by",
+            help="Only when the pause in force came from this source (else exit 3).",
+        ),
+    ] = None,
+) -> None:
+    """Release the kill switch. On personal Resonant it resumes the siblings it paused."""
+    from resonant.ops.siblings import EXIT_KEPT
+
+    settings = load_settings()
+    conn = _db(settings)
+    if if_by is not None:
+        _source(if_by)
+        if kv_get(conn, "paused") is not True:
+            typer.echo("not paused")
+            return
+        source = killswitch.paused_by(conn)
+        if source != if_by:
+            typer.echo(f"still paused: paused by {source or 'someone else'}, not {if_by}")
+            raise typer.Exit(EXIT_KEPT)
+        killswitch.release(conn, actor=if_by)
+        typer.echo("kill switch released")
+        return
+    killswitch.release(conn, actor=_CLI_ACTOR)
     typer.echo("kill switch released")
+    _fan_out(settings, False)
 
 
 @app.command(

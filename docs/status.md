@@ -26,6 +26,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 27, two extensi
 | Self-recovery (PER-284) | Manifest `recover: {run, timeout}`: after 2 failed health checks in a row the daemon runs it (at most every 15 min, 3 a day, never paused or autonomy off), audits `ext.recover` and texts one line; the relay pusher and dead-man pinger rebuild their HTTP client after 3 failures in a row | #151, deployed 2026-11-05 |
 | Panel daily history (PER-286) | Manifest `history: {every: daily, keep}`: the daemon archives each ended day once (panel command + `--date`; `{"schema":1,"none":true}` = no data) in `ext_panel_days`, backfills 30 days, uploads to Supabase `panel_days`; Day dropdown on `#/ext/<name>`; `read_panel` takes `day`; `resonant ext panel-history` | #152, deployed 2026-11-06, schema 27 |
 | Instances on one user (PER-297, Phase 8 "Cori" wave 1) | `instance.name` (default `resonant`) derives the home (`~/.resonant-<name>`), LaunchAgent label (`com.resonant.<name>.daemon`), Keychain service (`resonant-<name>`) and worker dirs (`~/<name>/runs`, `~/<name>/code`) in `resonant/instance.py`; `resonant --instance <name>` / `RESONANT_INSTANCE` targets one, a home/name mismatch is refused, install refuses a bound `api.port`; instance shown in `/status`, `resonant status`, `/api/status` and the snapshot (`instance`, schema 2 additive). `config/cori.example.yaml` (port 7778, iMessage off). No `instance:` block: nothing changes. No migration, no relay change | PR open |
+| Two daemons, one checkout (PER-290, Phase 8 "Cori" wave 2) | Personal Resonant and Cori run from `~/resonant` with their own homes. Ollama and keep-awake stay personal's (a non-default instance reads `power.keep_awake`/`model.manage` as false, refuses them true, never installs/removes those agents; `restart_ollama` not registered). `instance.siblings()` reads the installed `com.resonant*.daemon` plists. Personal `/update` pulls and syncs once, backs every store up on a migration-bearing deploy, restarts each loaded sibling (its own "Back up") then itself; `ops.self_update: false` (Cori) refuses `/update`, `update_resonant` and a worker's `resonant update`. Personal `/kill`/`resonant kill` pauses siblings via `resonant pause --by sibling:resonant`; `/resume` resumes only those (`resume --if-by`); new kv `paused_by`; a pause from another process fires the pause hooks on the next tick. `runner.self_repo: false` (Cori): no `resonant` repo. Backups `<name>-YYYY-MM-DD.db` per instance. Brain shell never-list covers every instance home; restore guard and conftest guard per instance. No migration, no relay change | PR open |
 | Tool core (TC-1) | `resonant/toolcore/`: the single call path (registry → gate → executor) for the Claude brain, the local runner, jobs and watches; a boundary test enforces it | #109 |
 | Backups (BK-1) | Daily SQLite backup at 03:30, 7 daily + 4 weekly, 36h alert, `resonant backup now/list/restore` | #110 |
 | Quiet briefing (BF-1) | All-zero items dropped; an empty briefing is one line | #111 |
@@ -44,15 +45,15 @@ Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapprove
 - **Code** goes through robot-surf, one fresh agent per ticket in its own worktree:
   1. The agent builds the change, opens a PR, gets CI green, and runs the code-reviewer until no must-fix remains.
   2. The coordinator verifies `gh pr checks` and that mergeStateStatus is CLEAN, then squash-merges with `--match-head-commit`.
-  3. Before deploying a migration, back up the DB (`resonant backup now`).
-  4. Deploy: `uv sync`, then `launchctl kickstart -k gui/$(id -u)/com.resonant.daemon`.
+  3. Before deploying a migration, back up every DB (`resonant backup now` and `resonant --instance cori backup now`). Personal `/update` (or a worker's `resonant update` on personal) does this itself when the pull adds a migration.
+  4. Deploy (both daemons run from this one checkout, PER-290): `uv sync`, then `launchctl kickstart -k gui/$(id -u)/com.resonant.cori.daemon` (when Cori is installed) and `launchctl kickstart -k gui/$(id -u)/com.resonant.daemon`, or `/update` on personal, which pulls, syncs, restarts Cori and then itself. Cori never deploys code (`ops.self_update: false`). `.claude/settings.local.json` already allows `Bash(launchctl kickstart:*)`, which covers `launchctl kickstart -k gui/$(id -u)/com.resonant.cori.daemon` (run it as its own command).
 - **Main moves under parallel agents.** When main changes, have each open branch merge origin/main and get CI green again before merging it.
 - **Hard rules (owner's):**
   - Claude never runs `resonant secret set` or `resonant ext add/update`. These need the owner's typed confirmation.
   - Never put secrets in chat.
   - Ask before anything that sends an iMessage.
   - Never write to the login keychain.
-  - Tests and agents never touch `~/.resonant` or `~/code`.
+  - Tests and agents never touch `~/.resonant`, `~/.resonant-cori` (any `~/.resonant-<name>`), `~/code` or `~/cori` (the conftest guard trips on all of them).
   - Workers stay unguarded; don't propose sandbox layers.
 - **Keep replies short.**
 

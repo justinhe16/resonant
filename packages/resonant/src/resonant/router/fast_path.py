@@ -463,6 +463,9 @@ class FastPath:
         self.repo_path: Path | None = None
         # How many runs the last ``/kill`` ended (``ClaudeRunner.last_killed``; wiring sets it).
         self.runs_killed: Callable[[], int] = lambda: 0
+        # PER-290: personal Resonant's kill switch fanned out to the sibling instances
+        # (``ops.siblings.kill_switch_fan_out``): one line per sibling. None: no fan-out.
+        self.siblings: Callable[[bool], Awaitable[list[str]]] | None = None
 
     def match(self, text: str) -> FastCommand | None:
         """``match_fast_path`` over this fast path's command table (extensions included)."""
@@ -546,10 +549,11 @@ class FastPath:
             return self._result(cmd, cmd.reply)
         if cmd.admin and cmd.name == "/kill":
             killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
-            return self._result(cmd, kill_reply(self.runs_killed()), "killswitch.engage")
+            text = kill_reply(self.runs_killed())
+            return self._result(cmd, await self._fan_out(text, True), "killswitch.engage")
         if cmd.admin and cmd.name == "/resume":
             killswitch.release(self.conn, actor=principal)
-            return self._result(cmd, RESUME_REPLY, "killswitch.release")
+            return self._result(cmd, await self._fan_out(RESUME_REPLY, False), "killswitch.release")
         if cmd.name == "/approvals":
             return self._approvals(cmd, principal)
         if cmd.admin and cmd.title == "/ext run":
@@ -595,6 +599,18 @@ class FastPath:
             log.warning("fast path %s failed: %s", cmd.tool, type(e).__name__)
             text = f"Couldn't read {cmd.tool} right now."
         return self._result(cmd, text, cmd.tool)
+
+    async def _fan_out(self, text: str, paused: bool) -> str:
+        """PER-290: after this instance's own switch, the siblings' (a line each). This
+        instance's switch is already set: a sibling's failure only adds its line."""
+        if self.siblings is None:
+            return text
+        try:
+            lines = await self.siblings(paused)
+        except Exception:
+            log.exception("kill switch fan-out failed")
+            lines = ["the other instances: couldn't reach them"]
+        return "\n".join([text, *lines])
 
     def _direct(
         self, cmd: FastCommand, extension: str | None, tool: str, args: dict[str, Any], title: str

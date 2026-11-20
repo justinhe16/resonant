@@ -115,6 +115,7 @@ from resonant.loop import Loop, NewTask
 from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
 from resonant.ops import SubprocessRunner, back_up
+from resonant.ops.siblings import kill_switch_fan_out
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.ask import AskRunner, AskScope
@@ -476,10 +477,11 @@ def build_imessage_stack(
         submit=loop.submit,
         trust=trust,
         # GD-1: a worker's `resonant restart|update` runs the same ops as /restart and
-        # /update, and the daemon's own checkout is the repo "resonant"
+        # /update, and the daemon's own checkout is the repo "resonant" (not with
+        # runner.self_repo false, PER-290: Cori registers no such repo)
         self_ops=_worker_ops(conn, settings, components, owner_name),
         owner=owner_name,
-        self_repo=settings.ops.repo_path,
+        self_repo=settings.ops.repo_path if settings.runner.self_repo else None,
         voice=voice,
         api_port=settings.api.port,  # PER-297: the thin guard denies this instance's port
     )
@@ -534,6 +536,11 @@ def build_imessage_stack(
     components.runners[watcher.name] = watcher
     loop.runners[watcher.name] = watcher
     router.fast_path.runs_killed = lambda: claude.last_killed
+    # PER-290: personal Resonant's /kill and /resume reach the sibling instances too
+    router.fast_path.siblings = kill_switch_fan_out(
+        settings.instance.name,
+        components.ops_runner if components.ops_runner is not None else SubprocessRunner(),
+    )
     router.relay.workers = lambda: claude  # owner replies to worker questions (EM-5)
 
     owner = components.principals.owner if components.principals_loaded else None

@@ -96,6 +96,10 @@ class ModelConfig(_Section):
     # "openai": the OpenAI-compatible /v1 endpoint (portable, e.g. to MLX later).
     # `resonant model probe` checks that thinking is actually off for the chosen adapter.
     api: Literal["openai", "ollama"] = "ollama"
+    # PER-290: this instance owns the Ollama LaunchAgent (``resonant daemon install`` installs
+    # it, ``restart_ollama`` restarts it). Only the default instance may: any other one uses
+    # the owner's Ollama at ``base_url`` and reads this as false.
+    manage: bool = True
 
     @field_validator("base_url")
     @classmethod
@@ -266,6 +270,10 @@ class OpsConfig(_Section):
     # The `uv` binary `/update` syncs with. launchd's PATH is minimal, so this is an
     # absolute path; None means `/update` refuses.
     uv_path: Path | None = None
+    # PER-290: code deploys (``/update``, ``update_resonant``, a worker's ``resonant update``)
+    # may run from this instance. False (Cori): refused, "code updates come from personal
+    # Resonant". Runtime state (jobs, watchers, trust rules, facts) is not a code deploy.
+    self_update: bool = True
 
     @field_validator("repo_path", "uv_path")
     @classmethod
@@ -644,6 +652,9 @@ class RunnerConfig(_Section):
     keep_days: int = Field(default=7, ge=0, le=365)
     git_path: Path = Path("/usr/bin/git")
     gh_path: Path = Path("/opt/homebrew/bin/gh")
+    # PER-290: with the guard off, register the daemon's own checkout (``ops.repo_path``) as
+    # the repo ``resonant`` (GD-1). False (Cori): no such repo.
+    self_repo: bool = True
 
     @field_validator("guard", "remote_control", mode="before")
     @classmethod
@@ -1078,6 +1089,26 @@ class Settings(BaseSettings):
         owner = inst.home_owner(self.home)
         if owner is not None and owner != self.instance.name:
             raise ValueError(f"{self.home} is instance {owner}'s home, not {self.instance.name}'s")
+        return self
+
+    @model_validator(mode="after")
+    def _shared_agents(self) -> Self:
+        """PER-290: the shared LaunchAgents (caffeinate, Ollama) are the default instance's.
+        Any other instance reads ``power.keep_awake`` and ``model.manage`` as false, and
+        refuses them set true."""
+        if inst.is_default(self.instance.name):
+            return self
+        for section, key in ((self.power, "keep_awake"), (self.model, "manage")):
+            if key in section.model_fields_set and getattr(section, key):
+                where = "power" if section is self.power else "model"
+                raise ValueError(
+                    f"{where}.{key} can't be true for instance {self.instance.name}: "
+                    "personal Resonant owns it"
+                )
+        if self.power.keep_awake:
+            self.power = self.power.model_copy(update={"keep_awake": False})
+        if self.model.manage:
+            self.model = self.model.model_copy(update={"manage": False})
         return self
 
     @model_validator(mode="after")

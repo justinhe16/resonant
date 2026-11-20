@@ -60,6 +60,15 @@ Only if the store is damaged or a bad change has to be undone. Everything since 
 
 - **Rollback:** restore the `pre-restore` copy the same way.
 
+### Two daemons on one checkout (PER-290)
+
+Once Cori is installed (`resonant --instance cori daemon install`), both daemons run from `~/resonant` and its `.venv`, each with its own home. Cori's install never touches the Ollama or keep-awake agents: those stay personal Resonant's, and Cori uses the same Ollama.
+
+- **Deploy:** text `/update` to personal Resonant. It pulls and syncs once; if the pull adds a migration it backs up both stores first (`backups/daily/resonant-<date>.db` and `~/.resonant-cori/backups/daily/cori-<date>.db`); then it restarts Cori, then itself. Each says "Back up" on its own channel. A stopped Cori stays stopped (`Cori: stopped, not started`). By hand: `uv sync`, `launchctl kickstart -k gui/$(id -u)/com.resonant.cori.daemon`, then `launchctl kickstart -k gui/$(id -u)/com.resonant.daemon`. Cori's own `/update` is refused: code updates come from personal Resonant.
+- **Kill switch:** personal `/kill` (or `resonant kill`) pauses Cori too, within a tick, and names her in the reply (`Cori: paused`, or `Cori: couldn't pause (…)`; personal is paused either way). Personal `/resume` resumes Cori only if that pause came from personal: a pause an approver made on Cori stays.
+- **Verify:** `resonant status` and `resonant --instance cori status` both show `daemon up`; after a `/kill`, `resonant --instance cori status` shows `(PAUSED)`.
+- **Rollback (both):** `cd ~/resonant && git checkout <previous commit> && uv sync`, then kickstart Cori and personal as above (`git checkout main` before the next `/update`, which refuses a detached checkout; a migration can't be undone this way: restore each store from the backup the deploy took, `resonant backup restore …` and `resonant --instance cori backup restore …`, with each daemon stopped). To take Cori out entirely: `resonant --instance cori daemon uninstall` (it removes only `com.resonant.cori.daemon`).
+
 ## 3. Resonant's Apple ID
 
 Resonant has its own Apple ID so that it can text you, and you can text it.

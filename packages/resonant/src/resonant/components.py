@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from resonant import instance
 from resonant.brain.history import DEFAULT_TAINT_HOPS
 from resonant.config import Settings
 from resonant.executor import Executor, Handler, HandlerKey, ToolHandler
@@ -168,13 +169,18 @@ def summary_actions(
 
 def shell_policy(settings: Settings) -> ShellPolicy:
     """PER-258: the shell family's rules for this install: the read tools' roots and deny
-    list, ``RESONANT_HOME`` (never written) and the brain's own dir (``<home>/ask``)."""
+    list, ``RESONANT_HOME`` (never written), the sibling instances' homes (never written,
+    PER-290) and the brain's own dir (``<home>/ask``)."""
     scope = ReadScope.from_settings(settings)
 
     def read_ok(path: str) -> bool:
         return not scope.denied(path) and scope.inside(os.path.realpath(path))
 
-    return ShellPolicy(read_ok=read_ok, home=settings.home, scratch=[settings.home / "ask"])
+    # PER-290: the other instances' homes are never written either
+    others = [s.home for s in instance.siblings(settings.instance.name)]
+    return ShellPolicy(
+        read_ok=read_ok, home=settings.home, scratch=[settings.home / "ask"], others=others
+    )
 
 
 @dataclass(frozen=True)
