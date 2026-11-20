@@ -262,13 +262,87 @@ class IMessageConfig(_Section):
         return v
 
 
+_SLACK_TEAM = re.compile(r"^T[A-Z0-9]{2,31}$")
+_SLACK_USER = re.compile(r"^[UW][A-Z0-9]{2,31}$")
+_SLACK_ROOM = re.compile(r"^[CG][A-Z0-9]{2,31}$")
+_ROOM_KEY = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+class SlackConfig(_Section):
+    """``channels.slack`` (PER-295): the Slack adapter (``resonant.gateway.slack``), over
+    Socket Mode. Its tokens are Keychain secrets of this instance (``bot_token_ref``,
+    ``app_token_ref``), never config."""
+
+    enabled: bool = False
+    # The workspace (``T…``): events and clicks from any other team are dropped, and only a
+    # sender of this team is vouched for (``Principals.resolve(..., vouched=True)``).
+    team_id: str | None = None
+    bot_user_id: str | None = None  # the bot's own user (``U…``): its mentions are stripped
+    # Rooms ``post_room(key, text)`` may post to, by key (``digest: C0123``). Any other key is
+    # refused: a room is the one destination that isn't a principal.
+    rooms: dict[str, str] = Field(default_factory=dict[str, str])
+    follow_idle_days: int = Field(default=14, ge=1, le=365)  # a tagged thread is followed so long
+    inbound_per_minute: int = Field(default=30, ge=1)  # per principal; excess is dropped
+    max_body_chars: int = Field(default=4000, ge=1)  # longer messages are dropped, never answered
+    # Where run codes link (``<link_base>#/runs/R12``): the dashboard's URL. None: plain text.
+    link_base: str | None = None
+    # Keychain refs (values are set by the owner, never here): the bot token (xoxb-…) and the
+    # app-level token (xapp-…, connections:write) for Socket Mode.
+    bot_token_ref: str = "slack/bot_token"  # noqa: S105 - a Keychain ref, not a value
+    app_token_ref: str = "slack/app_token"  # noqa: S105 - a Keychain ref, not a value
+
+    @field_validator("bot_token_ref", "app_token_ref")
+    @classmethod
+    def _ref(cls, v: str) -> str:
+        from resonant.secrets import validate_ref
+
+        return validate_ref(v)
+
+    @field_validator("team_id")
+    @classmethod
+    def _team(cls, v: str | None) -> str | None:
+        if v is not None and not _SLACK_TEAM.match(v):
+            raise ValueError("channels.slack.team_id must be a Slack team id (T…)")
+        return v
+
+    @field_validator("bot_user_id")
+    @classmethod
+    def _bot(cls, v: str | None) -> str | None:
+        if v is not None and not _SLACK_USER.match(v):
+            raise ValueError("channels.slack.bot_user_id must be a Slack user id (U…)")
+        return v
+
+    @field_validator("rooms")
+    @classmethod
+    def _rooms(cls, v: dict[str, str]) -> dict[str, str]:
+        for key, room in v.items():
+            if not _ROOM_KEY.match(key) or not _SLACK_ROOM.match(room):
+                raise ValueError(
+                    f"channels.slack.rooms: {key!r} must be a slug and map to a channel id (C…)"
+                )
+        return v
+
+    @field_validator("link_base")
+    @classmethod
+    def _link(cls, v: str | None) -> str | None:
+        if v is not None and not re.fullmatch(r"https?://[^\s<>|]+", v):
+            raise ValueError("channels.slack.link_base must be an http(s) URL")
+        return None if v is None else v.rstrip("/")
+
+    @model_validator(mode="after")
+    def _complete(self) -> Self:
+        if self.enabled and (self.team_id is None or self.bot_user_id is None):
+            raise ValueError("channels.slack.enabled needs team_id and bot_user_id")
+        return self
+
+
 class ChannelsConfig(_Section):
     """One section per channel adapter; each has ``enabled``. PER-292: the daemon builds the
-    channel stack (``resonant.wiring.build_stack``) when any of them is enabled. A new
-    channel (Slack, PER-295) adds its section here and its adapter in
-    ``wiring.build_channels``."""
+    channel stack (``resonant.wiring.build_stack``) when any of them is enabled. A channel
+    adds its section here and its adapter in ``wiring.build_channels`` (Slack: PER-295)."""
 
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
 
     def enabled(self) -> tuple[str, ...]:
         """The enabled channels' names, in field order (iMessage first)."""

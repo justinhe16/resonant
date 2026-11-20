@@ -280,8 +280,13 @@ class ApprovalReply:
     returns the original result with no new effect.
 
     Binding rules: the actor must be an approver with the approve grant, and the reply
-    must come from iMessage via the parser. ``code`` picks one approval. Without a code,
-    the reply binds only if exactly one approval is pending for the actor. A
+    must come from a channel via the parser, or (PER-295) from a Slack button
+    (``path="button"``): a button always carries its prompt's code, so it binds like
+    ``yes <code>`` / ``no <code>`` (an L1 approval is one click too); the sent-before rule
+    is that the prompt went out to some approver before the click (the click is on the
+    posted message, which another approver may see in a shared thread); pay never binds by
+    button (``code_required``: only a typed ``yes <code>``). ``code`` picks one approval.
+    Without a code, the reply binds only if exactly one approval is pending for the actor. A
     ``require_code`` approval (L1, pay) is approved only by ``yes <code>``; a plain ``no``
     may deny it. ``always`` (``yes always``) binds like a plain or coded yes, but only to an
     approval that offered it (``allow_always``: a worker's trust check, never
@@ -298,8 +303,8 @@ class ApprovalReply:
     channel: str
     raw_text: str
     decision: Literal["approve", "deny"]
-    path: Literal["parser", "classifier"]
-    event_id: str  # the reply Event's id
+    path: Literal["parser", "classifier", "button"]
+    event_id: str  # the reply Event's id (a button: one id per click)
     occurred_at: datetime  # the reply Event's occurred_at; timezone-aware
     code: str | None = None
     all_in_batch: bool = False
@@ -318,6 +323,8 @@ class ApprovalReply:
             raise ValueError("always is an approval")
         if self.picks is not None and (self.decision != "approve" or self.always or not self.picks):
             raise ValueError("picks are a plain approval of some changes")
+        if self.path == "button" and (self.code is None or self.always or self.picks is not None):
+            raise ValueError("a button carries its prompt's code, and nothing else")
 
 
 # Why ``resolve_reply`` refused a reply. A closed set the router maps to its replies:
@@ -328,7 +335,7 @@ class ApprovalReply:
 # - unknown_code: the code matches none of the actor's pending approvals.
 # - code_required: a plain "yes" for a require_code approval.
 # - not_sent_before: the approval's prompt was not sent to the actor before the reply.
-# - unsupported: not an iMessage parser reply, or a ``yes all`` reply (not offered).
+# - unsupported: not a parser reply (or a Slack button), or a ``yes all`` reply (not offered).
 # - always_unsupported: "yes always" for an approval that doesn't offer it (anything but a
 #   worker's trust check, and never a require_code one).
 # - not_a_batch: "yes 1,3" for a lone approval (PER-255).
