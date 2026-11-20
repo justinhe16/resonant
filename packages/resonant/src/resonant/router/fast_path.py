@@ -50,7 +50,14 @@ extension shipped in ``<repo>/extensions/<word>/resonant.yaml`` gets, for the ow
 isn't installed. On the Mini: resonant ext add repo:<word>" (or "is disabled ... ext update");
 nothing runs.
 
-``/kill`` and ``/resume`` are never decided by the LLM. A non-owner gets "not allowed".
+``/kill`` and ``/resume`` are never decided by the LLM. A member gets "not allowed".
+PER-293: an approver may use them too (and the words ``pause`` / ``resume``, approvers
+only), on this instance alone: never the sibling fan-out, the source recorded as
+``approver:<name>``, and a pause personal Resonant made (``sibling:resonant``) is never theirs
+to resume (``SIBLING_PAUSE_REPLY``), nor is the owner's own (``OWNER_PAUSE_REPLY``).
+Owner-only commands an approver may use are the registry's ``staff`` ones; the rest
+(``/update``, ``/ext``, ``/pulse``) stay the owner's.
+A member asking for ``/run`` or ``/merge`` gets ``start_work_reply`` (who can start work).
 A slash command whose tool the principal can't request gets "not allowed"; a keyword in
 that case falls through to the brain (``run`` returns None).
 
@@ -103,7 +110,7 @@ from resonant.router.render import (
 from resonant.store import extensions as ext_store
 from resonant.store import repos as repo_store
 from resonant.store.audit import audit
-from resonant.store.db import atomic, iso, utcnow
+from resonant.store.db import atomic, iso, kv_get, utcnow
 from resonant.toolcore import allow_inline
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect
@@ -119,6 +126,16 @@ _SESSION_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")
 NOT_ALLOWED = "not allowed"
 KILL_REPLY = "kill switch engaged"
 RESUME_REPLY = "resumed: autonomy on, unpaused"
+# PER-293: an approver's resume of a pause personal Resonant made ({owner} is the owner).
+SIBLING_PAUSE_REPLY = "{owner} paused everything from personal Resonant; he resumes it there."
+# PER-293: an approver's resume of a pause the owner made here (only approvers' pauses lift).
+OWNER_PAUSE_REPLY = "{owner} paused this; he resumes it."
+APPROVER_SOURCE = killswitch.APPROVER_SOURCE  # kv ``paused_by``: ``approver:<name>``
+# PER-293: plain words an approver may use for the instance-only pause (owners use /kill).
+APPROVER_KEYWORDS: dict[str, str] = {"pause": "/kill", "resume": "/resume"}
+# PER-293: the builtins only the owner and approvers may ask for (start_work_reply).
+START_WORK_TOOLS = frozenset({"start_run", "merge_run"})
+FILE_TICKET = "file_ticket"  # an extension tool a member may be offered instead
 UNKNOWN_COMMAND_REPLY = commands.unknown_reply(None)
 PAUSED_REPLY = "Paused: nothing runs until /resume."
 CORE_EXT = "core"
@@ -150,6 +167,15 @@ class FastPathResult:
 
 
 # --- templates ---------------------------------------------------------------------------
+
+
+def start_work_reply(principals: Principals, *, can_file: bool) -> str:
+    """PER-293: what a member hears asking for a run or a merge: who can start work (the
+    owner, then the approvers), and the offer to file a ticket when they can."""
+    names = [principals.display(n) for n in (principals.owner, *principals.approver_names)]
+    who = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} or {names[-1]}"
+    text = f"Only {who} can start work."
+    return f"{text} I can file a ticket for it instead." if can_file else text
 
 
 def kill_reply(runs_ended: int) -> str:
@@ -338,6 +364,7 @@ class FastCommand:
     render: Render | None = None
     reply: str | None = None  # static reply (no tool): a usage line
     admin: bool = False  # owner-only (the registry's ``owner_only``)
+    staff: bool = False  # PER-293: an approver may use it too (the registry's ``staff``)
     help: bool = False  # /help: rendered from the registry for the asking principal
     tools: tuple[str, ...] = ()  # every tool the command can call: checked before ``reply``
     title: str = ""  # the task title ("/restart ollama"); defaults to ``name``
@@ -391,6 +418,7 @@ def _from_command(cmd: Command, rest: str, ctx: ParseContext) -> FastCommand:
         cmd.intent,
         True,
         admin=cmd.owner_only,
+        staff=cmd.staff,
         tools=cmd.tools,
         extension=cmd.extension,
     )
@@ -467,8 +495,13 @@ class FastPath:
         # (``ops.siblings.kill_switch_fan_out``): one line per sibling. None: no fan-out.
         self.siblings: Callable[[bool], Awaitable[list[str]]] | None = None
 
-    def match(self, text: str) -> FastCommand | None:
-        """``match_fast_path`` over this fast path's command table (extensions included)."""
+    def match(self, text: str, principal: str | None = None) -> FastCommand | None:
+        """``match_fast_path`` over this fast path's command table (extensions included).
+        PER-293: for an approver, ``pause`` / ``resume`` are ``/kill`` / ``/resume``."""
+        if principal is not None and self.principals.role(principal) == "approver":
+            slash = APPROVER_KEYWORDS.get(normalize(text))
+            if slash is not None:
+                return match_fast_path(slash, self.context(), self.table)
         return match_fast_path(text, self.context(), self.table)
 
     def available(self, principal: str) -> list[Command]:
@@ -528,7 +561,8 @@ class FastPath:
         self, cmd: FastCommand, principal: str, event_id: str, trace_id: str | None
     ) -> FastPathResult | None:
         # Permission before arguments: a refused asker never sees a usage line.
-        if cmd.admin and not self.principals.can(principal, "admin", None):
+        owner = self.principals.can(principal, "admin", None)
+        if cmd.admin and not owner and not (cmd.staff and self.principals.is_approver(principal)):
             with atomic(self.conn):
                 audit(
                     self.conn,
@@ -537,8 +571,10 @@ class FastPath:
                     trace_id=trace_id,
                     command=cmd.name,
                 )
+            if self.principals.team and START_WORK_TOOLS.intersection(cmd.tools):  # PER-293
+                return self._result(cmd, self._start_work(principal))
             return self._result(cmd, NOT_ALLOWED)
-        if cmd.slash and not all(self._can_request(principal, t, cmd.extension) for t in cmd.tools):
+        if cmd.slash and not self._may_use(cmd, principal):
             return self._result(cmd, NOT_ALLOWED)
         if cmd.unknown is not None:
             if (hint := self._not_installed(cmd.unknown, principal)) is not None:
@@ -548,10 +584,16 @@ class FastPath:
         if cmd.reply is not None:  # a usage line
             return self._result(cmd, cmd.reply)
         if cmd.admin and cmd.name == "/kill":
+            if not owner:  # PER-293: an approver pauses this instance only
+                actor = APPROVER_SOURCE + principal
+                killswitch.engage(self.conn, actor=actor, reason="fast path /kill (approver)")
+                return self._result(cmd, kill_reply(self.runs_killed()), "killswitch.engage")
             killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
             text = kill_reply(self.runs_killed())
             return self._result(cmd, await self._fan_out(text, True), "killswitch.engage")
         if cmd.admin and cmd.name == "/resume":
+            if not owner:  # PER-293: this instance only, never personal Resonant's pause
+                return self._approver_resume(cmd, principal)
             killswitch.release(self.conn, actor=principal)
             return self._result(cmd, await self._fan_out(RESUME_REPLY, False), "killswitch.release")
         if cmd.name == "/approvals":
@@ -599,6 +641,46 @@ class FastPath:
             log.warning("fast path %s failed: %s", cmd.tool, type(e).__name__)
             text = f"Couldn't read {cmd.tool} right now."
         return self._result(cmd, text, cmd.tool)
+
+    def _may_use(self, cmd: FastCommand, principal: str) -> bool:
+        """A builtin command needs every tool it can call. An ``/<ext>`` command (PER-293:
+        per-tool grants) needs the tool it names, or any of its tools for a usage line."""
+        if cmd.extension is None:
+            return all(self._can_request(principal, t) for t in cmd.tools)
+        tools = (cmd.tool,) if cmd.tool is not None else cmd.tools
+        return any(self._can_request(principal, t, cmd.extension) for t in tools)
+
+    def _start_work(self, principal: str) -> str:
+        """``start_work_reply`` for ``principal``: the ticket offer only when they may file
+        one (a ``file_ticket`` tool of any extension)."""
+        can_file = any(
+            s.name == FILE_TICKET and self.principals.may_request(principal, s)
+            for s in self.registry.specs()
+            if s.extension is not None
+        )
+        return start_work_reply(self.principals, can_file=can_file)
+
+    def _approver_resume(self, cmd: FastCommand, principal: str) -> FastPathResult:
+        """PER-293: an approver's ``/resume``: this instance only, and only an approver's
+        pause. Personal Resonant's (``sibling:resonant``) the owner resumes there; the owner's
+        own here (or one with no recorded source) he resumes himself."""
+        source = killswitch.paused_by(self.conn)
+        paused = kv_get(self.conn, "paused") is True
+        if paused and (source is None or not source.startswith(APPROVER_SOURCE)):
+            with atomic(self.conn):
+                audit(
+                    self.conn,
+                    "router.resume_refused",
+                    requested_by=principal,
+                    command=cmd.name,
+                    paused_by=source,
+                )
+            owner = self.principals.display(self.principals.owner)
+            sibling = source == killswitch.SIBLING_SOURCE
+            text = (SIBLING_PAUSE_REPLY if sibling else OWNER_PAUSE_REPLY).format(owner=owner)
+            return self._result(cmd, text)
+        killswitch.release(self.conn, actor=APPROVER_SOURCE + principal)
+        return self._result(cmd, RESUME_REPLY, "killswitch.release")
 
     async def _fan_out(self, text: str, paused: bool) -> str:
         """PER-290: after this instance's own switch, the siblings' (a line each). This
@@ -722,7 +804,7 @@ class FastPath:
             self.conn,
             self.gate.pending_for(principal),
             code if isinstance(code, str) else None,
-            is_owner=self.principals.can(principal, "admin", None),
+            is_owner=self.principals.is_approver(principal),  # PER-293: approvers see args
             now=self.clock(),
         )
         return self._result(cmd, NOT_ALLOWED if text is None else text)

@@ -34,11 +34,12 @@ transaction as the approval when the owner answers ``yes always``.
 Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (missing or
 garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
 
-Approvers (``approvers``): a builtin (``extension=None``) is owner-only. An extension tool's
-approvers are the owner plus each principal its manifest names (``approvers_for``) that
-holds ``approve`` for that extension in principals.yaml. The grant check runs here, so a
-manifest can't grant itself approvers: a name without the grant, or unknown, is dropped
-and logged.
+Approvers (``approvers``, PER-293): a builtin's (``extension=None``) are the owner and every
+``role: approver``. An extension tool's are those, plus each principal its manifest names
+(``approvers_for``) that holds ``approve`` for that extension (for that tool, under a per-tool
+grant) in principals.yaml. The grant check runs here, so a manifest can't grant itself
+approvers: a name without the grant, unknown, or a workspace-default member is dropped and
+logged. Self-approval is allowed: an approver may answer the prompt for their own request.
 
 Approvals, per (task, intent hash):
 - "ask" reuses the pending approval if there is one, else inserts a new one (approvers as
@@ -102,7 +103,7 @@ from resonant.gate.types import (
     ReplyRefusal,
     ResolveResult,
 )
-from resonant.principals import KNOWN_CHANNELS, Principals
+from resonant.principals import ADMIN_TOOLS, KNOWN_CHANNELS, Principals
 from resonant.store import approvals as ap
 from resonant.store import outbound
 from resonant.store import trust as trust_store
@@ -503,20 +504,26 @@ class PolicyGate:
             return False
         return summary == phrased(intent)
 
-    def approvers(self, extension: str | None) -> tuple[str, ...]:
-        """Who may approve a call to this extension's tools: the owner first, then each
-        manifest-named principal that holds ``approve`` for it. Builtins are owner-only."""
-        owner = self.principals.owner
+    def approvers(self, extension: str | None, tool: str | None = None) -> tuple[str, ...]:
+        """Who may approve a call to this tool: the owner first, then every approver
+        (``role: approver``, PER-293). A builtin's stop there. An extension's then add each
+        manifest-named principal that holds ``approve`` for it (for ``tool``, when given: a
+        per-tool grant covers only its tools)."""
+        staff = (self.principals.owner, *self.principals.approver_names)
         if extension is None:
-            return (owner,)
+            return (self.principals.owner,) if tool in ADMIN_TOOLS else staff
         named = self.approvers_for(extension)
         if isinstance(named, str):  # a bare name is a seam bug, never a list of letters
             raise TypeError("approvers_for must return a sequence of names, not a str")
-        found = [owner]
+        found = list(staff)
         for name in named:
             if name in found:
                 continue
-            if not self.principals.can(name, "approve", extension):
+            if self.principals.is_default(name) or not (
+                self.principals.can(name, "approve", extension, tool=tool)
+                if tool is not None
+                else self.principals.holds(name, "approve", extension)
+            ):
                 log.warning("dropping approver %r: no approve grant for %r", name, extension)
                 continue
             found.append(name)
@@ -575,7 +582,7 @@ class PolicyGate:
             effect=intent.effect,
             level=intent.level,
             summary=summary,
-            approvers=self.approvers(intent.extension),
+            approvers=self.approvers(intent.extension, intent.tool),
             code=new_code(ap.pending_codes(self.conn)),
             expires_at=now + self.ttl,
             require_code=require_code,
@@ -662,7 +669,8 @@ class PolicyGate:
             if len({r.task_id for r in found}) != 1 or found[0].task_id is None:
                 raise ValueError("a batch is one task's approvals")
             if not all(
-                principal in r.approvers and self.principals.can(principal, "approve", r.extension)
+                principal in r.approvers
+                and self.principals.can(principal, "approve", r.extension, tool=r.tool)
                 for r in found
             ):
                 raise ValueError("the owner can't approve every approval in it")
@@ -759,7 +767,7 @@ class PolicyGate:
             if approval is None or (approval.task_id is None and approval.tool != ap.REPIN_TOOL):
                 reason = "not_found"
             elif resolution.actor not in approval.approvers or not self.principals.can(
-                resolution.actor, "approve", approval.extension
+                resolution.actor, "approve", approval.extension, tool=approval.tool
             ):
                 reason = "not an approver"
             else:
@@ -978,7 +986,7 @@ class PolicyGate:
         return (
             (a.task_id is not None or a.tool == ap.REPIN_TOOL)  # PER-275: a re-pin has no task
             and reply.actor in a.approvers
-            and self.principals.can(reply.actor, "approve", a.extension)
+            and self.principals.can(reply.actor, "approve", a.extension, tool=a.tool)
         )
 
 

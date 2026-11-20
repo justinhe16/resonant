@@ -18,7 +18,8 @@ Pause source (PER-290). ``paused_by`` (kv) is who engaged it: the owner's handle
 ``owner:cli``, or ``sibling:resonant`` when personal Resonant's ``/kill`` paused this instance
 (``resonant pause --by sibling:resonant``). An engage while already paused keeps the first
 source, so personal's ``/resume`` (``resonant resume --if-by sibling:resonant``) never undoes a
-pause someone else made. ``release`` clears it.
+pause someone else made. ``release`` clears it. PER-293: an approver's pause is
+``approver:<name>``; any other actor engaging over it takes the source over.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ _hooks: list[PauseHook] = []
 PAUSED_BY_KEY = "paused_by"
 SIBLING_SOURCE = "sibling:resonant"  # personal Resonant's /kill, fanned out (PER-290)
 UNRECORDED_SOURCE = "unrecorded:before-sources"  # a pause older than paused_by
+APPROVER_SOURCE = "approver:"  # PER-293: an approver's instance-only pause (approver:<name>)
 
 
 def add_pause_hook(hook: PauseHook) -> Callable[[], None]:
@@ -67,7 +69,16 @@ def engage(conn: sqlite3.Connection, *, actor: str, reason: str | None = None) -
     first source stays)."""
     with atomic(conn):
         before = _state(conn)
+        source = paused_by(conn)
         if kv_get(conn, "paused") is not True:
+            kv_set(conn, PAUSED_BY_KEY, actor)
+        elif (
+            source is not None
+            and source.startswith(APPROVER_SOURCE)
+            and not actor.startswith(APPROVER_SOURCE)
+        ):
+            # PER-293: the owner (or personal Resonant) pausing over an approver's pause takes
+            # it over, so the approver can't lift it.
             kv_set(conn, PAUSED_BY_KEY, actor)
         elif paused_by(conn) is None:  # paused before sources were recorded: not this actor's
             kv_set(conn, PAUSED_BY_KEY, UNRECORDED_SOURCE)

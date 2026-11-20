@@ -33,9 +33,11 @@ the shared tool call path (``resonant.toolcore``, ``_call_tool``).
 4. **Claude can't take it** (``AskRefused.reason``, code, never parsed from text): the
    usage limit says so once per reset (``LIMIT_OWNER``: "I'm at my Claude limit until 3pm;
    I can still do approvals and /status") and then ``LIMIT_SHORT``; a full queue says so;
-   anything else (off, paused, not running, caps) is ``UNAVAILABLE_REPLY``. A member who may
-   not use Claude gets ``MEMBER_REPLY`` (small talk still works). Never a model-written
-   answer in its place.
+   anything else (off, paused, not running, caps) is ``UNAVAILABLE_REPLY``. A member reaches
+   Claude with a per-principal toolset (PER-293: ``ask_claude``'s ``claude`` grant, held via
+   ``"builtin:claude"``, or any extension grant on a team config; ``tools_for`` and the bridge
+   offer only what ``may_request`` allows). Any other member still gets ``MEMBER_REPLY``
+   (small talk still works). Never a model-written answer in its place.
 5. **After the reply** (``step``): when ``history.fold_due``, the history fold runs as a
    background task, never on the reply path.
 
@@ -112,7 +114,8 @@ TRIAGE_MESSAGE_CHARS = 2000  # of the message, as the triage call reads it
 RUNNER_GAPS_TTL_S = 60.0  # as the dashboard's runner check (api.RUNNER_CHECK_TTL_S)
 RUNNER_GAPS_TIMEOUT_S = 30.0  # a background check; never on the reply path
 
-# What a member hears for a text that needs Claude (members may not use ask_claude).
+# What a member without a Claude grant hears for a text that needs Claude (PER-293: a
+# member with ``builtin:claude``, or any extension grant on a team config, reaches Claude).
 MEMBER_REPLY = "I can only take that from the owner right now."
 
 # Builtins whose results carry text others wrote (a Claude worker's notes, questions and
