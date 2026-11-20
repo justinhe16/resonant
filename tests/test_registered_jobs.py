@@ -604,3 +604,16 @@ async def test_a_paused_instance_with_no_jobs_records_nothing(
     rows = db.execute("SELECT action FROM audit_log WHERE id > ?", (before,)).fetchall()
     assert [r[0] for r in rows if r[0].startswith("job.")] == []
     await sched.aclose()
+
+
+def test_the_heartbeat_reads_the_next_job_from_the_real_table(db: sqlite3.Connection) -> None:
+    """PER-303's ``next_registered_job`` over this table: the soonest active job, paused and
+    deleted ones left out."""
+    from resonant.extensions.pulse_job import next_registered_job
+
+    assert next_registered_job(db, NOW) is None
+    for name, expr in (("weekly", "0 9 * * 1"), ("daily", "0 8 * * *"), ("off", "0 7 * * *")):
+        store.create(db, name=name, schedule=expr, tz=TZ, prompt="p", repo=None, output="dm",
+                     created_by="brian", channel_ref=None, now=NOW)  # fmt: skip
+    store.set_state(db, "J3", "paused", NOW, expect=("active",))
+    assert next_registered_job(db, NOW) == ("J2", datetime(2026, 11, 21, 13, 0, tzinfo=UTC))

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -30,12 +31,12 @@ from resonant.config import VoiceConfig
 from resonant.extensions import briefing as bf
 from resonant.extensions import notify
 from resonant.extensions import pulse_job as pj
-from resonant.extensions.scheduler import CORE_JOBS, Scheduler
-from resonant.gateway.channel import ChannelError, MessageRef
+from resonant.extensions.scheduler import CORE_JOBS, CoreDeps, Scheduler
+from resonant.gateway.channel import ChannelError, ChannelRefused, ChannelSendError, MessageRef
 from resonant.runners.voice import CallResult
 from resonant.store import pulse as ps
 from resonant.store import runs as runs_store
-from resonant.store.db import atomic, kv_get, kv_set
+from resonant.store.db import atomic, iso, kv_get, kv_set
 
 T9 = local(10, 13, 9)  # 09:00 PDT: a normal hour
 MANUAL = {"enabled": True}
@@ -701,3 +702,266 @@ async def test_the_pulse_voice_call_is_kept_under_the_key_for_a_catch_up() -> No
         use_voice(h, script)
         await pulse(h, T9)
         assert kv_get(h.db, "voice.out:pulse:2026-10-13:09") is not None
+
+
+# --- the heartbeat (PER-303) ---------------------------------------------------------------------
+
+
+@dataclass
+class RoomChannel(FakeChannel):
+    """The hub as the heartbeat sees it: owner sends as before, plus ``post_room`` to the
+    configured rooms (deduped by key like the Slack adapter); ``down`` makes posts fail."""
+
+    rooms: frozenset[str] = frozenset({"pulse"})
+    posts: list[tuple[str, str, str | None]] = field(
+        default_factory=list[tuple[str, str, str | None]]
+    )
+    down: str | None = None
+
+    async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
+        if key not in self.rooms:
+            raise ChannelRefused(f"slack: unknown room {key!r}")
+        if self.down is not None:
+            raise ChannelSendError(f"slack: chat.postMessage failed: {self.down}")
+        if dedupe_key is None or dedupe_key not in self.keys:
+            self.posts.append((key, text, dedupe_key))
+            if dedupe_key is not None:
+                self.keys.add(dedupe_key)
+        return MessageRef("slack", f"C0PULSE:{len(self.posts)}")
+
+    def beats(self) -> list[str]:
+        return [t for _, t, _ in self.posts]
+
+
+def cori(h: Harness, *, room: str | None = "pulse") -> RoomChannel:
+    """Cori's settings: the heartbeat on (``room``) and her name; the hub with a room."""
+    h.settings.pulse.heartbeat.room = room
+    h.settings.instance.display_name = "Cori"
+    h.channel = RoomChannel()
+    return h.channel
+
+
+async def beat(h: Harness, due: datetime, *, owner: str | None = OWNER) -> dict[str, Any]:
+    deps = CoreDeps(h.settings, h.db, h.components, h.channel, owner)
+    job = pj.pulse_job(deps, clock=h.clock)
+    assert job is not None
+    h.clock.now = due
+    return await job.run({"due_at": due.isoformat()}, CTX)
+
+
+def registered_job(h: Harness, job_id: str, schedule: str, *, state: str = "active") -> None:
+    """A row of PER-298's ``registered_jobs`` through its store (``job_id`` is ``J<n>``)."""
+    from resonant.store import jobs as jobs_store
+
+    while True:  # ids below job_id are fillers, deleted at once
+        job = jobs_store.create(h.db, name=job_id, schedule=schedule, tz=TZ, prompt="p",
+                                repo=None, output="dm", created_by=OWNER, channel_ref=None,
+                                now=T9)  # fmt: skip
+        if job.id == job_id:
+            break
+        jobs_store.set_state(h.db, job.id, "deleted", T9, expect=("active",))
+    if state != "active":
+        jobs_store.set_state(h.db, job.id, state, T9, expect=("active",))  # type: ignore[arg-type]
+
+
+def running(h: Harness, n: int) -> list[str]:
+    codes: list[str] = []
+    for _ in range(n):
+        run = runs_store.create(
+            h.db, repo="dori", ask="a private ask", principal=OWNER, session_id="s",
+            max_seconds=600,
+        )  # fmt: skip
+        runs_store.update(h.db, run.code, status="running")
+        codes.append(run.code)
+    return codes
+
+
+async def test_heartbeat_off_leaves_the_pulse_job_unchanged() -> None:
+    # golden: room null -> the same job, the same result, the same sends, no room post
+    async with harness() as h:
+        ch = cori(h, room=None)
+        report(h, "trader", "pnl", "PnL -$1.8k today", at=T9 - timedelta(minutes=20))
+        job = pj.pulse_job(h.deps(ch), clock=h.clock)
+        assert job is not None and job.runs_while_paused is False
+        out = await beat(h, T9)
+        assert out == {"sent": True, "count": 1}
+        assert ch.sent == [(OWNER, "btw:\n[trader] PnL -$1.8k today", "pulse:2026-10-13:09")]
+        assert ch.posts == []
+        assert kv_get(h.db, "heartbeat.inflight:heartbeat:2026-10-13:09") is None
+        # and with no owner nothing is scheduled, as before
+        assert pj.pulse_job(CoreDeps(h.settings, h.db, h.components, ch, None)) is None
+
+
+async def test_heartbeat_all_healthy_one_line_an_hour_with_runs_and_next_job() -> None:
+    async with harness() as h:
+        ch = cori(h)
+        codes = running(h, 2)
+        registered_job(h, "J3", "0 14 * * *")
+        registered_job(h, "J4", "0 10 * * *", state="paused")
+        out = await beat(h, T9)
+        assert out == {
+            "sent": False, "count": 0, "skipped": "nothing", "heartbeat": {"posted": True},
+        }  # fmt: skip
+        assert ch.posts == [
+            (
+                "pulse",
+                f"✓ Cori up · healthy · running {codes[0]}, {codes[1]} · next job J3 at 14:00",
+                "heartbeat:2026-10-13:09",
+            )
+        ]
+        assert ch.sent == []  # the owner pulse had nothing
+        # each hour exactly one line; idle once the runs end; a job due tomorrow names the day
+        for code in codes:
+            runs_store.finish(h.db, code, "done", step="reply")
+        await beat(h, local(10, 13, 15))
+        assert ch.beats()[-1] == "✓ Cori up · healthy · idle · next job J3 at Wed 14:00"
+        assert [k for _, _, k in ch.posts] == ["heartbeat:2026-10-13:09", "heartbeat:2026-10-13:15"]
+        # recorded once per key as the room's system text, kind heartbeat
+        rows = h.db.execute("SELECT principal, kind, ref, outside FROM system_texts").fetchall()
+        assert [tuple(r) for r in rows] == [
+            ("room:pulse", "heartbeat", "heartbeat:2026-10-13:09", 0),
+            ("room:pulse", "heartbeat", "heartbeat:2026-10-13:15", 0),
+        ]
+
+
+async def test_heartbeat_without_registered_jobs_or_owner() -> None:
+    # not owner-gated: no owner, pulse.enabled false -> still scheduled for the room
+    async with harness() as h:
+        ch = cori(h)
+        h.settings.pulse.enabled = False
+        out = await beat(h, T9, owner=None)
+        assert out["heartbeat"] == {"posted": True} and out["skipped"] == "unreachable"
+        assert ch.beats() == ["✓ Cori up · healthy · idle"] and ch.sent == []
+        # a hub without rooms and no owner pulse: nothing to schedule
+        plain = CoreDeps(h.settings, h.db, h.components, FakeChannel(), None)
+        assert pj.pulse_job(plain) is None
+
+
+async def test_heartbeat_health_lines_approvals_and_cap() -> None:
+    async with harness() as h:
+        ch = cori(h)
+        since = local(10, 13, 8, 30)
+        with atomic(h.db):
+            kv_set(h.db, "health.model", {"state": "degraded", "since": iso(since),
+                                          "detail": "SECRET-DETAIL"})  # fmt: skip
+            kv_set(h.db, "health.slack", {"state": "degraded", "since": iso(since)})
+        approval(h.db, "A1", T9 - timedelta(minutes=40))
+        approval(h.db, "A2", T9 - timedelta(minutes=5))
+        await beat(h, T9)
+        assert ch.beats() == [
+            "✓ Cori up · 2 checks degraded · idle\n"
+            "⚠ model: degraded since 08:30\n"
+            "⚠ slack: degraded since 08:30\n"
+            "Waiting: 2 approvals (oldest 40m)"
+        ]
+        assert "SECRET" not in ch.beats()[0]
+        # over 5 degraded rows: 5 lines then +N more, and always under 500 chars
+        with atomic(h.db):
+            for i in range(6):
+                kv_set(h.db, f"health.ext:noisy{i}", {"state": "degraded"})
+        text = pj.heartbeat_text(h.db, h.settings, T9, paused=False)
+        lines = text.splitlines()
+        assert lines[0].startswith("✓ Cori up · 8 checks degraded")
+        assert sum(line.startswith("⚠ ") for line in lines) == 5
+        assert "+3 more" in lines and len(text) < 500
+
+
+async def test_heartbeat_posts_paused_and_skips_the_owner_step() -> None:
+    async with harness() as h:
+        ch = cori(h)
+        report(h, "trader", "pnl", "PnL -$1.8k today", at=T9 - timedelta(minutes=20))
+        set_paused(h, True)
+        out = await beat(h, T9)
+        assert out == {
+            "sent": False, "count": 0, "skipped": "paused", "heartbeat": {"posted": True},
+        }  # fmt: skip
+        assert ch.beats() == ["⏸ Cori paused · healthy · idle"] and ch.sent == []
+        assert not told(h, "trader", "pnl")
+
+
+async def test_scheduler_runs_the_heartbeat_while_paused() -> None:
+    async with harness(at=local(10, 13, 8, 59)) as h:
+        ch = cori(h)
+        set_paused(h, True)
+        s = Scheduler.from_components(
+            h.settings, h.db, h.components, started_at=h.clock.now, channel=ch,
+            core_jobs=(functools.partial(pj.pulse_job, clock=h.clock),), clock=h.clock,
+        )  # fmt: skip
+        h.sched = s
+        s.jobs = tuple(j for j in s.jobs if j.core)
+        assert [j.runs_while_paused for j in s.jobs] == [True]
+        await h.tick(local(10, 13, 9, 0))
+        assert ch.beats() == ["⏸ Cori paused · healthy · idle"]
+
+
+async def test_heartbeat_ignores_quiet_hours_unless_asked() -> None:
+    async with harness() as h:
+        ch = cori(h)
+        night = local(10, 14, 3)  # inside 00:00-06:00; the owner pulse is quiet
+        report(h, "trader", "pnl", "PnL", at=night - timedelta(minutes=5))
+        out = await beat(h, night)
+        assert out["skipped"] == "quiet" and out["heartbeat"] == {"posted": True}
+        assert len(ch.posts) == 1 and ch.sent == []
+        h.settings.pulse.heartbeat.quiet_hours = True
+        out = await beat(h, night + timedelta(hours=1))
+        assert out["heartbeat"] == {"posted": False, "skipped": "quiet"}
+        assert len(ch.posts) == 1
+
+
+async def test_heartbeat_posts_in_the_briefing_hour() -> None:
+    async with harness(briefing={"enabled": True, "at": "08:00"}) as h:
+        cori(h)
+        out = await beat(h, local(10, 13, 8))
+        assert out["skipped"] == "briefing" and out["heartbeat"] == {"posted": True}
+
+
+async def test_heartbeat_restart_in_the_same_hour_posts_once() -> None:
+    async with harness() as h:
+        ch = cori(h)
+        await beat(h, T9)
+        # a restart: a new job and a channel that forgot its dedupe keys (only the store knows)
+        ch.keys.clear()
+        out = await beat(h, T9 + timedelta(minutes=20))
+        assert out["heartbeat"] == {"posted": False, "skipped": "duplicate"}
+        assert len(ch.posts) == 1
+
+
+async def test_heartbeat_room_missing_or_bot_removed_leaves_the_owner_pulse() -> None:
+    async with harness() as h:
+        ch = cori(h, room="nowhere")  # not a configured room
+        report(h, "trader", "pnl", "PnL -$1.8k today", at=T9 - timedelta(minutes=20))
+        out = await beat(h, T9)
+        assert out == {
+            "sent": True, "count": 1, "heartbeat": {"posted": False, "skipped": "failed"},
+        }  # fmt: skip
+        assert ch.texts() == ["btw:\n[trader] PnL -$1.8k today"] and ch.posts == []
+        # the bot removed from the room: failed this hour; back next hour, the old line is
+        # abandoned (never posted late), the new one goes out once
+        h.settings.pulse.heartbeat.room = "pulse"
+        ch.down = "not_in_channel"
+        out = await beat(h, T9 + timedelta(hours=1))
+        assert out["heartbeat"] == {"posted": False, "skipped": "failed"}
+        ch.down = None
+        out = await beat(h, T9 + timedelta(hours=2))
+        assert out["heartbeat"] == {"posted": True}
+        assert [k for _, _, k in ch.posts] == ["heartbeat:2026-10-13:11"]
+
+
+async def test_owner_step_failure_still_beats() -> None:
+    async with harness() as h:
+        ch = cori(h)
+        report(h, "trader", "pnl", "PnL", at=T9 - timedelta(minutes=20))
+
+        async def broken(*_a: Any, **_k: Any) -> MessageRef:
+            raise ChannelError("imessage down")
+
+        ch.send = broken  # type: ignore[method-assign]
+        with pytest.raises(ChannelError):
+            await beat(h, T9)
+        assert len(ch.posts) == 1
+
+
+def test_heartbeat_dedupe_key_and_kind() -> None:
+    assert pj.heartbeat_key(datetime(2026, 10, 13, 9, 5, tzinfo=LA)) == "heartbeat:2026-10-13:09"
+    assert pj.text_kind("heartbeat:2026-10-13:09") == "heartbeat"
+    assert pj.text_kind("pulse:2026-10-13:09") == "pulse"

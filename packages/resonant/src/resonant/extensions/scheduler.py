@@ -7,7 +7,8 @@ Each job's tick calls ``cron.decide`` over its ``ext_jobs`` state, then:
 - **Pause wins.** Paused (kv ``paused``; unknown counts as paused), every due time is
   skipped (``job.skipped_paused``) and ``last_due`` moves past it: no catch-up on resume.
   The one exception is a core job with ``runs_while_paused`` (``core/backup``: read-only,
-  nothing sent or spawned), which runs as if unpaused.
+  nothing sent or spawned; ``core/pulse`` with ``pulse.heartbeat.room``, PER-303, for the
+  room's ``⏸`` line only), which runs as if unpaused.
 - **Catch-up.** Only the latest due time can run: on time (within ``tick_s`` plus a
   minute), or within the job's ``catchup`` while the daemon was down (``Downtime`` from
   the previous run's last tick, kv ``scheduler.last_tick``, to this start). Every other one
@@ -152,7 +153,9 @@ class CoreJob:
     catchup: timedelta | None = None
     timeout_s: float = 300.0
     # Runs while the kill switch is engaged. Only for a job that reads the store and writes
-    # nothing outside Resonant's home, sends nothing and spawns nothing (core/backup).
+    # nothing outside Resonant's home, sends nothing and spawns nothing (core/backup); the one
+    # sender is core/pulse with the heartbeat on (PER-303): it posts only the room's "⏸ paused"
+    # line and skips the owner pulse.
     runs_while_paused: bool = False
     # PER-298: a run that returns ``{"quiet": true}`` (nothing to do) records nothing: no
     # ``record_run``, no ``job.run`` audit; its missed due times aren't audited either

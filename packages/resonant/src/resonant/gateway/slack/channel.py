@@ -48,7 +48,11 @@ when it is at most 30s, else raises :class:`ChannelRateLimited`; any other failu
 
 **Rooms.** :meth:`post_room` posts only to a key of ``channels.slack.rooms``; any other key
 raises :class:`ChannelRefused`. It is the one send that takes no principal (the documented
-exception, ``ChannelHub.post_room``).
+exception, ``ChannelHub.post_room``). A room post that fails (an unknown key, the bot removed
+from the room: ``not_in_channel``, Slack down) is remembered per key until the room's next post
+goes out, and ``health()``'s ``detail`` names it (``room pulse: chat.postMessage failed:
+not_in_channel``), so the ``slack`` check shows it (PER-303's heartbeat) without degrading:
+the adapter still works for everything else.
 
 **Approvals.** :meth:`request_approval` posts ``prompt.text()`` with Approve and Deny buttons
 (``blocks.approval_blocks``), in ``prompt.thread`` when set, else the principal's DM, deduped
@@ -85,6 +89,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 from resonant.config import SlackConfig
 from resonant.gateway.channel import (
     ApprovalPrompt,
+    ChannelError,
     ChannelRateLimited,
     ChannelRefused,
     ChannelSendError,
@@ -193,6 +198,7 @@ class SlackChannel:
         self._connected_at: datetime | None = None
         self._last_event_at: datetime | None = None
         self._last_error: str | None = None
+        self._room_errors: dict[str, str] = {}  # room key -> its last post's failure (PER-303)
         self._threads_swept: datetime | None = None
 
     @property
@@ -279,9 +285,11 @@ class SlackChannel:
         if error is None and self._task is not None and not self._connected:
             error = "socket disconnected"
         event = iso(self._last_event_at) if self._last_event_at else None
+        rooms = "".join(f", room {k}: {why}" for k, why in sorted(self._room_errors.items()))
         detail = (
             f"{'connected' if self._connected else 'disconnected'}, "
             f"{n} followed thread{'s' if n != 1 else ''}"
+            + rooms
             + (f", last event {event}" if event else "")
         )
         return {
@@ -790,7 +798,17 @@ class SlackChannel:
 
     async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
         """Post ``text`` to the room ``channels.slack.rooms[key]``. Any other key raises
-        :class:`ChannelRefused` (audited ``slack.room_refused``)."""
+        :class:`ChannelRefused` (audited ``slack.room_refused``). A failure is noted for
+        ``health()`` until the room's next post goes out (see "Rooms")."""
+        try:
+            ref = await self._post_room(key, text, dedupe_key=dedupe_key)
+        except ChannelError as e:
+            self._room_errors[key] = str(e).removeprefix(f"{CHANNEL_NAME}: ")
+            raise
+        self._room_errors.pop(key, None)
+        return ref
+
+    async def _post_room(self, key: str, text: str, *, dedupe_key: str | None) -> MessageRef:
         if not text:
             raise ValueError("cannot send an empty message")
         room = self.config.rooms.get(key)
