@@ -31,6 +31,11 @@ While ``relay.enabled``, the daemon runs :meth:`SnapshotPusher.run` as a backgro
   to drop a day a rebuild found empty. A failed one waits ``DAY_BACKOFF_S`` doubling up to
   ``DAY_BACKOFF_MAX_S`` and the rest wait for the next push; it never touches the relay's
   health row. The RPC prunes that panel's rows past its ``keep``.
+- **Instance** (PER-304). Both RPCs carry ``p_instance``, this daemon's instance name
+  (``settings.instance.name``; ``resonant`` for personal Resonant), and the snapshot names it
+  too (``instance``). The relay finds the instance from the ingest token and refuses (403) a
+  push whose ``p_instance`` or snapshot says another, so one instance can never write another's
+  rows. Each instance's token is ``relay/supabase_key`` in its own Keychain service.
 - **Kill switch.** ``/kill`` doesn't stop the relay: it is outbound status, not an action, and
   a paused Mini is exactly what the owner wants to see from away. The snapshot says
   ``paused: true``. ``dry_run`` doesn't stop it either. Only ``relay.enabled: false`` does,
@@ -63,6 +68,7 @@ from resonant.dashboard.snapshot import (
     to_remote,
 )
 from resonant.extensions.panel_history import panel_history
+from resonant.instance import DEFAULT_INSTANCE
 from resonant.monitor import scrub
 from resonant.redact import Redactor, redact_secrets, scrub_rc_links
 from resonant.secrets import SecretError, SecretMissing, SecretStore, secret_ref
@@ -339,7 +345,8 @@ class SnapshotPusher:
     the relay's own secrets as known values; this class applies ``to_remote`` itself, so a
     caller can't hand it anything wider. ``client`` (kept for good), ``client_factory`` (an
     owned client, rebuilt after ``FAIL_AFTER`` failed pushes in a row), ``sleep``,
-    ``clock``, ``monotonic`` and ``jitter`` are injectable for tests.
+    ``clock``, ``monotonic`` and ``jitter`` are injectable for tests. ``instance`` is this
+    daemon's instance name, sent as ``p_instance`` (PER-304).
     """
 
     def __init__(
@@ -355,6 +362,7 @@ class SnapshotPusher:
         clock: Callable[[], datetime] = utcnow,
         monotonic: Callable[[], float] = time.monotonic,
         jitter: Callable[[], float] = random.random,
+        instance: str = DEFAULT_INSTANCE,
     ) -> None:
         if config.supabase_url is None or config.anon_key is None:
             raise ValueError("relay needs supabase_url and anon_key")
@@ -363,6 +371,7 @@ class SnapshotPusher:
         self.url = config.supabase_url + INGEST_PATH
         self.day_url = config.supabase_url + DAY_PATH
         self.anon_key = config.anon_key
+        self.instance = instance
         self._snapshot = snapshot
         self.secrets = secrets
         self._owns_client = client is None
@@ -452,7 +461,7 @@ class SnapshotPusher:
                 continue
             body = json.dumps({
                 "p_token": token, "p_ext": row.ext, "p_panel": row.panel_id, "p_day": row.day,
-                "p_data": data, "p_keep_days": found[0],
+                "p_data": data, "p_keep_days": found[0], "p_instance": self.instance,
             }).encode()  # fmt: skip
             outcome = await self._post(body, self.day_url)
             with atomic(self.conn):
@@ -493,7 +502,7 @@ class SnapshotPusher:
             size = data_size(data)
         if size > MAX_BYTES:
             return PushOutcome(False, True, f"snapshot too large ({size} > {MAX_BYTES} bytes)")
-        body = json.dumps({"p_token": token, "p_data": data}).encode()
+        body = json.dumps({"p_token": token, "p_data": data, "p_instance": self.instance}).encode()
         outcome = _OK
         for attempt in range(1, self.config.max_attempts + 1):
             outcome = await self._post(body)

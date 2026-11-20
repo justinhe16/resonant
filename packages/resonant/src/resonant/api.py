@@ -196,7 +196,15 @@ async def local_snapshot(state: DaemonState, *, redactor: Redactor | None = None
         core_jobs=_core_jobs(state),
         redactor=redactor,
         launch_agents=await asyncio.to_thread(cached_scan),  # PER-277's diagram, 60 s cache
+        owner=_owner(state),
     )
+
+
+def _owner(state: DaemonState) -> str | None:
+    """The owner principal's name, or None when principals.yaml isn't loaded (PER-304: the
+    snapshot marks every other principal's words ``outside``)."""
+    c = state.components
+    return c.principals.owner if c is not None and c.principals_loaded else None
 
 
 def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> FastAPI:

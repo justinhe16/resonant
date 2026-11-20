@@ -157,6 +157,7 @@ class Daemon:
                     if secrets is not None
                     else SecretStore(service=settings.keychain_service)
                 ),
+                instance=settings.instance.name,  # PER-304: the relay keys rows by it
             )
         else:
             clear_relay_health(self.conn)
