@@ -13,7 +13,7 @@ from collections.abc import Iterable, Mapping
 from types import FrameType
 
 from resonant_relay import config, web
-from resonant_relay.alerts import Notifier, NtfyNotifier, WebhookNotifier
+from resonant_relay.alerts import Notifier, NtfyNotifier, SlackWebhookNotifier, WebhookNotifier
 from resonant_relay.checker import Checker
 from resonant_relay.source import RpcSource, StatusSource, TableSource
 
@@ -50,17 +50,43 @@ def setup_logging(secrets: Iterable[str]) -> None:
 
 def build_source(s: config.Settings) -> StatusSource:
     if s.read_mode == "table":
-        return TableSource(s.supabase_url, s.read_key)
+        return TableSource(s.supabase_url, s.read_key, s.instances)
     return RpcSource(s.supabase_url, s.anon_key, s.status_token)
 
 
 def build_notifiers(s: config.Settings) -> list[Notifier]:
+    """The global channels (ntfy, webhook), then one Slack channel per instance that routes
+    to its own Slack webhook (`slack:<instance>`)."""
     out: list[Notifier] = []
     if s.ntfy_topic:
         out.append(NtfyNotifier(s.ntfy_url, s.ntfy_topic, s.ntfy_token))
     if s.webhook_url:
         out.append(WebhookNotifier(s.webhook_url))
+    for inst in s.instances:
+        if "slack" in s.channels_for(inst):
+            out.append(SlackWebhookNotifier(inst, s.slack_webhooks[inst]))
     return out
+
+
+def build_routes(s: config.Settings) -> dict[str, list[str]]:
+    """Instance -> the notifier names its stale/failing alerts go to."""
+    return {
+        inst: [f"slack:{inst}" if ch == "slack" else ch for ch in s.channels_for(inst)]
+        for inst in s.instances
+    }
+
+
+def build_checker(s: config.Settings, notifiers: list[Notifier]) -> Checker:
+    """read_error is about the relay, not an instance: it goes to the global channels only."""
+    return Checker(
+        build_source(s),
+        notifiers,
+        stale_after=s.stale_after,
+        read_fail_after=s.read_fail_after,
+        instances=s.instances,
+        routes=build_routes(s),
+        read_error_to=list(s.global_channels()),
+    )
 
 
 def main(env: Mapping[str, str] = os.environ) -> int:
@@ -72,12 +98,8 @@ def main(env: Mapping[str, str] = os.environ) -> int:
     setup_logging(settings.secrets())
 
     site = web.load_site(settings.dist_dir, settings.supabase_url, settings.anon_key)
-    checker = Checker(
-        build_source(settings),
-        build_notifiers(settings),
-        stale_after=settings.stale_after,
-        read_fail_after=settings.read_fail_after,
-    )
+    notifiers = build_notifiers(settings)
+    checker = build_checker(settings, notifiers)
     stop = threading.Event()
     thread = threading.Thread(
         target=checker.run, args=(settings.check_every, stop), name="checker", daemon=True
@@ -116,13 +138,15 @@ def main(env: Mapping[str, str] = os.environ) -> int:
     thread.start()
     threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
     log.info(
-        "serving %d files on :%d; checking every %ds (stale after %ds, read mode %s, alerts: %s)",
+        "serving %d files on :%d; checking every %ds (stale after %ds, read mode %s, "
+        "instances: %s, alerts: %s)",
         len(site),
         settings.port,
         settings.check_every,
         settings.stale_after,
         settings.read_mode,
-        ", ".join(n.name for n in build_notifiers(settings)),
+        ", ".join(settings.instances),
+        "; ".join(f"{i} -> {', '.join(r)}" for i, r in build_routes(settings).items()),
     )
     with server:
         server.serve_forever()

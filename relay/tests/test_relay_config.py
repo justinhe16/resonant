@@ -150,3 +150,89 @@ def test_table_mode_and_webhook_only():
         }
     )
     assert s.read_mode == "table" and s.stale_after == 600 and s.read_fail_after == 600
+
+
+# --- instances and per-instance notify targets (PER-305) -------------------------------------
+
+SLACK = "https://hooks.slack.com/services/T000/B000/slack-secret-3"
+
+
+def test_instances_default_to_personal_with_the_global_channels():
+    s = load({**BASE, "WEBHOOK_URL": "https://hooks.example/x"})
+    assert s.instances == ("resonant",)
+    assert s.channels_for("resonant") == ("ntfy", "webhook")
+    assert s.slack_webhooks == {}
+
+
+def test_cori_with_her_slack_webhook_routes_to_ntfy_and_slack():
+    s = load({**BASE, "RELAY_INSTANCES": "resonant, cori", "SLACK_WEBHOOK_CORI": SLACK})
+    assert s.instances == ("resonant", "cori")
+    assert s.channels_for("resonant") == ("ntfy",)
+    assert s.channels_for("cori") == ("ntfy", "slack")
+    assert SLACK in s.secrets()
+    assert "slack-secret-3" not in repr(s)
+
+
+def test_explicit_notify_list():
+    s = load(
+        {
+            **BASE,
+            "RELAY_INSTANCES": "resonant,cori",
+            "SLACK_WEBHOOK_CORI": SLACK,
+            "RELAY_NOTIFY_CORI": "ntfy,slack",
+        }
+    )
+    assert s.channels_for("cori") == ("ntfy", "slack")
+    s = load({**BASE, "RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "ntfy"})
+    assert s.channels_for("cori") == ("ntfy",)
+
+
+def test_missing_slack_secret_only_means_no_slack():
+    s = load({**BASE, "RELAY_INSTANCES": "resonant,cori"})
+    assert s.channels_for("cori") == ("ntfy",)
+
+
+def test_a_slack_webhook_for_an_unwatched_instance_is_ignored():
+    s = load({**BASE, "SLACK_WEBHOOK_CORI": SLACK})
+    assert s.instances == ("resonant",) and s.slack_webhooks == {}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"RELAY_INSTANCES": "Cori!"},
+        {"RELAY_INSTANCES": "resonant,9cori"},
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "http://hooks.slack.com/x"},
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://evil.example/x"},
+        {
+            "RELAY_INSTANCES": "resonant,cori",
+            "SLACK_WEBHOOK_CORI": "https://hooks.slack.com.evil/x",
+        },
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://u:p@hooks.slack.com/x"},
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://hooks.slack.com:abc/x"},
+        {
+            "RELAY_INSTANCES": "resonant,cori",
+            "SLACK_WEBHOOK_CORI": "https://hooks.slack.com:99999/x",
+        },
+        {"RELAY_INSTANCES": "resonant,cori", "SLACK_WEBHOOK_CORI": "https://[hooks.slack.com/x"},
+        {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "ntfy,slack"},  # no URL
+        {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "pager"},
+        {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": "webhook"},  # no WEBHOOK_URL
+        {"RELAY_INSTANCES": "resonant,cori", "RELAY_NOTIFY_CORI": " , "},
+    ],
+)
+def test_bad_instance_settings(change: dict[str, str]):
+    with pytest.raises(ConfigError):
+        load({**BASE, **change})
+
+
+def test_slack_errors_never_echo_the_url():
+    with pytest.raises(ConfigError) as e:
+        load(
+            {
+                **BASE,
+                "RELAY_INSTANCES": "resonant,cori",
+                "SLACK_WEBHOOK_CORI": "http://hooks.slack.com/services/slack-secret-4",
+            }
+        )
+    assert "slack-secret-4" not in str(e.value)

@@ -617,7 +617,12 @@ Never use the `service_role` key or the JWT secret anywhere outside Supabase. Ea
 
     Expected: within a couple of minutes **Resonant: snapshots back**, and the banner clears. The daemon's watchdog may notice the frozen minutes and exit on resume; launchd restarts it, and `resonant status` shows `daemon  up`. Either way, one recovery alert.
 
-- **Verify:** `scripts/bootstrap.sh --check`, `fly status --app "$APP"`, and the freeze test above.
+### A second instance (Cori, PER-305)
+
+12. **Watch Cori from Fly.** After Cori pushes (her ingest token is in `relay_private.ingest_tokens` and `resonant --instance cori status` shows the relay `ok`), have the Slack Incoming Webhook for `#voyager-pulse` ready (PER-308) and set it on stdin, so it stays out of history: `{ printf 'SLACK_WEBHOOK_CORI='; pbpaste; } | fly secrets import --app "$APP"` (it must be `https://hooks.slack.com/...`). Then in `relay/fly.toml` `[env]` uncomment `RELAY_INSTANCES = "resonant,cori"` (and, optionally, `RELAY_NOTIFY_CORI = "ntfy,slack"`) and `fly deploy` as in step 8. `fly logs` shows `instances: resonant, cori, alerts: resonant -> ntfy; cori -> ntfy, slack:cori`. Without the secret Cori is still watched on ntfy; listing `slack` without it refuses to start.
+13. **Cori's freeze test.** `kill -STOP <cori daemon pid>` (`launchctl list | grep com.resonant.cori.daemon` shows it). Within about 5 minutes (`STALE_AFTER` plus one `CHECK_EVERY`): one ntfy alert **Cori: no snapshots** and one `#voyager-pulse` post `🔴 Cori: no snapshot for …`, and nothing for personal Resonant. Then `kill -CONT <pid>`: within one check, **Cori: snapshots back** on ntfy and `✅ Cori: back (snapshot …s old)` in Slack.
+
+- **Verify:** `scripts/bootstrap.sh --check`, `fly status --app "$APP"`, and the freeze test above (and Cori's, once she runs).
 - **Expected:** the relay rows and `dead-man switch` `PASS` (all advisory); one Fly machine; one alert on the freeze and one on recovery; the remote dashboard behind password + TOTP.
 - **Rollback:** stop the checker first, or it alerts that snapshots stopped: `fly scale count 0 --app "$APP" --yes` (or `fly apps destroy "$APP"`). Then tell Claude to set `relay.enabled: false`, and `resonant secret rm relay/supabase_key`. Deleting the instance's row from `relay_private.ingest_tokens` (step 6) refuses its pushes at once. The local dashboard keeps working throughout.
 

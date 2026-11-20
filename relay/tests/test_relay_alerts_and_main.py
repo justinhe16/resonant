@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 
 from resonant_relay import http
-from resonant_relay.__main__ import RedactFilter, build_notifiers, main
-from resonant_relay.alerts import Alert, NtfyNotifier, WebhookNotifier
+from resonant_relay.__main__ import RedactFilter, build_checker, build_notifiers, build_routes, main
+from resonant_relay.alerts import Alert, NtfyNotifier, SlackWebhookNotifier, WebhookNotifier
 from resonant_relay.config import load
 
 AT = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
@@ -102,3 +102,53 @@ def test_main_refuses_bad_config_without_echoing_secrets(capsys: pytest.CaptureF
     assert code == 2
     err = capsys.readouterr().err
     assert "not an anon" in err and "sb_secret_zzz" not in err
+
+
+def test_slack_payload_is_the_code_built_line():
+    cap = Capture()
+    slack = SlackWebhookNotifier("cori", "https://hooks.slack.com/services/x", send=cap)
+    assert slack.name == "slack:cori"
+    slack.send(Alert("stale", "open", "t", "m", AT, "cori", "Cori: no snapshot for 7m"))
+    slack.send(Alert("stale", "recovered", "t", "m", AT, "cori", "Cori: back"))
+    assert [json.loads(b) for _, b, _ in cap.calls] == [
+        {"text": "🔴 Cori: no snapshot for 7m"},
+        {"text": "✅ Cori: back"},
+    ]
+    assert cap.calls[0][0] == "https://hooks.slack.com/services/x"
+
+
+def test_webhook_payload_names_the_instance():
+    cap = Capture()
+    WebhookNotifier("https://hooks.example/x", send=cap).send(
+        Alert("stale", "open", "t", "m", AT, "cori")
+    )
+    assert json.loads(cap.calls[0][1])["instance"] == "cori"
+    WebhookNotifier("https://hooks.example/x", send=cap).send(
+        Alert("stale", "open", "t", "m", AT, "resonant")
+    )
+    assert "instance" not in json.loads(cap.calls[1][1])  # personal's body is unchanged
+
+
+def test_cori_routing_from_settings():
+    base = {
+        "SUPABASE_URL": "https://p.supabase.co",
+        "SUPABASE_ANON_KEY": "sb_publishable_x",
+        "RELAY_STATUS_TOKEN": "t",
+        "NTFY_TOPIC": "x",
+    }
+    s = load(
+        {
+            **base,
+            "RELAY_INSTANCES": "resonant,cori",
+            "SLACK_WEBHOOK_CORI": "https://hooks.slack.com/services/x",
+        }
+    )
+    assert [n.name for n in build_notifiers(s)] == ["ntfy", "slack:cori"]
+    assert build_routes(s) == {"resonant": ["ntfy"], "cori": ["ntfy", "slack:cori"]}
+    checker = build_checker(s, build_notifiers(s))
+    assert set(checker.told["slack:cori"]) == {("cori", "stale"), ("cori", "failing")}
+    assert ("", "read_error") in checker.told["ntfy"]
+    # No Slack secret: Cori is watched, alerts go to ntfy, nothing crashes.
+    s = load({**base, "RELAY_INSTANCES": "resonant,cori"})
+    assert [n.name for n in build_notifiers(s)] == ["ntfy"]
+    assert build_routes(s) == {"resonant": ["ntfy"], "cori": ["ntfy"]}
