@@ -149,6 +149,8 @@ export interface RunItem {
   /** false for runs past `limits.run_detail`: their texts and history are left out */
   detail: boolean;
   outside: string[];
+  /** PER-306: who asked when it isn't the owner (a member or approver on Cori) */
+  requested_by?: string | null;
 }
 
 export interface DetectedEffects {
@@ -191,6 +193,8 @@ export interface ApprovalItem {
   run_code: string | null;
   changes: ApprovalChange[] | null;
   outside: string[];
+  /** PER-306: whose task asked when it isn't the owner (`decided_by` resolved it) */
+  requested_by?: string | null;
 }
 
 export interface Approvals {
@@ -644,6 +648,44 @@ export interface Snapshot {
   repo_count: number;
   /** PER-277; absent from a daemon before it */
   diagram?: Diagram | null;
+  /** PER-306: registered jobs; absent when there are none */
+  jobs?: RegisteredJob[];
+  /** PER-306: live channel adapters beyond iMessage; absent without one */
+  channels?: Channels | null;
+}
+
+/** PER-298's registered job: cron plus a prompt, one worker run per firing (PER-306). */
+export interface RegisteredJob {
+  /** J3 */
+  id: string;
+  name: string;
+  /** schedule (PER-298) or watch (PER-299) */
+  kind: string;
+  state: "active" | "paused";
+  /** five-field cron */
+  schedule: string;
+  tz: string;
+  /** null while paused */
+  next_due: Timestamp | null;
+  last_run_code: string | null;
+  last_run_status: string | null;
+  last_run_at: Timestamp | null;
+  /** why the last firing didn't start */
+  last_error: string | null;
+  created_by: string;
+  /** thread, dm or room:<key> */
+  output: string;
+  outside: string[];
+}
+
+export interface SlackStatus {
+  connected: boolean;
+  last_event_at: Timestamp | null;
+  followed_threads: number;
+}
+
+export interface Channels {
+  slack?: SlackStatus | null;
 }
 
 /** Which instance took the snapshot (PER-297). */

@@ -309,3 +309,156 @@ async def test_notify_owner_needs_a_token_and_a_channel(db: sqlite3.Connection) 
     assert no_stack.status_code == 404  # no channel stack: nothing can text the owner
     assert remote.status_code == 403  # loopback only, like every route
     assert db.execute("SELECT COUNT(*) FROM pulse_items").fetchone()[0] == 0
+
+
+# --- PER-306: the instance list and the loopback proxy -------------------------------------
+
+
+def _linked_state(db: sqlite3.Connection, upstream: httpx.AsyncBaseTransport | None) -> DaemonState:
+    from resonant.config import InstanceLink
+
+    settings = load_settings().model_copy(
+        update={"instances": [InstanceLink(name="cori", url="http://127.0.0.1:7778")]}
+    )
+    loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
+    return DaemonState(settings, db, loop, started_at=utcnow(), instance_transport=upstream)
+
+
+def _cori_snapshot(name: str = "cori") -> dict[str, Any]:
+    rc = "https://claude.ai/code/session_" + "Cori123"
+    return {
+        "schema": 2,
+        "tier": "local",
+        "instance": {"name": name, "display_name": name.capitalize()},
+        "runs": {"items": [{"code": "R4", "remote_url": rc, "ask": f"see {rc}"}]},
+        "approvals": {
+            "items": [{"id": "a1", "code": "4821", "summary": "s"}],
+            "recent": [{"id": "a0", "code": "1111", "summary": "t"}],
+        },
+        "claude_brain": {"state": "up", "remote_url": rc, "tools": []},
+        "jobs": [{"id": "J1", "name": "flaky CI"}],
+        "channels": {"slack": {"connected": True, "last_event_at": None, "followed_threads": 2}},
+        "newer_field": {"remote_url": rc},
+    }
+
+
+async def test_instances_without_config_is_this_one_alone(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    async with _client(_app(db, tmp_path)) as client:
+        r = await client.get("/api/instances")
+        proxied = await client.get("/api/instances/cori/dashboard")
+    assert r.json() == {
+        "instances": [{"name": "resonant", "display_name": "Resonant", "self": True}]
+    }
+    assert proxied.status_code == 404
+
+
+async def test_the_proxy_strips_links_and_codes(db: sqlite3.Connection, tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_cori_snapshot())
+
+    state = _linked_state(db, httpx.MockTransport(answer))
+    async with _client(create_app(state, dashboard_dist=tmp_path)) as client:
+        listed = (await client.get("/api/instances")).json()["instances"]
+        r = await client.get("/api/instances/cori/dashboard")
+    assert [(i["name"], i["self"]) for i in listed] == [("resonant", True), ("cori", False)]
+    assert listed[1]["display_name"] == "Cori"
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
+    assert str(seen[0].url) == "http://127.0.0.1:7778/api/dashboard"
+    assert seen[0].method == "GET" and "cookie" not in seen[0].headers
+    body = r.json()
+    text = r.text
+    assert "claude.ai/code" not in text and "4821" not in text and "1111" not in text
+    assert '"remote_url"' not in text
+    assert body["runs"]["items"][0]["code"] == "R4"  # a run's code is not an approval's
+    assert body["runs"]["items"][0]["ask"] == "see [remote control link]"
+    assert body["jobs"] == [{"id": "J1", "name": "flaky CI"}]
+    assert body["channels"]["slack"]["followed_threads"] == 2
+    assert body["newer_field"] == {}  # a newer schema's field passes, without its link
+
+
+async def test_an_unreachable_instance_says_since_when(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    calls = {"n": 0}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, json=_cori_snapshot())
+
+    state = _linked_state(db, httpx.MockTransport(answer))
+    async with _client(create_app(state, dashboard_dist=tmp_path)) as client:
+        first = await client.get("/api/instances/cori/dashboard")
+        second = await client.get("/api/instances/cori/dashboard")
+        own = await client.get("/api/dashboard")  # personal's view is unaffected
+        third = await client.get("/api/instances/cori/dashboard")
+    assert first.status_code == 502 and second.status_code == 502
+    assert first.json()["detail"] == "cori isn't answering"
+    assert first.json()["since"] == second.json()["since"]  # since the first failure
+    assert own.status_code == 200 and own.json()["instance"]["name"] == "resonant"
+    assert third.status_code == 200 and "cori" not in state.instance_down
+
+
+@pytest.mark.parametrize(
+    ("response", "detail"),
+    [
+        (httpx.Response(500, json={}), "cori answered HTTP 500"),
+        (
+            httpx.Response(302, headers={"location": "http://evil.example/"}),
+            "cori answered HTTP 302",
+        ),
+        (httpx.Response(200, content=b"<html>"), "cori didn't send JSON"),
+        (httpx.Response(200, json=[1, 2]), "cori didn't send a snapshot"),
+        (httpx.Response(200, json=_cori_snapshot("resonant")), "answers as resonant, not cori"),
+    ],
+)
+async def test_the_proxy_refuses_anything_but_the_instances_snapshot(
+    db: sqlite3.Connection, tmp_path: Path, response: httpx.Response, detail: str
+) -> None:
+    state = _linked_state(db, httpx.MockTransport(lambda _r: response))
+    async with _client(create_app(state, dashboard_dist=tmp_path)) as client:
+        r = await client.get("/api/instances/cori/dashboard")
+    assert r.status_code == 502 and detail in r.json()["detail"]
+
+
+def test_instance_links_are_loopback_only() -> None:
+    from pydantic import ValidationError
+
+    from resonant.config import InstanceLink, Settings
+
+    assert InstanceLink(name="cori", url="http://127.0.0.1:7778/").url == "http://127.0.0.1:7778"
+    for url in ("http://example.com:7778", "https://127.0.0.1:7778", "http://127.0.0.1:7778/x"):
+        with pytest.raises(ValidationError):
+            InstanceLink(name="cori", url=url)
+    with pytest.raises(ValidationError):
+        InstanceLink(name="Cori!", url="http://127.0.0.1:7778")
+    base = load_settings().model_dump()
+    link = {"name": "cori", "url": "http://127.0.0.1:7778"}
+    with pytest.raises(ValidationError, match="at most once"):
+        Settings.model_validate({**base, "instances": [link, link]})
+    with pytest.raises(ValidationError, match="this instance"):
+        Settings.model_validate({**base, "instances": [{**link, "name": "resonant"}]})
+
+
+async def test_the_dashboard_carries_the_slack_adapters_state(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    class FakeSlack:
+        def health(self) -> dict[str, Any]:
+            return {"ok": True, "connected": True, "last_event_at": None, "followed_threads": 4}
+
+    settings = load_settings()
+    loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
+    state = DaemonState(settings, db, loop, started_at=utcnow())
+    state.monitor = cast(Any, SimpleNamespace(channels={"slack": FakeSlack()}))
+    async with _client(create_app(state, dashboard_dist=tmp_path)) as client:
+        body = (await client.get("/api/dashboard")).json()
+    assert body["channels"] == {
+        "slack": {"connected": True, "last_event_at": None, "followed_threads": 4}
+    }

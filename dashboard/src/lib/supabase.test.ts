@@ -152,3 +152,82 @@ describe("panelDay", () => {
     await expect(wrapSupabase(daysFake(null, "denied").sb).panelDay("github", "prs", "2026-10-15")).rejects.toThrow("denied");
   });
 });
+
+describe("instances (PER-306)", () => {
+  /** `snapshot_latest` with one row per instance: select, eq, order/limit, maybeSingle, and a
+   * plain await for the instance list. */
+  function multi(rows: Record<string, Row>, opts: { listError?: string } = {}) {
+    const reads: { table: string; cols: string; eqs: [string, string][] }[] = [];
+    const from = vi.fn((table: string) => {
+      const read = { table, cols: "", eqs: [] as [string, string][] };
+      reads.push(read);
+      const pick = () => {
+        const inst = read.eqs.find(([k]) => k === "instance")?.[1];
+        const all = Object.entries(rows);
+        const hit = inst === undefined ? all.sort((a, b) => b[1].taken_at.localeCompare(a[1].taken_at))[0] : all.find(([n]) => n === inst);
+        return hit ? { name: hit[0], row: hit[1] } : null;
+      };
+      const query: Record<string, unknown> = {};
+      query.select = vi.fn((c: string) => ((read.cols = c), query));
+      query.eq = vi.fn((k: string, v: string) => (read.eqs.push([k, v]), query));
+      query.order = vi.fn(() => query);
+      query.limit = vi.fn(() => query);
+      query.maybeSingle = vi.fn(async () => {
+        const hit = table === "snapshot_latest" ? pick() : null;
+        const data = hit && read.cols === "taken_at" ? { taken_at: hit.row.taken_at } : (hit?.row ?? null);
+        return { data, error: null };
+      });
+      query.then = (resolve: (v: unknown) => unknown) =>
+        resolve(
+          opts.listError
+            ? { data: null, error: { message: opts.listError } }
+            : {
+                data: Object.entries(rows).map(([name, row]) => ({
+                  instance: name,
+                  display_name: (row.data as { instance?: { display_name?: string } }).instance?.display_name ?? null,
+                })),
+                error: null,
+              },
+        );
+      return query;
+    });
+    return { sb: { auth: {}, from } as unknown as SupabaseClient, reads };
+  }
+
+  const coriRow = { data: { ...remote, instance: { name: "cori", display_name: "Cori" } }, taken_at: "2026-10-16T09:00:30Z" };
+
+  it("lists the instances from snapshot_latest, personal Resonant first", async () => {
+    const f = multi({ cori: coriRow, resonant: { data: remote, taken_at: remote.taken_at } });
+    expect(await wrapSupabase(f.sb).instances()).toEqual([
+      { name: "resonant", display_name: "Resonant" },
+      { name: "cori", display_name: "Cori" },
+    ]);
+    expect(f.reads[0]!.cols).toContain("data->instance->>display_name");
+  });
+
+  it("is empty when the table has no instance column yet", async () => {
+    expect(await wrapSupabase(multi({}, { listError: "column snapshot_latest.instance does not exist" }).sb).instances()).toEqual([]);
+  });
+
+  it("reads each instance's own row, with two rows present, and caches per instance", async () => {
+    const f = multi({ resonant: { data: remote, taken_at: remote.taken_at }, cori: coriRow });
+    const client = wrapSupabase(f.sb);
+    expect((await client.latest("resonant"))?.instance?.name ?? "resonant").toBe("resonant");
+    expect((await client.latest("cori"))?.instance?.name).toBe("cori");
+    expect(f.reads.filter((r) => r.table === "snapshot_latest").every((r) => r.eqs.some(([k]) => k === "instance"))).toBe(true);
+    const before = f.reads.length;
+    await client.latest("cori");
+    expect(f.reads.length - before).toBe(1); // the time only: the body is cached
+  });
+
+  it("filters an archived panel day by instance", async () => {
+    const eqs: [string, string][] = [];
+    const query: Record<string, ReturnType<typeof vi.fn>> = {};
+    query.select = vi.fn(() => query);
+    query.eq = vi.fn((k: string, v: string) => (eqs.push([k, v]), query));
+    query.maybeSingle = vi.fn(async () => ({ data: null, error: null }));
+    const sb = { auth: {}, from: vi.fn(() => query) } as unknown as SupabaseClient;
+    await wrapSupabase(sb).panelDay("github", "prs", "2026-10-15", "cori");
+    expect(eqs).toContainEqual(["instance", "cori"]);
+  });
+});

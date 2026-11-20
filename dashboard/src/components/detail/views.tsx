@@ -109,6 +109,7 @@ function runView(code: string, { snap, now }: Ctx): View {
             )}
           </F>
           <F label="Remote Control">{remoteUrl && <ExternalLink href={remoteUrl}>Open session</ExternalLink>}</F>
+          <F label="Asked by">{run.requested_by}</F>
           <F label="Created">
             <When iso={run.created_at} now={now} />
           </F>
@@ -321,6 +322,7 @@ function approvalView(id: string, { snap, now }: Ctx): View {
           <F label="Decided">
             <When iso={a.decided_at} now={now} />
           </F>
+          <F label="Asked by">{a.requested_by}</F>
           <F label="Decided by">{a.decided_by}</F>
           <F label="Task">
             <TaskLink id={a.task_id} />

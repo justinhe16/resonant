@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { type InstanceRef, parseInstances } from "@/lib/instances";
 import { assertDay, isDay } from "@/lib/panelDays";
 import { assertSnapshot } from "@/lib/snapshot";
 import type { Normalized, PanelDay } from "@/types";
@@ -17,9 +18,13 @@ export interface RemoteClient {
   signIn(email: string, password: string): Promise<void>;
   verify(factorId: string, code: string): Promise<void>;
   signOut(): Promise<void>;
-  latest(): Promise<Normalized | null>;
+  /** PER-306: the instances with a row in `snapshot_latest` (personal Resonant first). Empty
+   *  when none is listed or the table has no `instance` column yet (before PER-304). */
+  instances(): Promise<InstanceRef[]>;
+  /** The newest snapshot of `instance` (PER-306); without one, the newest of any row. */
+  latest(instance?: string): Promise<Normalized | null>;
   /** PER-286: one archived day of a panel (the `panel_days` row), or null. */
-  panelDay(ext: string, panel: string, day: string): Promise<PanelDay | null>;
+  panelDay(ext: string, panel: string, day: string, instance?: string): Promise<PanelDay | null>;
   onAuthChange(cb: () => void): () => void;
 }
 
@@ -33,12 +38,19 @@ function check<R extends Result>(r: R): Exclude<R, { error: object }>["data"] {
 
 export function wrapSupabase(sb: SupabaseClient): RemoteClient {
   const auth = sb.auth;
-  let cache: { at: string; snap: Normalized } | null = null;
-  const remember = (row: { data: unknown; taken_at: string }): Normalized => {
+  // The last body per instance ("" for the unfiltered read), refetched only when its time moves.
+  const cache = new Map<string, { at: string; snap: Normalized }>();
+  const remember = (key: string, row: { data: unknown; taken_at: string }): Normalized => {
     const snap = assertSnapshot(row.data);
     const out = { ...snap, taken_at: snap.taken_at || row.taken_at };
-    cache = { at: row.taken_at, snap: out };
+    cache.set(key, { at: row.taken_at, snap: out });
     return out;
+  };
+  // PER-306: one row per instance in `snapshot_latest`, so every read names its instance;
+  // `undefined` (no instance known) reads the newest row, which never errors on two rows.
+  const latestOf = (cols: string, instance: string | undefined) => {
+    const q = sb.from("snapshot_latest").select(cols);
+    return instance === undefined ? q.order("taken_at", { ascending: false }).limit(1) : q.eq("instance", instance);
   };
   return {
     async stage() {
@@ -59,28 +71,35 @@ export function wrapSupabase(sb: SupabaseClient): RemoteClient {
     async signOut() {
       await auth.signOut();
     },
-    async latest() {
-      // The one-row `snapshot_latest` table holds the full newest snapshot. Ask for its time
+    async instances() {
+      // A few bytes per row: the name and the display name inside the stored snapshot.
+      const res = await sb.from("snapshot_latest").select("instance, display_name:data->instance->>display_name");
+      if (res.error || !Array.isArray(res.data)) return [];
+      const rows = (res.data as { instance?: unknown; display_name?: unknown }[]).map((r) => ({
+        name: r.instance,
+        display_name: r.display_name,
+      }));
+      const list = parseInstances(rows);
+      return list.sort((a, b) => (a.name === "resonant" ? -1 : b.name === "resonant" ? 1 : a.name.localeCompare(b.name)));
+    },
+    async latest(instance) {
+      // `snapshot_latest` holds the full newest snapshot of each instance. Ask for its time
       // first (a few bytes) and fetch the body only when it changed since the last poll.
-      const head = check(
-        await sb.from("snapshot_latest").select("taken_at").maybeSingle<{ taken_at: string }>(),
-      );
+      const key = instance ?? "";
+      const head = check(await latestOf("taken_at", instance).maybeSingle<{ taken_at: string }>());
       if (head) {
-        if (cache && cache.at === head.taken_at) return cache.snap;
+        const hit = cache.get(key);
+        if (hit && hit.at === head.taken_at) return hit.snap;
         const row = check(
-          await sb
-            .from("snapshot_latest")
-            .select("data, taken_at")
-            .maybeSingle<{ data: unknown; taken_at: string }>(),
+          await latestOf("data, taken_at", instance).maybeSingle<{ data: unknown; taken_at: string }>(),
         );
-        if (row) return remember(row);
+        if (row) return remember(key, row);
       }
       // Nothing in `snapshot_latest` yet: the newest history row, when it is a whole snapshot
       // (schema 2 history rows are slim: health and counts only, not enough for this page).
+      const history = sb.from("snapshots").select("data, taken_at");
       const row = check(
-        await sb
-          .from("snapshots")
-          .select("data, taken_at")
+        await (instance === undefined ? history : history.eq("instance", instance))
           .order("taken_at", { ascending: false })
           .limit(1)
           .maybeSingle<{ data: unknown; taken_at: string }>(),
@@ -88,19 +107,12 @@ export function wrapSupabase(sb: SupabaseClient): RemoteClient {
       if (!row) return null;
       if (typeof row.data === "object" && row.data !== null && (row.data as { slim?: unknown }).slim === true)
         return null;
-      return remember(row);
+      return remember(key, row);
     },
-    async panelDay(ext, panel, day) {
+    async panelDay(ext, panel, day, instance) {
       if (!isDay(day)) return null;
-      const row = check(
-        await sb
-          .from("panel_days")
-          .select("data")
-          .eq("ext", ext)
-          .eq("panel_id", panel)
-          .eq("day", day)
-          .maybeSingle<{ data: unknown }>(),
-      );
+      const q = sb.from("panel_days").select("data").eq("ext", ext).eq("panel_id", panel).eq("day", day);
+      const row = check(await (instance === undefined ? q : q.eq("instance", instance)).maybeSingle<{ data: unknown }>());
       return row ? assertDay(row.data) : null;
     },
     onAuthChange(cb) {
