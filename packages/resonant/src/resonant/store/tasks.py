@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime
 from typing import Any, cast
 
-from resonant.loop.types import TERMINAL, NewTask, Task, TaskStatus, WaitReason
+from resonant.loop.types import TERMINAL, NewTask, Task, TaskStatus, WaitReason, conversation_of
 from resonant.store import task_titles
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, now_iso
@@ -59,6 +59,7 @@ def row_to_task(r: sqlite3.Row) -> Task:
         error=r["error"],
         title=r["title"],
         title_outside=bool(r["title_outside"]),
+        conversation=r["conversation"] if "conversation" in r.keys() else None,  # noqa: SIM118
     )
 
 
@@ -85,8 +86,8 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
     conn.execute(
         """INSERT INTO tasks (id, kind, runner, extension, principal, lane, priority, checkpoint,
                scope, origin_event_id, channel_ref, trace_id, wake_at, created_at, updated_at,
-               title, title_outside)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               title, title_outside, conversation)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task_id,
             spec.kind,
@@ -105,6 +106,7 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
             ts,
             title,
             int(outside and title is not None),
+            conversation_of(spec.channel_ref),
         ),
     )
     return task_id

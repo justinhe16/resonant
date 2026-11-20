@@ -1,4 +1,4 @@
--- 030: the hourly alive line a room gets (PER-303, ``pulse.heartbeat``) is a system text too,
+-- 031: the hourly alive line a room gets (PER-303, ``pulse.heartbeat``) is a system text too,
 -- kind ``heartbeat``, recorded once per dedupe key (``ref``: ``heartbeat:<date>:<HH>``) under
 -- the room's principal (``room:<key>``).
 -- SQLite can't change a CHECK in place, so ``system_texts`` is rebuilt exactly as 024 did (the

@@ -58,15 +58,20 @@ def news_reply(
     *,
     event_id: str | None,
     now: datetime,
+    conversation: str | None = None,
 ) -> str | None:
     """The owner's news, or None when the records can't be read (the caller hands the text
     to Claude). ``event_id``: the message asking; the news is what happened since the one
-    before it."""
+    before it (in its thread, ``conversation``: PER-294)."""
     tz = ZoneInfo(settings.timezone)
     try:
         since = (
             last_talked(
-                conn, principal, before_event_id=event_id, source=channel_of(conn, event_id)
+                conn,
+                principal,
+                before_event_id=event_id,
+                source=channel_of(conn, event_id),
+                conversation=conversation,
             )
             if event_id is not None
             else None

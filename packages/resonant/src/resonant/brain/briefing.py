@@ -354,8 +354,16 @@ def last_talked(
     *,
     before_event_id: str,
     source: str = "imessage",
+    conversation: str | None = None,
 ) -> datetime | None:
-    """When ``principal`` sent their previous message (any, task or not), or None."""
+    """When ``principal`` sent their previous message (any, task or not), or None. In a
+    thread (``conversation``, PER-294): the thread's previous message, whoever sent it."""
+    if conversation is not None:
+        found = brain_store.thread_after(conn, principal, source=source, event_type="message",
+                                         after_event_id=None,
+                                         before_event_id=before_event_id, limit=1, newest=True,
+                                         conversation=conversation)  # fmt: skip
+        return found[-1][0].occurred_at if found else None
     prev = principal_thread(
         conn,
         principal,

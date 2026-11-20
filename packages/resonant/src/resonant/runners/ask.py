@@ -118,7 +118,9 @@ from resonant.brain import guard
 from resonant.brain.history import (
     DEFAULT_TAINT_HOPS,
     SinceLast,
+    Speak,
     channel_of,
+    named,
     primer,
     since_last,
     system_gaps,
@@ -142,6 +144,7 @@ from resonant.loop.types import (
     Wait,
 )
 from resonant.observability.spans import span
+from resonant.principals import Principals
 from resonant.redact import Redactor
 from resonant.router.prefixes import time_context
 from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
@@ -200,6 +203,36 @@ ATTACH_BYTES = 20 * 1024 * 1024
 # PER-268 key ``brain.claude_session.texts_seen`` held a system text id and is no longer read.)
 SINCE_KV = "brain.claude_session.seen_event"
 SINCE_HOURS = 24
+
+
+@dataclass(frozen=True)
+class _Convo:
+    """PER-294: the conversation a Claude brain turn is in: who wrote (``principal``) and the
+    thread (None: that principal's own conversation)."""
+
+    principal: str
+    thread: str | None
+
+    @classmethod
+    def of(cls, task: Task | None, owner: str) -> _Convo:
+        if task is None:
+            return cls(owner, None)
+        return cls(task.principal or owner, task.conversation)
+
+    @property
+    def key(self) -> str:
+        """``tasks.conversation``: the thread, else the principal."""
+        return self.thread or self.principal
+
+    def plain(self, owner: str) -> bool:
+        """The owner's own conversation: the turn reads exactly as before PER-294."""
+        return self.thread is None and self.principal == owner
+
+    def since_kv(self, owner: str) -> str:
+        """Where the "since we last spoke" cursor lives (the owner's own: ``SINCE_KV``)."""
+        return SINCE_KV if self.plain(owner) else f"{SINCE_KV}:{self.key}"
+
+
 DEFER_S = 5.0  # a busy ask (concurrency) looks again this soon
 # PER-256: a session turn that ended like this, with nothing changed and nothing asked, means
 # Claude is down: the owner hears so once and the turn is tried again.
@@ -952,6 +985,7 @@ class AskRunner:
         kill_grace_s: float = KILL_GRACE_S,
         defer_s: float = DEFER_S,
         bridge_root: Path | None = None,
+        principals: Principals | None = None,
         claude_config_dir: Path | None = None,
         instructions_file: Path | None = None,
     ) -> None:
@@ -969,7 +1003,10 @@ class AskRunner:
         (PER-262; None: the system temp dir, where ``McpServer`` makes them).
         ``claude_config_dir`` (PER-291, ``runner.claude_config_dir``): every ask's and the
         brain session's ``CLAUDE_CONFIG_DIR``; set, the owner's login is never used.
-        ``instructions_file`` (``brain.instructions_file``): appended to the system text."""
+        ``instructions_file`` (``brain.instructions_file``): appended to the system text.
+        ``principals`` (PER-294): names and roles for a Claude brain turn's header (None: the
+        owner alone)."""
+        self.principals = principals
         self.claude_config_dir = claude_config_dir
         self.instructions_file = instructions_file
         self._warned: set[str] = set()
@@ -1576,7 +1613,10 @@ class AskRunner:
         asking_task = cp.get("requested_by")
         source = get_task(self.conn, asking_task) if isinstance(asking_task, str) else None
         before = source.origin_event_id if source is not None else None
-        owner = self.owner
+        # PER-294: the conversation this turn is in: the asking task's thread, else its
+        # principal's own (the owner's, with no threads: exactly as before).
+        convo = _Convo.of(source, self.owner)
+        owner = convo.principal
 
         def argv(session_id: str, resume: bool) -> list[str]:
             return session_argv(head, cfg=self.cfg, scope=self.scope, api_billing=api_billing,
@@ -1595,7 +1635,10 @@ class AskRunner:
 
         def prime() -> str:
             try:
-                text = primer(self.conn, owner, before_event_id=before)
+                text = primer(self.conn, owner, before_event_id=before,
+                              conversation=convo.thread,
+                              speaker=None if convo.plain(self.owner)
+                              else self._speaker())  # fmt: skip
             except sqlite3.Error:
                 return ""
             primed.append(text)
@@ -1608,12 +1651,15 @@ class AskRunner:
 
         approved = cp.get("approved") is True
         message = self._turn_message(
-            question, kind, approved=approved, now=self.clock(), tz=self.tz
-        )
+            question, kind, approved=approved, now=self.clock(), tz=self.tz,
+            who=None if convo.plain(self.owner) else self._who(convo.principal),
+        )  # fmt: skip
         # an approved change's turn is Resonant's own: the texts wait for the owner's next one
-        delta = None if approved else self._since(owner, before)
+        delta = None if approved else self._since(convo, before)
         if delta is not None:  # PER-270: the thread since the session's last turn
             message = f"{delta.text}\n\n{message}"
+        if not convo.plain(self.owner):  # PER-294: which thread, and who wrote
+            message = f"{self._header(convo)}\n{message}"
         if delta is not None and delta.outside:  # one came from a tainted task: it reads it
             bridge.taint("since_last", hops=1)
             start = 1 if start is None else min(start, 1)
@@ -1641,12 +1687,13 @@ class AskRunner:
                 out, flagged = await self._guarded(
                     task, out, run, bridge, message, primed, question=question,
                     owner_text=str(cp.get("owner_text") or question), before=before,
+                    convo=convo,
                 )  # fmt: skip
         finally:
             await bridge.aclose()
         if before is not None and not approved and out.status == "answered":  # it read them
             with contextlib.suppress(sqlite3.Error), atomic(self.conn):
-                kv_set(self.conn, SINCE_KV, before)
+                kv_set(self.conn, convo.since_kv(self.owner), before)
         hops = hops_of(out)  # recorded by the session, under its lock
         seen = {"status": out.status, "fresh": out.fresh, "retried": out.retried}
         log.info("claude brain turn", extra={"task": task.id, **seen, "tainted": hops is not None})
@@ -1678,6 +1725,7 @@ class AskRunner:
         question: str,
         owner_text: str,
         before: str | None,
+        convo: _Convo | None = None,
     ) -> tuple[TurnOutcome, guard.Problem | None]:
         """PER-256: check Claude's answer (``brain.guard.check``) before anything is sent. A
         problem sends the turn back once with a message that says why (the sources add up
@@ -1693,7 +1741,7 @@ class AskRunner:
             problem = guard.check(
                 outcome[1],
                 owner_text=owner_text,
-                sources=self._sources(message, primed, bridge, before, question),
+                sources=self._sources(message, primed, bridge, before, question, convo),
                 tools=set(bridge.specs),
                 called=bridge.called,
                 changed=bool(bridge.reports or bridge.progress),
@@ -1732,15 +1780,18 @@ class AskRunner:
         bridge: ClaudeTools,
         before: str | None,
         question: str,
+        convo: _Convo | None = None,
     ) -> list[str]:
         """What a number in Claude's answer may come from: the message it was given (the
         owner's text and the thread since its last turn), the primer, every result it got this
         turn, the last day of the thread (the session remembers it) and the calendar around
         now."""
         found = [message, question, *primed, *bridge.sources]
+        convo = convo or _Convo(self.owner, None)
         with contextlib.suppress(sqlite3.Error):
-            found += thread_texts(self.conn, self.owner, before_event_id=before,
-                                  since=self.clock() - timedelta(hours=SINCE_HOURS))  # fmt: skip
+            found += thread_texts(self.conn, convo.principal, before_event_id=before,
+                                  since=self.clock() - timedelta(hours=SINCE_HOURS),
+                                  conversation=convo.thread)  # fmt: skip
         found.append(guard.calendar_text(self.clock(), str(self.tz)))
         return found
 
@@ -1773,24 +1824,45 @@ class AskRunner:
         retry = self.session_cfg.retry_after_s if self.session_cfg is not None else RETRY_AFTER_S
         return Wait("resource", nxt, self.clock() + timedelta(seconds=retry))
 
-    def _since(self, owner: str, before: str | None) -> SinceLast | None:
+    def _since(self, convo: _Convo, before: str | None) -> SinceLast | None:
         """PER-270: the thread since the Claude brain's last turn (``history.since_last``): the
         owner's texts, Resonant's replies and what it texted on its own, newest ``SINCE_ITEMS``
         of the last ``SINCE_HOURS``, as a ``<since_last>`` block (data: Resonant's own
         records). Its ``outside`` says an item came from a tainted task (the turn is then
-        tainted, as after that task's reply)."""
+        tainted, as after that task's reply). PER-294: by conversation, with its own cursor
+        (``_Convo.since_kv``): a thread's turn sees that thread's delta only."""
         try:
-            raw: Any = kv_get(self.conn, SINCE_KV)
+            raw: Any = kv_get(self.conn, convo.since_kv(self.owner))
             return since_last(
                 self.conn,
-                owner,
+                convo.principal,
                 after_event_id=raw if isinstance(raw, str) else None,
                 before_event_id=before,
                 since=self.clock() - timedelta(hours=SINCE_HOURS),
                 tz=self.tz,
+                conversation=convo.thread,
+                speaker=None if convo.plain(self.owner) else self._speaker(),
             )
         except sqlite3.Error:
             return None
+
+    def _speaker(self) -> Speak:
+        """How a transcript line names a sender (PER-294): ``Principals.display``."""
+        principals = self.principals
+        if principals is None:
+            return named(lambda name: name[:1].upper() + name[1:])
+        return named(principals.display)
+
+    def _who(self, principal: str) -> str:
+        """``Brian (approver)``: a sender's name and role, for a turn's header (PER-294)."""
+        role = self.principals.role(principal) if self.principals is not None else None
+        role = role or ("owner" if principal == self.owner else "member")
+        return f"{self._speaker()(principal)} ({role})"
+
+    def _header(self, convo: _Convo) -> str:
+        """PER-294: the code-built first line of a turn in a thread or from someone other than
+        the owner: ``Thread: <key> · from: <name> (<role>)``."""
+        return f"Thread: {convo.key} · from: {self._who(convo.principal)}"
 
     @staticmethod
     def _asking_hops(cp: dict[str, Any]) -> int:
@@ -1814,14 +1886,21 @@ class AskRunner:
 
     @staticmethod
     def _turn_message(
-        question: str, kind: Kind, *, approved: bool = False, now: datetime, tz: ZoneInfo
+        question: str,
+        kind: Kind,
+        *,
+        approved: bool = False,
+        now: datetime,
+        tz: ZoneInfo,
+        who: str | None = None,
     ) -> str:
         """One owner text as the session's user message: the time (so a reminder's `at` can be
         worked out), the kind's hint, then the text. An approved run (PER-258) is Resonant's
         own message, never the owner's words."""
         if approved:
             return f"{APPROVED_HEAD}\n{question}"
-        parts = ["New text from the owner, through Resonant:", time_context(now, str(tz))]
+        sender = "the owner" if who is None else who  # PER-294: someone else in a thread
+        parts = [f"New text from {sender}, through Resonant:", time_context(now, str(tz))]
         if hint := KIND_HINTS.get(kind):
             parts.append(hint)
         parts.append(question)
