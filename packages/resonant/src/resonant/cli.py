@@ -80,6 +80,7 @@ from resonant.store.db import (
     open_existing,
     utcnow,
 )
+from resonant.store.secret_expiry import Source
 from resonant.tools import ToolRegistry
 from resonant_sdk import load_manifest
 from resonant_sdk.manifest import McpHttpServer
@@ -314,10 +315,11 @@ def echo_health(health: object, *, live: bool) -> None:
     for name, raw in cast(dict[str, Any], health).items():
         h = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
         state = str(h.get("state") or "unknown")
-        line = f"  {name:<10}{state.upper() if state == 'degraded' else state}"
+        bad = state in ("degraded", "failing")  # failing: PER-313's secrets row
+        line = f"  {name:<10}{state.upper() if bad else state}"
         if h.get("since") and state != "unknown":
             line += f" since {h['since']}"
-        if state == "degraded" and h.get("detail"):
+        if bad and h.get("detail"):
             line += f": {h['detail']}"
         typer.echo(line)
 
@@ -1268,6 +1270,63 @@ def _read_secret_value(ref: str, from_file: str | None = None) -> str:
     return sys.stdin.readline().removesuffix("\n").removesuffix("\r")
 
 
+ExpiresOpt = Annotated[
+    str | None,
+    typer.Option("--expires", metavar="YYYY-MM-DD", help="When the secret expires (a date)."),
+]
+ExpiresInOpt = Annotated[
+    str | None,
+    typer.Option("--expires-in", metavar="<N>d", help="When it expires, in days (like 365d)."),
+]
+
+
+def _expiry_flag(
+    expires: str | None, expires_in: str | None, settings: Settings
+) -> datetime | None:
+    """PER-313: ``--expires`` / ``--expires-in`` (mutually exclusive) as a UTC time, or None
+    for neither. Exit 2 on both, a bad value or a date in the past."""
+    from resonant.secret_expiry import parse_expires, parse_expires_in
+
+    if expires is not None and expires_in is not None:
+        typer.echo("error: --expires and --expires-in can't be used together", err=True)
+        raise typer.Exit(2)
+    now = utcnow()
+    try:
+        if expires is not None:
+            return parse_expires(expires, tz=settings.timezone, now=now)
+        if expires_in is not None:
+            return parse_expires_in(expires_in, now=now)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+    return None
+
+
+def _write_expiry(settings: Settings, ref: str, row: tuple[datetime, Source] | None) -> bool:
+    """Write (``(expires_at, source)``) or clear (None) ``ref``'s expiry row in the existing
+    store. False when the store isn't there (missing or behind)."""
+    from resonant.store import secret_expiry as expiry_store
+
+    try:
+        conn = open_existing(settings.db_path)
+    except StoreUnavailableError:
+        return False
+    try:
+        with atomic(conn):
+            if row is None:
+                if expiry_store.clear(conn, ref):
+                    audit(conn, "secrets.expiry_set", requested_by=_CLI_ACTOR, ref=ref,
+                          decision="cleared")  # fmt: skip
+            else:
+                source = row[1]
+                expiry_store.upsert(conn, ref, expires_at=row[0], source=source, set_at=utcnow())
+                audit(conn, "secrets.expiry_set", requested_by=_CLI_ACTOR, ref=ref,
+                      decision=source, expires_at=iso(row[0]))  # fmt: skip
+    finally:
+        conn.close()
+    return True
+
+
 @secret_app.command("set")
 def secret_set(
     ref: SecretRef,
@@ -1279,13 +1338,20 @@ def secret_set(
             "like a PEM, up to about 2.5 KB. Delete the file afterwards.",
         ),
     ] = None,
+    expires: ExpiresOpt = None,
+    expires_in: ExpiresInOpt = None,
 ) -> None:
     """Store a secret. The value comes from a hidden prompt, stdin or --from-file, never the
-    command line."""
+    command line. --expires/--expires-in record when it expires (PER-313); without them a
+    known default is assumed (runner/claude_token: 365 days), else any old expiry is cleared."""
     import asyncio
     import hmac
 
+    from resonant.secret_expiry import DEFAULTS
+
     ref = _checked_ref(ref)
+    settings = load_settings()
+    expires_at = _expiry_flag(expires, expires_in, settings)
     value = _read_secret_value(ref, from_file)
     try:
         validate_value(value)
@@ -1314,6 +1380,64 @@ def secret_set(
         typer.echo(f"error: {ref} didn't read back as entered; removed it", err=True)
         raise typer.Exit(1)
     typer.echo(f"stored {ref}")
+    # PER-313: the expiry row. A new value makes an old expiry wrong, so no flag and no
+    # default clears it. The default counts from the item's mdat (never its value).
+    row: tuple[datetime, Source] | None = None
+    if expires_at is not None:
+        row = (expires_at, "owner")
+    elif ref in DEFAULTS:
+        try:
+            mdat = asyncio.run(store.modified_at(ref))
+        except SecretError:
+            mdat = None
+        if mdat is not None:
+            row = (mdat + DEFAULTS[ref], "assumed")
+    # An assumed row that can't be written is no loss: the default counts from mdat anyway.
+    if not _write_expiry(settings, ref, row) and row is not None and row[1] == "owner":
+        typer.echo(
+            f"error: {ref} is stored, but its expiry wasn't recorded (the store isn't there "
+            f"yet); later: resonant secret expiry {ref} --expires …",
+            err=True,
+        )
+        raise typer.Exit(EX_TEMPFAIL)
+    if row is not None:
+        local = row[0].astimezone(ZoneInfo(settings.timezone)).date().isoformat()
+        typer.echo(f"expires {local} ({row[1]})")
+
+
+@secret_app.command("expiry")
+def secret_expiry_cmd(
+    ref: SecretRef,
+    expires: ExpiresOpt = None,
+    expires_in: ExpiresInOpt = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Forget the expiry.")] = False,
+) -> None:
+    """Record (or --clear) when a secret expires, without touching the Keychain item or its
+    value. Owner-run, like secret set."""
+    import asyncio
+
+    ref = _checked_ref(ref)
+    settings = load_settings()
+    if clear == (expires is not None or expires_in is not None):
+        typer.echo("error: give one of --expires, --expires-in or --clear", err=True)
+        raise typer.Exit(2)
+    expires_at = None if clear else _expiry_flag(expires, expires_in, settings)
+    try:
+        present = asyncio.run(_secret_store().exists(ref))
+    except SecretError:
+        present = None
+    if present is False:
+        typer.echo(f"note: {ref} isn't in the Keychain (service {settings.keychain_service})",
+                   err=True)  # fmt: skip
+    row: tuple[datetime, Source] | None = None if expires_at is None else (expires_at, "owner")
+    if not _write_expiry(settings, ref, row):
+        typer.echo(f"error: the store at {settings.db_path} isn't there or is behind", err=True)
+        raise typer.Exit(EX_TEMPFAIL)
+    if row is None:
+        typer.echo(f"cleared the expiry of {ref}")
+    else:
+        local = row[0].astimezone(ZoneInfo(settings.timezone)).date().isoformat()
+        typer.echo(f"{ref} expires {local} (owner)")
 
 
 def _declared_refs(paths: list[Path]) -> list[tuple[str, str | None]]:
@@ -1341,30 +1465,53 @@ def secret_list(
         typer.Argument(help="Extension dirs to include besides the installed ones"),
     ] = None,
 ) -> None:
-    """Declared secrets and whether each is present. Names only: no value is read."""
+    """Known secrets (the runner's, the relay's, the config's: notify, Slack, session env),
+    the declared ones, and any with a recorded expiry: whether each is present and when it
+    expires. Names and metadata only: no value is read."""
     import asyncio
 
-    installed = load_settings().home / "extensions"
+    from resonant import secret_expiry as sx
+    from resonant.store import secret_expiry as expiry_store
+
+    settings = load_settings()
+    installed = settings.home / "extensions"
     found = sorted(installed.glob("*/resonant.yaml")) if installed.is_dir() else []
-    refs = _declared_refs([*found, *(dirs or [])])
-    if not refs:
-        typer.echo("no declared secrets (installed extensions, or the dirs given)")
-        return
+    declared = _declared_refs([*found, *(dirs or [])])
+    rows: list[expiry_store.ExpiryRow] = []
+    try:
+        conn = open_existing(settings.db_path, readonly=True)
+    except StoreUnavailableError:
+        pass
+    else:
+        try:
+            rows = expiry_store.all(conn)
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+    problems = dict(declared)
+    good = [r for r, p in declared if p is None]
     store = _secret_store()
-    unavailable = False
+    facts = asyncio.run(sx.probe(store, sorted({*sx.known_refs(settings), *good,
+                                                *(r.ref for r in rows)})))  # fmt: skip
+    entries = {e.ref: e for e in sx.entries(facts.present, rows, facts)}
+    now = utcnow()
+    unavailable = facts.locked
     present = 0
-    for ref, problem in refs:
-        state = problem
-        if state is None:
-            try:
-                state = "present" if asyncio.run(store.exists(ref)) else "missing"
-            except SecretError as e:
-                state, unavailable = e.reason, True
-        present += state == "present"
-        typer.echo(f"  {ref:<40} {state}")
+    total = 0
+    for ref in sorted({*entries, *problems}):
+        total += 1
+        e = entries.get(ref)
+        if (problem := problems.get(ref)) is not None or e is None:
+            typer.echo(f"  {ref:<40} {problem or 'invalid name'}")
+            continue
+        state = {True: "present", False: "missing", None: "unavailable"}[e.present]
+        present += e.present is True
+        typer.echo(f"  {ref:<40} {state:<12} {sx.describe(e, now, settings.timezone)}".rstrip())
     # PER-297: which Keychain service was asked, so a changed secrets.service explains itself
-    typer.echo(f"{present} of {len(refs)} present (service {store.service})")
+    typer.echo(f"{present} of {total} present (service {store.service})")
     if unavailable:
+        typer.echo(f"error: {facts.reason or 'the keychain did not answer'}", err=True)
         raise typer.Exit(EX_TEMPFAIL)
 
 

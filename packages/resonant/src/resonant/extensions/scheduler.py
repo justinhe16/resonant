@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     from resonant.components import Components
     from resonant.config import Settings
     from resonant.gateway.channel import Channel
+    from resonant.notify_owner import OwnerBridge
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +174,8 @@ class CoreDeps:
     components: Components
     channel: Channel | None  # None when iMessage is off
     owner: str | None  # None when principals.yaml is missing
+    # PER-313: the notify-owner bridge (``Stack.bridge``) on an instance with ``notify_owner``
+    bridge: OwnerBridge | None = None
 
 
 CoreJobFactory = Callable[[CoreDeps], CoreJob | None]
@@ -216,6 +219,14 @@ def registered_jobs_job(deps: CoreDeps) -> CoreJob | None:
     return factory(deps)
 
 
+def secrets_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/secrets`` (PER-313, ``resonant.secret_expiry``: the daily expiry watch),
+    imported late like ``backup_job``."""
+    from resonant.secret_expiry import secrets_job as factory
+
+    return factory(deps)
+
+
 def watches_job(deps: CoreDeps) -> CoreJob | None:
     """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
     gate and the router, which this module must not pull in at import time."""
@@ -234,6 +245,7 @@ CORE_JOBS: tuple[CoreJobFactory, ...] = (
     remind_job,
     mcp_drift_job,
     registered_jobs_job,
+    secrets_job,
 )
 
 
@@ -459,6 +471,7 @@ class Scheduler:
         core_jobs: Sequence[CoreJobFactory] = CORE_JOBS,
         clock: Callable[[], datetime] = utcnow,
         panel_first_run_s: float | None = None,
+        bridge: OwnerBridge | None = None,
     ) -> Scheduler:
         """Every loaded extension's jobs, then the core jobs, over the components' gate and
         the executor's ``SecretStore``."""
@@ -505,6 +518,7 @@ class Scheduler:
             components,
             channel,
             owner if components.principals_loaded else None,
+            bridge,
         )
         for factory in core_jobs:
             core = factory(deps)

@@ -205,3 +205,26 @@ def test_audit_delete_window_only_opens_for_rows_before_the_cutoff(db: sqlite3.C
     ]
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         db.execute("DELETE FROM audit_log")
+
+
+def test_migration_035_adds_secret_expiry_on_a_v34_db(tmp_path: Path) -> None:
+    from resonant.store.db import _migrations  # pyright: ignore[reportPrivateUsage]
+
+    path = tmp_path / "v34.db"
+    raw = sqlite3.connect(path, isolation_level=None)
+    raw.row_factory = sqlite3.Row
+    every = _migrations()
+    assert migrate(raw, [m for m in every if m[0] <= 34]) == 34
+    raw.execute("INSERT INTO kv (key, value, updated_at) VALUES ('k', '1', 'x')")
+    assert migrate(raw, every) == 35
+    cols = [r["name"] for r in raw.execute("PRAGMA table_info(secret_expiry)")]
+    assert cols == ["ref", "expires_at", "source", "set_at", "note"]  # no value column, ever
+    raw.execute("INSERT INTO secret_expiry VALUES ('a/b', 'x', 'owner', 'x', NULL)")
+    raw.execute("INSERT INTO secret_expiry VALUES ('a/c', 'x', 'assumed', 'x', NULL)")
+    raw.execute("INSERT INTO secret_expiry VALUES ('a/d', 'x', 'probe', 'x', 'n')")
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("INSERT INTO secret_expiry VALUES ('a/e', 'x', 'guess', 'x', NULL)")
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("INSERT INTO secret_expiry VALUES ('a/b', 'y', 'owner', 'y', NULL)")
+    assert kv_get(raw, "k") == 1
+    raw.close()

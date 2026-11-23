@@ -254,6 +254,7 @@ CORE_JOB_TEXT: Final[Mapping[str, str]] = {
     "backup": "copies the store and checks the copy",
     "prune": "trims old rows from the store after a good backup",
     "run-cleanup": "removes old run folders and their branch checkouts",
+    "secrets": "warns you 30, 7 and 1 days before a secret expires, and when it has",
 }
 
 

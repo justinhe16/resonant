@@ -37,6 +37,7 @@ import re
 import signal
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol
 
 from resonant.instance import SERVICE_RE
@@ -57,6 +58,10 @@ EXT_SLUG = r"[a-z][a-z0-9-]{0,47}"  # the manifest's extension name rule
 NAME_SLUG = r"[a-z][a-z0-9_]{0,31}"  # the manifest's secret name rule
 _REF = re.compile(rf"(?P<ext>{EXT_SLUG})/(?P<name>{NAME_SLUG})")
 _NAME = re.compile(NAME_SLUG)
+# The ``mdat`` (modified) attribute line ``security find-generic-password`` (no ``-w``) prints:
+#     "mdat"<timedate>=0x32303236...5A00  "20261123100000Z\000"
+# Only this line is parsed (PER-313: when an assumed expiry counts from).
+_MDAT = re.compile(r'^\s*"mdat"<timedate>=\S*\s+"(\d{14})Z', re.MULTILINE)
 
 # security(1) exits with the low byte of the OSStatus.
 EXIT_NOT_FOUND = 44  # errSecItemNotFound (-25300)
@@ -287,6 +292,19 @@ class SecretStore:
             return False
         raise error
 
+    async def modified_at(self, ref: str) -> datetime | None:
+        """When the item was last written (its ``mdat`` attribute, UTC), without reading its
+        value: the same ``find-generic-password`` as :meth:`exists`, never ``-w`` or ``-g``.
+        None when the item is missing or the line doesn't parse (the expiry is then unknown,
+        never guessed). Raises ``SecretUnavailable``."""
+        result = await self._run(ref, find_argv(ref, value=False, service=self.service))
+        if result.returncode != 0:
+            error = self._failed(ref, result.returncode)
+            if isinstance(error, SecretMissing):
+                return None
+            raise error
+        return parse_mdat(result.stdout.decode(errors="replace"))
+
     async def set(self, ref: str, value: str) -> None:
         """Create or replace the item. The value goes on stdin, never in argv."""
         validate_value(value)
@@ -311,6 +329,25 @@ class SecretStore:
         for name in names:
             env[env_name(name)] = await self.get(secret_ref(ext, name))
         return env
+
+
+def parse_mdat(attributes: str) -> datetime | None:
+    """The ``mdat`` time from ``security find-generic-password``'s attribute listing, or None.
+    Reads only that one line."""
+    m = _MDAT.search(attributes)
+    if m is None:
+        return None
+    try:
+        return datetime.strptime(m[1], "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def mdat_line(at: datetime) -> str:
+    """The ``mdat`` line as ``security`` prints it (for ``FakeKeychain`` and tests)."""
+    stamp = at.astimezone(UTC).strftime("%Y%m%d%H%M%S") + "Z"
+    raw = (stamp + "\0").encode().hex().upper()
+    return f'    "mdat"<timedate>=0x{raw}  "{stamp}\\000"'
 
 
 def values_of(env: Mapping[str, str]) -> list[str]:
@@ -408,6 +445,10 @@ class FakeKeychain:
     fail_with: int | BaseException | None = None  # every call fails this way while set
     # The one Keychain service this fake answers for; a call naming another fails the test.
     service: str = SERVICE
+    # PER-313: each item's ``mdat`` (modified) attribute; ``set`` stamps ``now``. An item
+    # without one lists no ``mdat`` line (so its modified time doesn't parse).
+    modified: dict[str, datetime] = field(default_factory=dict[str, datetime])
+    now: datetime | None = None  # the time ``set`` stamps; None: the wall clock
 
     async def run(
         self, argv: Sequence[str], *, stdin: bytes | None, timeout_s: float
@@ -433,13 +474,20 @@ class FakeKeychain:
                     return SecurityResult(EXIT_NOT_FOUND, b"")
                 if args[-1] == "-w":
                     return SecurityResult(0, self.items[ref].encode() + b"\n")
-                return SecurityResult(0, f'keychain: "login"\n"acct"<blob>="{ref}"\n'.encode())
+                lines = ['keychain: "login"', 'class: "genp"', "attributes:",
+                         f'    "acct"<blob>="{ref}"']  # fmt: skip
+                if (at := self.modified.get(ref)) is not None:
+                    lines.append(mdat_line(at))
+                lines.append(f'    "svce"<blob>="{self.service}"')
+                return SecurityResult(0, ("\n".join(lines) + "\n").encode())
             case "add-generic-password":
                 if ref in self.items and "-U" not in args:
                     return SecurityResult(45, b"")  # errSecDuplicateItem
                 self.items[ref] = args[args.index("-w") + 1]
+                self.modified[ref] = self.now or datetime.now(UTC)
                 return SecurityResult(0, b"")
             case "delete-generic-password":
+                self.modified.pop(ref, None)
                 if self.items.pop(ref, None) is None:
                     return SecurityResult(EXIT_NOT_FOUND, b"")
                 return SecurityResult(0, b"")

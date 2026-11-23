@@ -866,6 +866,22 @@ async def test_heartbeat_health_lines_approvals_and_cap() -> None:
         assert "+3 more" in lines and len(text) < 500
 
 
+async def test_heartbeat_lists_a_failing_secrets_row() -> None:
+    # PER-313: an expired secret is a failing health row; the heartbeat shows it hourly
+    async with harness() as h:
+        ch = cori(h)
+        since = local(10, 13, 8, 30)
+        with atomic(h.db):
+            kv_set(h.db, "health.secrets", {"state": "failing", "since": iso(since),
+                                            "detail": "expired: runner/claude_token"})  # fmt: skip
+        await beat(h, T9)
+        assert ch.beats() == ["✓ Cori up · 1 check failing · idle\n⚠ secrets: failing since 08:30"]
+        with atomic(h.db):
+            kv_set(h.db, "health.model", {"state": "degraded", "since": iso(since)})
+        text = pj.heartbeat_text(h.db, h.settings, T9, paused=False)
+        assert text.startswith("✓ Cori up · 2 checks degraded or failing · idle\n")
+
+
 async def test_heartbeat_posts_paused_and_skips_the_owner_step() -> None:
     async with harness() as h:
         ch = cori(h)

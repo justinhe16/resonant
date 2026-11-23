@@ -327,6 +327,7 @@ Only if you want them (see the github README). Edit the token: Actions **read an
 
 - **Verify:** `scripts/bootstrap.sh --check`
 - **Expected:** exit 0; `extension github pin`, `secret github/token`, `extension jobs scheduled` and `briefing scheduled` all `PASS` (and `extension linear pin`, `secret linear/token` if you installed it).
+- **Secret expiries (PER-313):** one `secret expiry <ref>` row per present secret. `FAIL 0 … unknown: resonant secret expiry <ref> --expires-in <N>d` means no expiry is recorded and none is assumed: run that command with the token's real lifetime (the owner does, or Claude when you give the date in words). An expired one is `FAIL 1` with its renew command. `runner/claude_token` is assumed to last 365 days from when it was set (`assumed`).
 - **Rollback:** `resonant ext remove github`, type `github`: its tools, jobs and commands go after the restart. It keeps `~/.resonant/ext-data/github/` (`--purge` deletes it) and prints `resonant secret rm github/token` for the token it leaves. `/kill` stops everything at once in the meantime.
 
 ## 13. Phase 3.5: the pulse

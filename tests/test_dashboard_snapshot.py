@@ -407,7 +407,8 @@ def test_empty_db(db: sqlite3.Connection) -> None:
         "approvals_pending": 20, "questions": 20, "pulse": 60, "brain_tools": 20,
     }  # fmt: skip
     assert data["autonomy"] == "on" and data["paused"] is False and data["dry_run"] is True
-    assert [h["name"] for h in data["health"]] == ["model", "imessage", "loop", "store", "backup"]
+    assert [h["name"] for h in data["health"]] == ["model", "imessage", "loop", "store", "backup",
+                                                      "secrets"]  # fmt: skip
     assert {h["state"] for h in data["health"]} == {"unknown"}
     assert all(h["reason"] is None for h in data["health"])
     assert data["tasks"] == {"by_state": {}, "items": []}

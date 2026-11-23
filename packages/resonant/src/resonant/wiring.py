@@ -147,6 +147,7 @@ from resonant.runners.voice import ClaudeVoice
 from resonant.runners.watch import WatchRunner
 from resonant.runners.worker_desk import SelfOps
 from resonant.runners.worker_requests import WorkerRequests
+from resonant.secret_expiry import SecretsHealth
 from resonant.secrets import SecretStore
 from resonant.store.db import utcnow
 from resonant.toolcore import ToolCore
@@ -678,11 +679,11 @@ def build_stack(
     owner = components.principals.owner if components.principals_loaded else None
     # /ext run core/briefing (P3-14): the briefing on demand, through this channel.
     router.fast_path.core_jobs[BRIEFING_JOB] = core_briefing(
-        CoreDeps(settings, conn, components, channel, owner)
+        CoreDeps(settings, conn, components, channel, owner, bridge)
     )
     router.fast_path.repo_path = settings.ops.repo_path
     router.fast_path.core_jobs[PULSE_JOB] = core_pulse(
-        CoreDeps(settings, conn, components, channel, owner)
+        CoreDeps(settings, conn, components, channel, owner, bridge)
     )
     monitor = HealthMonitor(
         conn,
@@ -697,6 +698,12 @@ def build_stack(
         db_path=settings.db_path,
         model_meta={"model": settings.model.name, "api": settings.model.api},
         backup_check=partial(backup_health, conn, settings),
+        # PER-313: secret expiries (a silent row: the daily core/secrets job alerts)
+        secrets_check=SecretsHealth(
+            conn,
+            components.executor.secrets or SecretStore(service=settings.keychain_service),
+            settings,
+        ),
         ext_checks=(
             None
             if host is None

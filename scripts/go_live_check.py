@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from resonant.config import Settings
+    from resonant.secret_expiry import Probe
     from resonant.store.extensions import ExtensionRecord
 
 Row = tuple[str, bool, str, str]  # (status, required, step, detail)
@@ -204,6 +205,83 @@ def secret_rows(records: Sequence[ExtensionRecord], exists: Callable[[str], bool
             else:
                 rows.append(("FAIL", required, step, f"missing: resonant secret set {ref}"))
     return rows
+
+
+SECRET_EXPIRY_SCHEMA = 35  # migration 035: secret_expiry (PER-313)
+
+
+def expiry_rows(
+    settings: Settings,
+    conn: sqlite3.Connection | None,
+    refs: Sequence[str],
+    now: datetime,
+    keychain: Callable[[Sequence[str]], Probe] | None = None,
+) -> list[Row]:
+    """PER-313: one ``secret expiry <ref>`` row per present secret (``refs``: the known ones
+    and the enabled extensions' declared ones, plus every ref with a row). Unknown (no row, no
+    default) is advisory with the command to record it; expired is required. Names and
+    metadata only: ``keychain`` (``secret_expiry.probe`` over this instance's store, by
+    default) never reads a value."""
+    from resonant import secret_expiry as sx
+    from resonant.store import secret_expiry as expiry_store
+
+    rows = expiry_store.all(conn) if conn is not None else []
+    wanted = sorted({*refs, *(r.ref for r in rows)})
+    facts = (keychain or _expiry_probe(settings))(wanted)
+    if facts.locked:
+        why = facts.reason or "keychain unavailable"
+        return [("FAIL", False, "secret expiry", f"{why}; presence not checked")]
+    out_rows: list[Row] = []
+    cmd = sx.resonant_cmd(settings)
+    for e in sx.entries(wanted, rows, facts):
+        if e.present is not True:
+            continue
+        step = f"secret expiry {e.ref}"
+        if e.expires_at is None:
+            how = f"{cmd} secret expiry {e.ref} --expires-in <N>d"
+            out_rows.append(("FAIL", False, step, f"unknown: {how}"))
+            continue
+        detail = sx.describe(e, now, settings.timezone)
+        if sx.threshold(sx.days_left(e.expires_at, now, settings.timezone), e.expires_at, now) == 0:
+            out_rows.append(("FAIL", True, step, f"{detail}: {sx.renew_command(e, settings)}"))
+        else:
+            out_rows.append(("PASS", False, step, detail))
+    return out_rows
+
+
+def _expiry_refs(settings: Settings, conn: sqlite3.Connection) -> list[str]:
+    """The known refs and the enabled extensions' declared ones."""
+    from resonant.secret_expiry import known_refs
+    from resonant.secrets import InvalidSecretRef, secret_ref
+    from resonant.store.extensions import list_extensions
+    from resonant_sdk import Manifest
+
+    refs = set(known_refs(settings))
+    for r in list_extensions(conn):
+        if r.status != "enabled":
+            continue
+        try:
+            names = Manifest.model_validate(r.manifest).secrets
+        except ValueError:
+            continue
+        for name in names:
+            try:
+                refs.add(secret_ref(r.name, name))
+            except InvalidSecretRef:
+                continue
+    return sorted(refs)
+
+
+def _expiry_probe(settings: Settings) -> Callable[[Sequence[str]], Probe]:
+    def run(refs: Sequence[str]) -> Probe:
+        import asyncio
+
+        from resonant.secret_expiry import probe
+        from resonant.secrets import SecretStore
+
+        return asyncio.run(probe(SecretStore(service=settings.keychain_service), refs))
+
+    return run
 
 
 def _next_text(at: datetime | None, now: datetime, tz: str) -> str:
@@ -806,6 +884,12 @@ def main() -> None:
             out(*row)
     except sqlite3.Error as e:
         out("FAIL", True, "extensions", _err(e))
+    if conn is not None and version >= SECRET_EXPIRY_SCHEMA:
+        try:
+            for row in expiry_rows(settings, conn, _expiry_refs(settings, conn), now):
+                out(*row)
+        except sqlite3.Error as e:
+            out("FAIL", False, "secret expiry", _err(e))
     try:
         for row in relay_rows(settings, conn):
             out(*row)

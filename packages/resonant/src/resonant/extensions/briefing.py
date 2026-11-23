@@ -298,7 +298,8 @@ def _work(conn: sqlite3.Connection) -> tuple[int, tuple[str, ...], int]:
 
 
 def _degraded(conn: sqlite3.Connection) -> tuple[str, ...]:
-    return tuple(name for name, s in health_snapshot(conn).items() if s["state"] == "degraded")
+    bad = ("degraded", "failing")  # failing: PER-313's secrets row
+    return tuple(name for name, s in health_snapshot(conn).items() if s["state"] in bad)
 
 
 def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
