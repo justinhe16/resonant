@@ -184,6 +184,7 @@ class HealthConfig(_Section):
 
 
 _SUPABASE_KEY = re.compile(r"[A-Za-z0-9._-]{20,1024}")
+_FLY_APP = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 
 
 class RelayConfig(_Section):
@@ -201,6 +202,23 @@ class RelayConfig(_Section):
     every_s: float = Field(default=60.0, ge=15, le=3600)
     timeout_s: float = Field(default=10.0, gt=0, le=30)  # per HTTP attempt
     max_attempts: int = Field(default=3, ge=1, le=5)  # per push; the rest waits for the next
+    # PER-316: `resonant relay deploy`. The Fly app (resonant-relay-jhe); None refuses.
+    fly_app: str | None = None
+    # The `fly` binary. None: `fly` or `flyctl` on the caller's PATH, then
+    # /opt/homebrew/bin/fly. The deploy's env has system dirs only, so this is absolute.
+    fly_path: Path | None = None
+
+    @field_validator("fly_app")
+    @classmethod
+    def _fly_app(cls, v: str | None) -> str | None:
+        if v is not None and not _FLY_APP.fullmatch(v):
+            raise ValueError("relay.fly_app must be a Fly app name (a-z, 0-9 and -)")
+        return v
+
+    @field_validator("fly_path")
+    @classmethod
+    def _fly_path(cls, v: Path | None) -> Path | None:
+        return v.expanduser() if v is not None else None
 
     @field_validator("supabase_url")
     @classmethod

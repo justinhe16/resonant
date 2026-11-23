@@ -99,3 +99,4 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 - Contracts: [`interfaces.md`](interfaces.md). Brain design and as-built notes: [`brain-plan.md`](brain-plan.md). Go-live: [`go-live.md`](go-live.md).
 - Runtime state: `~/.resonant` (config.yaml, resonant.db, logs/, backups/).
 - Hosted: Supabase project `resonant-relay` and Fly app `resonant-relay-jhe` (both reachable from Claude Code: the Supabase MCP and `fly`). Rollback is in go-live step 15.
+- Relay deploys: `resonant relay deploy` (PER-316) with the Fly deploy token `relay/fly_deploy_token` in personal Resonant's Keychain and `relay.fly_app: resonant-relay-jhe`; no `fly auth login` needed (owner sets both up once, go-live step 15 step 8).

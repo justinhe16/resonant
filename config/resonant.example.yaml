@@ -23,6 +23,8 @@ relay:                                  # status relay to Supabase (docs/dashboa
   supabase_url: null                    # https://<ref>.supabase.co
   anon_key: null                        # the project's anon/publishable key (public); the write token is Keychain relay/supabase_key
   every_s: 60
+  fly_app: null                         # the Fly relay app, for `resonant relay deploy` (token: Keychain relay/fly_deploy_token)
+  fly_path: null                        # the fly binary; default fly/flyctl on PATH, then /opt/homebrew/bin/fly
 
 loop:
   tick_s: 30
