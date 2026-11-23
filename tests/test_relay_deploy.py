@@ -356,3 +356,14 @@ def test_interrupt_is_audited(env: Env, monkeypatch: pytest.MonkeyPatch) -> None
     assert code == rd.EXIT_INTERRUPTED and "interrupted" in out
     ((_, detail),) = _audits(env.conn)
     assert json.loads(detail)["exit_code"] == rd.EXIT_INTERRUPTED
+
+
+def test_expiry_watch_knows_the_token_when_configured(resonant_home: Path) -> None:
+    """PER-313's ``secret list`` and daily watch include relay/fly_deploy_token once
+    relay.fly_app is set on personal Resonant, with the renew command."""
+    from resonant import secret_expiry as sx
+
+    assert rd.FLY_DEPLOY_TOKEN_REF not in sx.known_refs(load_settings(home=resonant_home))
+    s = load_settings(home=resonant_home, relay={"fly_app": APP})
+    assert rd.FLY_DEPLOY_TOKEN_REF in sx.known_refs(s)
+    assert sx.RENEW_HINTS[rd.FLY_DEPLOY_TOKEN_REF].startswith("fly tokens create deploy")
