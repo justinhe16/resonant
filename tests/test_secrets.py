@@ -11,6 +11,8 @@ import base64
 import json
 import logging
 import re
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus
@@ -39,11 +41,15 @@ from resonant.secrets import (
     encode_value,
     env_name,
     find_argv,
+    mdat_line,
+    parse_mdat,
     secret_ref,
     split_ref,
     validate_ref,
     values_of,
 )
+from resonant.store import secret_expiry as expiry_store
+from resonant.store.db import open_db
 
 TOKEN = "ghp_S3ntinel+Value/abc=XYZ"  # has URL- and base64-special characters
 
@@ -524,24 +530,176 @@ def test_cli_list_shows_names_and_presence_only(
     code, out = run("list", str(extra))
     assert code == 0, out
     *rows, summary = out.strip().splitlines()
-    assert summary == "1 of 3 present (service resonant)"  # PER-297
-    lines = [line.split() for line in rows]
+    # PER-313: the known core refs show too (with no store, every expiry is unknown)
+    assert summary == "1 of 9 present (service resonant)"  # PER-297
+    lines = [line.split(maxsplit=1) for line in rows]
     assert lines == [
         ["example/api_key", "missing"],
         ["github/hook_key", "missing"],
-        ["github/token", "present"],
+        ["github/token", "present      unknown"],
+        ["relay/supabase_key", "missing"],
+        ["runner/anthropic_key", "missing"],
+        ["runner/claude_token", "missing"],
+        ["runner/github_app_key", "missing"],
+        ["runner/github_public_token", "missing"],
+        ["runner/github_token", "missing"],
     ]
     assert TOKEN not in out
     assert all("-w" not in argv for argv in keychain.argvs())
 
 
-def test_cli_list_empty_and_unavailable(keychain: FakeKeychain, resonant_home: Path) -> None:
-    code, out = run("list")
-    assert code == 0 and "no declared secrets" in out
+def test_cli_list_unavailable(keychain: FakeKeychain, resonant_home: Path) -> None:
     write_ext(resonant_home / "extensions", "github", "token")
     keychain.fail_with = 36
     code, out = run("list")
     assert code == EX_TEMPFAIL and "keychain locked" in out
+
+
+# --- expiry (PER-313) --------------------------------------------------------------------------
+
+# ``security find-generic-password -s resonant -a runner/claude_token`` (no -w) on macOS 26,
+# abridged: attributes only, never the value.
+RECORDED = """\
+keychain: "/Users/x/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="resonant"
+    0x00000008 <blob>=<NULL>
+    "acct"<blob>="runner/claude_token"
+    "cdat"<timedate>=0x32303235313132333039303030305A00  "20251123090000Z\\000"
+    "crtr"<uint32>=<NULL>
+    "mdat"<timedate>=0x32303236303130323033303430355A00  "20260102030405Z\\000"
+    "svce"<blob>="resonant"
+"""
+
+
+def test_parse_mdat_reads_only_the_mdat_line() -> None:
+    assert parse_mdat(RECORDED) == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    assert parse_mdat(RECORDED.replace('"mdat"', '"xdat"')) is None
+    assert parse_mdat('    "mdat"<timedate>=<NULL>\n') is None
+    assert parse_mdat("") is None
+    at = datetime(2027, 3, 4, 5, 6, 7, tzinfo=UTC)
+    assert parse_mdat(mdat_line(at)) == at
+
+
+async def test_modified_at_never_reads_the_value() -> None:
+    s, keychain = store()
+    at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    keychain.now = at
+    await s.set("runner/claude_token", TOKEN)
+    keychain.calls.clear()
+    assert await s.modified_at("runner/claude_token") == at
+    assert await s.modified_at("runner/absent") is None
+    assert keychain.argvs() == [tuple(find_argv("runner/claude_token", value=False)),
+                                tuple(find_argv("runner/absent", value=False))]  # fmt: skip
+    assert all("-w" not in a and "-g" not in a for a in keychain.argvs())
+    keychain.modified.clear()  # no mdat line: unknown, never guessed
+    assert await s.modified_at("runner/claude_token") is None
+    keychain.fail_with = 36
+    with pytest.raises(SecretUnavailable):
+        await s.modified_at("runner/claude_token")
+
+
+def expiry_db(home: Path) -> sqlite3.Connection:
+    return open_db(home / "resonant.db")
+
+
+def expiry_of(home: Path, ref: str) -> tuple[str, str] | None:
+    conn = expiry_db(home)
+    try:
+        row = expiry_store.get(conn, ref)
+        return None if row is None else (row.expires_at.date().isoformat(), row.source)
+    finally:
+        conn.close()
+
+
+def test_cli_set_records_the_expiry(keychain: FakeKeychain, resonant_home: Path) -> None:
+    expiry_db(resonant_home).close()
+    code, out = run("set", "github/token", "--expires-in", "90d", input=TOKEN + "\n")
+    assert code == 0, out
+    assert out.splitlines()[0] == "stored github/token" and out.splitlines()[1].startswith(
+        "expires "
+    )
+    assert expiry_of(resonant_home, "github/token") is not None
+    assert expiry_of(resonant_home, "github/token")[1] == "owner"  # type: ignore[index]
+    # a plain set of a ref with no default: the old expiry is wrong now, so it goes
+    code, out = run("set", "github/token", input=TOKEN + "\n")
+    assert (code, out.strip()) == (0, "stored github/token")
+    assert expiry_of(resonant_home, "github/token") is None
+    # runner/claude_token with no flag: assumed, 365 days from the item's mdat
+    keychain.now = datetime(2026, 11, 23, 18, 0, tzinfo=UTC)
+    code, out = run("set", "runner/claude_token", input=TOKEN + "\n")
+    assert code == 0, out
+    assert expiry_of(resonant_home, "runner/claude_token") == ("2027-11-23", "assumed")
+    assert "expires 2027-11-23 (assumed)" in out
+    assert all(TOKEN not in a for argv in keychain.argvs() for a in argv)
+    assert sum(argv[-1] == "-w" for argv in keychain.argvs()) == 3  # only the read-backs
+
+
+def test_cli_set_refuses_bad_expiry_flags_before_storing(
+    keychain: FakeKeychain, resonant_home: Path
+) -> None:
+    for args in (["--expires-in", "0d"], ["--expires-in", "1.5d"], ["--expires", "2001-01-01"],
+                 ["--expires", "2030-01-01", "--expires-in", "30d"]):  # fmt: skip
+        code, out = run("set", "github/token", *args, input=TOKEN + "\n")
+        assert code == 2, (args, out)
+    assert keychain.calls == []
+
+
+def test_cli_set_with_an_expiry_but_no_store(keychain: FakeKeychain, resonant_home: Path) -> None:
+    code, out = run("set", "github/token", "--expires-in", "30d", input=TOKEN + "\n")
+    assert code == EX_TEMPFAIL and "expiry wasn't recorded" in out
+    assert keychain.items == {"github/token": TOKEN}  # the value is stored all the same
+
+
+def test_cli_expiry_writes_the_store_only(keychain: FakeKeychain, resonant_home: Path) -> None:
+    expiry_db(resonant_home).close()
+    keychain.items["runner/github_app_key"] = TOKEN
+    code, out = run("expiry", "runner/github_app_key", "--expires", "2030-05-01")
+    assert (code, out.strip()) == (0, "runner/github_app_key expires 2030-05-01 (owner)")
+    assert expiry_of(resonant_home, "runner/github_app_key") == ("2030-05-01", "owner")
+    code, out = run("expiry", "runner/github_app_key", "--clear")
+    assert (code, out.strip()) == (0, "cleared the expiry of runner/github_app_key")
+    assert expiry_of(resonant_home, "runner/github_app_key") is None
+    assert all(argv[1] == "find-generic-password" and "-w" not in argv
+               for argv in keychain.argvs())  # fmt: skip
+    # a missing item: warned, not refused
+    code, out = run("expiry", "linear/token", "--expires-in", "30d")
+    assert code == 0 and "isn't in the Keychain" in out
+    for args in ([], ["--clear", "--expires-in", "3d"], ["--expires-in", "0d"]):
+        assert run("expiry", "linear/token", *args)[0] == 2
+    conn = expiry_db(resonant_home)
+    actions = [r[0] for r in conn.execute("SELECT detail FROM audit_log WHERE action = "
+                                          "'secrets.expiry_set'")]  # fmt: skip
+    conn.close()
+    assert len(actions) == 3
+
+
+def test_cli_list_shows_expiries(
+    keychain: FakeKeychain, resonant_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = expiry_db(resonant_home)
+    now = datetime.now(UTC)
+    later = now + timedelta(days=100, hours=1)
+    expiry_store.upsert(conn, "runner/github_app_key", expires_at=later, source="owner",
+                        set_at=now)  # fmt: skip
+    expiry_store.upsert(conn, "runner/github_token", expires_at=now - timedelta(days=2, hours=1),
+                        source="owner", set_at=now)  # fmt: skip
+    expiry_store.upsert(conn, "linear/token", expires_at=now + timedelta(days=5),
+                        source="owner", set_at=now)  # fmt: skip
+    conn.close()
+    keychain.items |= {"runner/github_app_key": TOKEN, "runner/github_token": TOKEN,
+                       "runner/claude_token": TOKEN}  # fmt: skip
+    keychain.modified["runner/claude_token"] = now
+    code, out = run("list")
+    assert code == 0, out
+    lines = {line.split()[0]: line.split(maxsplit=1)[1] for line in out.strip().splitlines()[:-1]}
+    assert lines["linear/token"].split() == ["missing", "(expiry", "kept)"]
+    assert lines["runner/github_app_key"].endswith("(100d, owner)")
+    assert lines["runner/github_token"].endswith("expired 2d ago")
+    assert lines["runner/claude_token"].endswith("(365d, assumed)")
+    assert out.strip().splitlines()[-1] == "3 of 7 present (service resonant)"
 
 
 # --- large and multi-line values (security -i, docs/repos-plan.md D10) ---------------------------

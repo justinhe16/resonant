@@ -17,6 +17,7 @@ from resonant.health import deadman_task
 from resonant.models import ProbeResult
 from resonant.monitor import (
     GB,
+    CheckResult,
     HealthMonitor,
     channels_snapshot,
     health_snapshot,
@@ -148,6 +149,7 @@ async def test_all_ok_first_round(env: Env) -> None:
         "loop": "ok",
         "store": "ok",
         "backup": "unknown",  # no backup_check wired here
+        "secrets": "unknown",  # nor a secrets_check (PER-313)
     }
     assert snap["model"]["since"] == iso(T0)
     assert env.sent == []
@@ -163,7 +165,7 @@ async def test_all_ok_first_round(env: Env) -> None:
 
 async def test_health_unknown_without_monitor(db: sqlite3.Connection) -> None:
     snap = health_snapshot(db)
-    assert set(snap) == {"model", "imessage", "loop", "store", "backup"}
+    assert set(snap) == {"model", "imessage", "loop", "store", "backup", "secrets"}
     assert all(s["state"] == "unknown" and s["since"] is None for s in snap.values())
 
 
@@ -508,3 +510,79 @@ async def test_persistent_send_failure_goes_to_deadman(env: Env) -> None:
     await env.tick()
     assert len(env.sent) == 1
     assert env.monitor.deadman_reason() is None
+
+
+# --- secrets (PER-313): a silent row with a failing state ----------------------------------
+
+
+class SecretsCheck:
+    def __init__(self) -> None:
+        self.result: CheckResult | None = CheckResult(True, "no expiries known")
+
+    async def __call__(self, now: datetime) -> CheckResult | None:
+        return self.result
+
+
+async def test_secrets_row_degrades_and_fails_without_any_alert(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    e = Env(db, tmp_path)
+    check = SecretsCheck()
+    e.monitor.secrets_check = check
+    await e.tick()
+    assert _state(db, "secrets") | {"checked_at": None} == {
+        "state": "ok", "since": iso(T0), "detail": "no expiries known", "checked_at": None,
+    }  # fmt: skip
+    check.result = CheckResult(False, "github/token expires in 5d")
+    await e.tick(3)
+    assert _state(db, "secrets")["state"] == "degraded"
+    check.result = CheckResult(False, "expired: github/token", failing=True)
+    await e.tick(3)
+    s = _state(db, "secrets")
+    assert (s["state"], s["detail"]) == ("failing", "expired: github/token")
+    assert e.sent == []  # the daily job owns the alerting
+    assert e.monitor.deadman_reason() is None
+    # failing survives a restart (from_kv keeps it), and the dead-man ignores it even when
+    # the owner can't be texted
+    again = Env(db, tmp_path, channel=False)
+    again.monitor.secrets_check = check
+    again.clock.now = e.clock.now
+    await again.tick()
+    assert _state(db, "secrets")["state"] == "failing"
+    check.result = CheckResult(False, "github/token expires in 5d")
+    await again.tick()
+    assert again.monitor.deadman_reason() is None
+    check.result = CheckResult(True, "soonest github/token in 300d")
+    await e.tick()
+    assert _state(db, "secrets")["state"] == "ok" and e.sent == []
+
+
+async def test_secrets_row_never_reaches_the_bridge(db: sqlite3.Connection, tmp_path: Path) -> None:
+    forwarded: list[tuple[str, str]] = []
+
+    class Bridge:
+        def forward(self, key: str, title: str, *, clear: bool = False) -> None:
+            forwarded.append((key, title))
+
+    e = Env(db, tmp_path)
+    e.monitor.bridge = Bridge()  # type: ignore[assignment]
+    check = SecretsCheck()
+    check.result = CheckResult(False, "github/token expires in 5d")
+    e.monitor.secrets_check = check
+    await e.tick(3)
+    check.result = CheckResult(False, "expired: github/token", failing=True)
+    await e.tick(3)
+    assert forwarded == []
+
+
+async def test_a_raising_secrets_check_is_a_degraded_row(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    e = Env(db, tmp_path)
+
+    async def boom(now: datetime) -> CheckResult | None:
+        raise RuntimeError("x")
+
+    e.monitor.secrets_check = boom
+    await e.tick()
+    assert _state(db, "secrets")["detail"] == "secret expiries unreadable (RuntimeError)"

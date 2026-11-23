@@ -851,18 +851,23 @@ def heartbeat_text(
 
     ``✓ Cori up · healthy · running R12, R14 · next job J3 at 14:00`` (``idle`` with no run;
     the next job only when PER-298's registered jobs exist), ``⏸ Cori paused · …`` while
-    paused. Then a ``⚠ <check>: degraded since <time>`` line per degraded health row (at most
-    5, then ``+N more``; Slack's own ``slack`` row among them) and ``Waiting: 2 approvals
+    paused. Then a ``⚠ <check>: degraded since <time>`` line per degraded or failing health row
+    (at most 5, then ``+N more``; Slack's own ``slack`` row among them; PER-313: ``⚠ secrets:
+    failing since …`` once a secret has expired) and ``Waiting: 2 approvals
     (oldest 40m)``. Names only: R-codes, check names and counts, never a run's ask or a
     detail."""
     from resonant.monitor import health_snapshot  # late: the monitor imports the gateway
 
     zone = ZoneInfo(settings.timezone)
     name = settings.instance.display_name
-    degraded = [(c, row) for c, row in health_snapshot(conn).items() if row["state"] == "degraded"]
+    degraded = [(c, row) for c, row in health_snapshot(conn).items()
+                if row["state"] in ("degraded", "failing")]  # fmt: skip
     parts = [f"⏸ {name} paused" if paused else f"✓ {name} up"]
     if degraded:
-        parts.append(f"{len(degraded)} check{'s' if len(degraded) != 1 else ''} degraded")
+        failing = sum(row["state"] == "failing" for _c, row in degraded)
+        word = ("degraded" if not failing
+                else "failing" if failing == len(degraded) else "degraded or failing")  # fmt: skip
+        parts.append(f"{len(degraded)} check{'s' if len(degraded) != 1 else ''} {word}")
     else:
         parts.append("healthy")
     codes = [r.code for r in runs_store.active(conn)]

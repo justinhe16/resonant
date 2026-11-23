@@ -153,6 +153,7 @@ class Daemon:
             channel=None if self.stack is None else self.stack.channel,
             core_jobs=(*CORE_JOBS, cleanup_job),
             panel_first_run_s=PANEL_FIRST_RUN_S,
+            bridge=None if self.stack is None else self.stack.bridge,
         )
         self.loop.scheduler = self.scheduler
         # The status relay (dashboard.pusher): the remote tier of the snapshot to Supabase.
