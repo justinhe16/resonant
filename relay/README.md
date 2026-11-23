@@ -88,15 +88,21 @@ fly apps create "$APP"                  # leaves relay/fly.toml untouched; every
 { echo "SUPABASE_URL=..."; ...; } | fly secrets import --app "$APP" --stage
 fly secrets list --app "$APP"           # names and digests only
 
+# A deploy token scoped to the app, in personal Resonant's Keychain (PER-316), and
+# relay.fly_app: "$APP" in ~/.resonant/config.yaml. Then no fly login is needed to deploy.
+fly tokens create deploy -a "$APP" --expiry 8760h
+resonant secret set relay/fly_deploy_token --expires-in 365d   # paste the token at the prompt
+
 # One machine (no HA pair: two checkers would alert twice)
-fly deploy --app "$APP" --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
-fly scale count 1 --app "$APP" --yes
-fly status --app "$APP"
+resonant relay deploy                   # from ops.repo_path: fly deploy ... --ha=false . with the token, then fly status
+fly scale count 1 --app "$APP" --yes    # first deploy only
 ```
 
-The status token's SHA-256 goes into `relay_private.config.status_token_sha256` (go-live 15 step 6). Always run `fly deploy` from the repo root with `.` as the context: from inside `relay/` the image can't reach `dashboard/dist`. `fly logs --app "$APP"` shows each check's failures and every alert sent.
+`resonant relay deploy` runs `fly deploy --app "$APP" --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .` from the repo root with `FLY_API_TOKEN` in fly's env only (never argv or output; an inherited Fly token is dropped), streams fly's output, returns fly's exit code, then prints the machine count from `fly status` and warns when it isn't 1. `--dry-run` shows the command and reads no token; `--repo` deploys another checkout. It refuses without `relay.fly_app`, `fly`, the repo or `dashboard/dist`, on a non-default instance (the token is personal Resonant's), and without the token (it prints the two setup lines). `fly auth login` is only for `fly apps create` and `fly secrets`.
 
-To change a setting later: `fly secrets set --app "$APP" NAME=value` (restarts the machine), or pipe it to `fly secrets import --app "$APP"` for a secret value. A dashboard rebuild ships with the next `fly deploy`.
+The status token's SHA-256 goes into `relay_private.config.status_token_sha256` (go-live 15 step 6). Run by hand, `fly deploy` must run from the repo root with `.` as the context: from inside `relay/` the image can't reach `dashboard/dist`. `fly logs --app "$APP"` shows each check's failures and every alert sent.
+
+To change a setting later: `fly secrets set --app "$APP" NAME=value` (restarts the machine), or pipe it to `fly secrets import --app "$APP"` for a secret value. A dashboard rebuild ships with the next `resonant relay deploy`.
 
 ## Develop and test
 

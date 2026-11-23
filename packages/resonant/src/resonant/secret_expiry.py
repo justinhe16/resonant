@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 from resonant import instance as inst
 from resonant.gateway.channel import ChannelError
+from resonant.ops.relay_deploy import FLY_DEPLOY_TOKEN_REF
 from resonant.secrets import (
     ANTHROPIC_KEY_REF,
     CLAUDE_TOKEN_REF,
@@ -93,7 +94,10 @@ RELAY_KEY_REF = secret_ref("relay", "supabase_key")  # dashboard.pusher.SUPABASE
 # otherwise. Keep it small, and say "assumed" wherever it shows.
 DEFAULTS: dict[str, timedelta] = {CLAUDE_TOKEN_REF: timedelta(days=365)}
 # What to do before ``resonant secret set`` for a ref (code-built, no value).
-RENEW_HINTS: dict[str, str] = {CLAUDE_TOKEN_REF: "claude setup-token"}
+RENEW_HINTS: dict[str, str] = {
+    CLAUDE_TOKEN_REF: "claude setup-token",
+    FLY_DEPLOY_TOKEN_REF: "fly tokens create deploy -a <relay.fly_app> --expiry 8760h",
+}
 
 CORE_REFS: tuple[str, ...] = (
     CLAUDE_TOKEN_REF,
@@ -125,6 +129,8 @@ def known_refs(settings: Settings) -> list[str]:
     if slack.enabled:
         refs.update((slack.bot_token_ref, slack.app_token_ref))
     refs.update(settings.runner.session_env.values())
+    if settings.relay.fly_app is not None and inst.is_default(settings.instance.name):
+        refs.add(FLY_DEPLOY_TOKEN_REF)  # PER-316: `resonant relay deploy`, personal only
     valid: list[str] = []
     for ref in sorted(refs):
         try:

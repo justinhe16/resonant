@@ -53,6 +53,7 @@ from resonant.ops import (
     mark_restart,
     restart_later_argv,
 )
+from resonant.ops import relay_deploy as rd
 from resonant.principals import Principals, load_principals
 from resonant.secrets import (
     InvalidSecretRef,
@@ -1546,6 +1547,161 @@ def secret_rm(ref: SecretRef) -> None:
         typer.echo(f"{ref}: not found", err=True)
         raise typer.Exit(1)
     typer.echo(f"removed {ref}")
+
+
+# --- relay -----------------------------------------------------------------------------
+
+relay_app = typer.Typer(
+    no_args_is_help=True, help="The Fly status relay (see relay/README.md, go-live step 15)."
+)
+app.add_typer(relay_app, name="relay")
+
+
+def _deploy_runner() -> rd.DeployRunner:
+    """The runner ``relay deploy`` uses. Tests swap in a fake: no real ``fly`` or ``git``."""
+    return rd.SubprocessDeployRunner()
+
+
+def _relay_refuse(message: str, code: int = 1, *, setup: str | None = None) -> typer.Exit:
+    typer.echo(f"error: {message}", err=True)
+    if setup is not None:
+        typer.echo("Set it up (once a year):", err=True)
+        for line in rd.setup_lines(setup):
+            typer.echo(line, err=True)
+    return typer.Exit(code)
+
+
+@relay_app.command("deploy")
+def relay_deploy(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the command; read no token, run nothing."),
+    ] = False,
+    repo: Annotated[
+        Path | None,
+        typer.Option("--repo", help="The checkout to deploy from (default: ops.repo_path)."),
+    ] = None,
+) -> None:
+    """Deploy the Fly relay with the Keychain deploy token relay/fly_deploy_token (PER-316).
+
+    Runs go-live step 15's ``fly deploy`` from the repo root with ``FLY_API_TOKEN`` in the
+    child's env only (never argv, output or the audit), streams fly's output, then
+    ``fly status``. Exit: fly's own code; 1 or 2 for a refusal, before anything runs."""
+    import asyncio
+
+    settings = load_settings()
+    if not instance.is_default(settings.instance.name):
+        raise _relay_refuse(
+            "the relay is shared and its deploy token is personal Resonant's: run "
+            "`resonant relay deploy` without --instance",
+            2,
+        )
+    app_name = settings.relay.fly_app
+    if app_name is None:
+        raise _relay_refuse(
+            f"relay.fly_app isn't set: add it under relay: in {settings.home / 'config.yaml'}"
+        )
+    fly = rd.find_fly(settings.relay.fly_path)
+    if fly is None:
+        where = settings.relay.fly_path or "fly or flyctl on PATH, or /opt/homebrew/bin/fly"
+        raise _relay_refuse(f"no fly binary ({where}): brew install flyctl, or set relay.fly_path")
+    checkout = repo.expanduser().absolute() if repo is not None else settings.ops.repo_path
+    if checkout is None:
+        raise _relay_refuse("no repo: set ops.repo_path or pass --repo")
+    if problem := rd.repo_problem(checkout):
+        raise _relay_refuse(problem)
+    ref = rd.FLY_DEPLOY_TOKEN_REF
+    store = _secret_store()
+    argv = rd.deploy_argv(fly, app_name)
+    if dry_run:
+        try:
+            present = asyncio.run(store.exists(ref))  # never the value
+        except SecretError as e:
+            raise _relay_refuse(str(e), EX_TEMPFAIL) from None
+        if not present:
+            raise _relay_refuse(f"{ref} isn't in the Keychain", setup=app_name)
+        typer.echo(f"cwd {checkout}")
+        typer.echo(f"{rd.TOKEN_ENV}=<from {ref}> {' '.join(argv)}")
+        typer.echo(f"then {' '.join(rd.status_argv(fly, app_name))}")
+        return
+    try:
+        token = asyncio.run(store.get(ref))
+    except SecretMissing:
+        raise _relay_refuse(f"{ref} isn't in the Keychain", setup=app_name) from None
+    except SecretError as e:
+        raise _relay_refuse(str(e), EX_TEMPFAIL) from None
+    runner = _deploy_runner()
+    env = rd.child_env(fly, token)
+    head = runner.run(
+        rd.head_argv(),
+        cwd=checkout,
+        env=rd.child_env(fly, None),
+        timeout_s=rd.GIT_TIMEOUT_S,
+        echo=False,
+    )
+    sha = head.tail.strip() if head.returncode == 0 else None
+    typer.echo(f"Deploying {app_name} from {checkout} ({sha[:12] if sha else 'HEAD unknown'})")
+    try:
+        result = runner.run(
+            argv, cwd=checkout, env=env, timeout_s=rd.DEPLOY_TIMEOUT_S, echo=True, mask=(token,)
+        )
+    except KeyboardInterrupt:
+        typer.echo("error: interrupted; fly deploy stopped", err=True)
+        _audit_relay_deploy(settings, app=app_name, exit_code=rd.EXIT_INTERRUPTED, head=sha)
+        raise typer.Exit(rd.EXIT_INTERRUPTED) from None
+    code = result.returncode
+    if result.timed_out:
+        typer.echo(
+            f"error: fly deploy timed out after {rd.DEPLOY_TIMEOUT_S / 60:.0f} min", err=True
+        )
+        code = rd.EXIT_TIMEOUT
+    elif code == rd.EXIT_NO_START:
+        typer.echo(f"error: couldn't start {fly}", err=True)
+    elif rd.auth_rejected(result):
+        typer.echo(rd.renew_line(app_name), err=True)
+    _audit_relay_deploy(settings, app=app_name, exit_code=code, head=sha)
+    if code != 0:
+        raise typer.Exit(code)
+    status = runner.run(
+        rd.status_argv(fly, app_name),
+        cwd=checkout,
+        env=env,
+        timeout_s=rd.STATUS_TIMEOUT_S,
+        echo=False,
+        mask=(token,),
+    )
+    machines = rd.machine_count(status.tail) if status.returncode == 0 else None
+    if machines is None:
+        typer.echo(f"warning: couldn't read fly status (run: fly status --app {app_name})")
+    elif machines == 1:
+        typer.echo(f"Deployed {app_name}: 1 machine")
+    else:
+        typer.echo(
+            f"warning: {app_name} has {machines} machines, not 1: two checkers alert twice "
+            f"(fly scale count 1 --app {app_name} --yes)"
+        )
+
+
+def _audit_relay_deploy(settings: Settings, *, app: str, exit_code: int, head: str | None) -> None:
+    """``relay.deploy`` in the audit: the app, fly's exit code and the HEAD deployed. Never
+    the token. A missing store doesn't fail a deploy that already ran."""
+    try:
+        conn = open_existing(settings.db_path, readonly=False)
+    except StoreUnavailableError as e:
+        typer.echo(f"note: not audited ({e})", err=True)
+        return
+    try:
+        with contextlib.closing(conn), atomic(conn):
+            audit(
+                conn,
+                "relay.deploy",
+                requested_by=_CLI_ACTOR,
+                app=app,
+                exit_code=exit_code,
+                head=head,
+            )
+    except sqlite3.Error as e:
+        typer.echo(f"note: not audited ({type(e).__name__})", err=True)
 
 
 # --- model -----------------------------------------------------------------------------
