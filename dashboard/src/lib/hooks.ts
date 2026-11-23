@@ -70,6 +70,50 @@ export function usePolling(load: Loader, intervalMs: number = POLL_MS): PollStat
   return { snapshot, error, loading, refresh };
 }
 
+/** PER-315: the other instances' snapshots are read this often (only the credentials card
+ * uses them; the remote client fetches a body only when its `taken_at` moved). */
+export const PEER_POLL_MS = 60_000;
+
+/** The newest snapshot of each of `peers` (by name), read now and every `intervalMs`. A failed
+ * read keeps that instance's last good one (none at first). */
+export function usePeerSnapshots(
+  peers: { name: string; load: Loader }[],
+  intervalMs: number = PEER_POLL_MS,
+): Record<string, Normalized | null> {
+  const [snaps, setSnaps] = useState<Record<string, Normalized | null>>({});
+  useEffect(() => {
+    if (!peers.length) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ctrl = new AbortController();
+    let alive = true;
+    const tick = async () => {
+      const got = await Promise.all(
+        peers.map(async (p) => {
+          try {
+            return [p.name, await p.load(ctrl.signal)] as const;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (!alive) return;
+      setSnaps((prev) => {
+        const next = { ...prev };
+        for (const hit of got) if (hit) next[hit[0]] = hit[1];
+        return next;
+      });
+      timer = setTimeout(tick, intervalMs);
+    };
+    void tick();
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      ctrl.abort();
+    };
+  }, [peers, intervalMs]);
+  return snaps;
+}
+
 /** The current time, re-read every `intervalMs` so relative times keep moving. */
 export function useNow(intervalMs: number = POLL_MS): number {
   const [now, setNow] = useState(() => Date.now());

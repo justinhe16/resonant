@@ -71,9 +71,14 @@ from resonant.loop.types import Task, TaskStatus
 from resonant.loop.types import WaitReason as TaskWait
 from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
 from resonant.redact import Redactor, clip_text, scrub_rc_links
+from resonant.secret_expiry import Probe as SecretFacts
+from resonant.secret_expiry import days_left as secret_days_left
+from resonant.secret_expiry import entries as secret_entries
+from resonant.secret_expiry import known_refs as secret_known_refs
 from resonant.store import approvals, pulse, questions, repos, runs, system_texts, trust
 from resonant.store import extensions as ext_store
 from resonant.store import jobs as job_store
+from resonant.store import secret_expiry as expiry_store
 from resonant.store import tasks as task_store
 from resonant.store.audit import EVENT_NAME, run_events, task_events
 from resonant.store.claude_brain import recent_tools, tool_counts
@@ -104,6 +109,7 @@ CORE_JOB_ITEMS = 12
 TRUST_RULE_ITEMS = 50
 REPO_ITEMS = 50
 REGISTERED_JOB_ITEMS = 30  # PER-306: the live registered jobs (store.jobs.MAX_JOBS caps them too)
+SECRET_ITEMS = 16  # PER-315: the soonest credential expiries
 RECENT_APPROVALS_DAYS = 7
 RUN_HISTORY = 12  # a run's last audit rows (``run.start``, ``run.ready``, ...)
 TASK_HISTORY = 10
@@ -138,6 +144,9 @@ EffectKind = Literal[
 ]  # fmt: skip
 EffectName = Literal["read", "write", "pay"]
 ApprovalLevel = Literal["L0", "L1", "L2", "L3"]
+# PER-313's expiry sources and PER-314's probe verdicts (kv ``secrets.probe:<ref>``).
+SecretSource = Literal["owner", "assumed", "probe"]
+ProbeState = Literal["ok", "rejected", "unknown"]
 Trimmed = Literal["none", "history", "panels", "lists", "detail", "items"]
 
 # Identifiers: health check names (``model``, ``ext:github``), extension names and job ids (the
@@ -185,6 +194,8 @@ Txt24 = Annotated[str, _txt(24)]
 # monitor's checks it can be ``failing``. Absent while the relay is off.
 RELAY_HEALTH_KV: Final = "health.relay"
 RELAY_CHECK: Final = "relay"
+# PER-314's daily credential probe, per ref: {state, status, at}. Read when present, else None.
+PROBE_KV: Final = "secrets.probe:"
 
 _GIT = "/usr/bin/git"  # SIP-protected; never looked up by name
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -488,6 +499,19 @@ class RegisteredJob(_Model):
     created_by: Txt40  # the creator principal's name
     output: Txt64  # ``thread``, ``dm`` or ``room:<key>``
     outside: list[OutsideName] = _list()  # ``["name"]`` when a member added it
+
+
+class SecretExpiry(_Model):
+    """PER-315: one Keychain ref's expiry (PER-313's ``secret_expiry``, or a known default
+    counted from the item's ``mdat``: ``assumed``). The ref name and dates only: a secret's
+    value is never read for this. ``days_left`` is counted at ``taken_at`` in
+    ``settings.timezone`` (negative once past); ``probe`` is PER-314's last verdict, if any."""
+
+    ref: Txt64
+    expires_at: datetime
+    days_left: int
+    source: SecretSource
+    probe: ProbeState | None = None
 
 
 class SlackStatus(_Model):
@@ -973,6 +997,10 @@ class Snapshot(_Model):
         default_factory=list[RegisteredJob], exclude_if=lambda v: not v
     )
     channels: Channels | None = _omit()
+    # PER-315: credential expiries, soonest first (left out when none is known)
+    secrets: list[SecretExpiry] = Field(
+        default_factory=list[SecretExpiry], exclude_if=lambda v: not v
+    )
 
 
 # --- tiers --------------------------------------------------------------------------------
@@ -1670,6 +1698,7 @@ def build_snapshot(
     diagram: bool = True,
     owner: str | None = None,
     slack: Mapping[str, Any] | None = None,
+    secret_facts: SecretFacts | None = None,
 ) -> Snapshot:
     """The local-tier snapshot (``to_remote`` derives the remote one).
 
@@ -1684,6 +1713,9 @@ def build_snapshot(
     its words marked ``outside`` (its title and label, its run's ask, its approvals' summary
     and changes; PER-304). None (no principals loaded): nothing is marked for that.
     ``slack`` is the live Slack adapter's ``health()`` (PER-306; None: no Slack adapter).
+    ``secret_facts`` is the monitor's cached Keychain presence and ``mdat`` (PER-315,
+    ``SecretsHealth.facts``; names and dates, never a value). None: the stored expiries only,
+    presence unknown.
     """
     now = now or utcnow()
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
@@ -1865,7 +1897,50 @@ def build_snapshot(
         diagram=graph,
         jobs=_registered_jobs(conn, ctx, t),
         channels=_channels(slack),
+        secrets=_secrets(conn, settings, secret_facts, now, t),
     )
+
+
+def _probe_state(conn: sqlite3.Connection, ref: str) -> ProbeState | None:
+    raw: object = kv_get(conn, PROBE_KV + ref)
+    if not isinstance(raw, dict):
+        return None
+    state = cast(dict[str, Any], raw).get("state")
+    return cast(ProbeState, state) if state in get_args(ProbeState) else None
+
+
+def _secrets(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    facts: SecretFacts | None,
+    now: datetime,
+    t: _Text,
+) -> list[SecretExpiry]:
+    """PER-315: every watched ref (an expiry known, the item not known to be missing),
+    soonest first, at most ``SECRET_ITEMS``. Names and dates: nothing is read from the
+    Keychain here."""
+    rows = expiry_store.all(conn)
+    if facts is None and not rows:
+        return []
+    found = secret_entries(
+        secret_known_refs(settings), rows, facts or SecretFacts(present={}, modified={})
+    )
+    watched = sorted(
+        (e for e in found if e.watched), key=lambda e: (cast(datetime, e.expires_at), e.ref)
+    )
+    out: list[SecretExpiry] = []
+    for e in watched[:SECRET_ITEMS]:
+        assert e.expires_at is not None and e.source is not None  # watched: a known expiry
+        out.append(
+            SecretExpiry(
+                ref=t(e.ref, 64),
+                expires_at=e.expires_at,
+                days_left=secret_days_left(e.expires_at, now, settings.timezone),
+                source=e.source,
+                probe=_probe_state(conn, e.ref),
+            )
+        )
+    return out
 
 
 def _registered_jobs(conn: sqlite3.Connection, ctx: _Context, t: _Text) -> list[RegisteredJob]:

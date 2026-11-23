@@ -7,6 +7,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { type Loader, useNow, usePolling } from "@/lib/hooks";
+import { credentialGroups } from "@/lib/credentials";
 import type { DayLoader } from "@/lib/panelDays";
 import { useHashRoute } from "@/lib/route";
 import { staleness, worstHealth } from "@/lib/snapshot";
@@ -14,6 +15,7 @@ import { duration, relative } from "@/lib/time";
 import { useTheme } from "@/lib/theme";
 import { healthTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
+import type { Snapshot } from "@/types";
 import { Claude } from "@/sections/Claude";
 import { Extensions } from "@/sections/Extensions";
 import { Jobs } from "@/sections/Jobs";
@@ -21,7 +23,7 @@ import { Pulse } from "@/sections/Pulse";
 import { RegisteredJobs } from "@/sections/RegisteredJobs";
 import { Rules } from "@/sections/Rules";
 import { Slack } from "@/sections/Slack";
-import { SystemStatus } from "@/sections/SystemStatus";
+import { Credentials, SystemStatus } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
 import { ActiveRuns, ActiveTasks, RecentRuns, Slots, Tasks } from "@/sections/Work";
 
@@ -45,6 +47,7 @@ export function Dashboard({
   onSignOut,
   name,
   switcher,
+  peers,
 }: {
   load: Loader;
   loadDay?: DayLoader;
@@ -53,6 +56,9 @@ export function Dashboard({
   name?: string;
   /** PER-306: the instance switcher, in place of the title */
   switcher?: ReactNode;
+  /** PER-315: every instance in switcher order, for the credentials card; `snap` undefined is
+   * the one shown here (its own snapshot), null one not read yet. Absent: just this one. */
+  peers?: { name: string; snap: Snapshot | null | undefined }[];
 }) {
   const { snapshot: snap, error, loading, refresh } = usePolling(load);
   const now = useNow();
@@ -72,6 +78,11 @@ export function Dashboard({
   const stale = snap ? staleness(snap, now) : null;
   const worst = snap?.health.length ? worstHealth(snap.health.map((h) => h.state)) : "unknown";
   // One bad section shows its own error; the next snapshot retries it.
+  const credentials = snap
+    ? credentialGroups(
+        (peers ?? [{ name: title, snap: undefined }]).map((p) => ({ name: p.name, snap: p.snap === undefined ? snap : p.snap })),
+      )
+    : [];
   const guard = (node: ReactNode) => <ErrorBoundary resetKey={snap?.taken_at ?? ""}>{node}</ErrorBoundary>;
 
   return (
@@ -184,6 +195,7 @@ export function Dashboard({
           >
             <div className="space-y-6" data-testid="column-left">
               {guard(<SystemStatus snap={snap} now={now} stale={stale !== null} />)}
+              {credentials.length > 0 && guard(<Credentials groups={credentials} now={now} />)}
               {snap.channels?.slack && guard(<Slack slack={snap.channels.slack} now={now} />)}
               {guard(<Slots snap={snap} />)}
               {guard(<ActiveRuns snap={snap} now={now} />)}

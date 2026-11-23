@@ -3247,6 +3247,60 @@
       "title": "Runs",
       "type": "object"
     },
+    "SecretExpiry": {
+      "additionalProperties": false,
+      "description": "PER-315: one Keychain ref's expiry (PER-313's ``secret_expiry``, or a known default\ncounted from the item's ``mdat``: ``assumed``). The ref name and dates only: a secret's\nvalue is never read for this. ``days_left`` is counted at ``taken_at`` in\n``settings.timezone`` (negative once past); ``probe`` is PER-314's last verdict, if any.",
+      "properties": {
+        "days_left": {
+          "title": "Days Left",
+          "type": "integer"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "probe": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "rejected",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe"
+        },
+        "ref": {
+          "maxLength": 64,
+          "title": "Ref",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "owner",
+            "assumed",
+            "probe"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref",
+        "expires_at",
+        "days_left",
+        "source"
+      ],
+      "title": "SecretExpiry",
+      "type": "object"
+    },
     "SeriesLine": {
       "additionalProperties": false,
       "properties": {
@@ -4338,6 +4392,13 @@
       "const": 2,
       "title": "Schema",
       "type": "integer"
+    },
+    "secrets": {
+      "items": {
+        "$ref": "#/$defs/SecretExpiry"
+      },
+      "title": "Secrets",
+      "type": "array"
     },
     "slots": {
       "$ref": "#/$defs/Slots"

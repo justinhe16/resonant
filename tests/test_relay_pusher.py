@@ -644,6 +644,26 @@ def test_shrink_steps_are_ordered_deterministic_and_valid(
     assert data == before
 
 
+def test_shrink_never_drops_the_credential_expiries(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-315: ``secrets`` is tiny and the reason for the page on a phone: every step keeps
+    it whole."""
+    from resonant.store import secret_expiry as expiry_rows
+
+    now = utcnow()
+    seed_worst(db, now)
+    for n in range(20):
+        expiry_rows.upsert(db, f"ext{n:02d}/token", expires_at=now + timedelta(days=10 + n),
+                           source="owner", set_at=now)  # fmt: skip
+    data = remote_dump(db, now)
+    assert len(data["secrets"]) == 16
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
+    for stage in _stages(data):
+        assert stage["secrets"] == data["secrets"]
+    assert pusher_mod.shrink(data)["secrets"] == data["secrets"]
+
+
 def test_shrink_stops_at_the_first_step_that_fits(
     db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
