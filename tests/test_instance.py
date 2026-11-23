@@ -293,10 +293,10 @@ def test_secret_list_shows_only_its_own_instance(
     keychain = TwoServiceKeychain(items={("resonant", "github/token"): "x"})
     personal = _secret_list(monkeypatch, keychain, [])
     assert "github/token" in personal and "present" in personal
-    assert "1 of 1 present (service resonant)" in personal
+    assert "1 of 7 present (service resonant)" in personal  # PER-313: + the known core refs
     cori = _secret_list(monkeypatch, keychain, ["--instance", "cori"])
     assert "missing" in cori
-    assert "0 of 1 present (service resonant-cori)" in cori
+    assert "0 of 7 present (service resonant-cori)" in cori
     services = {a[a.index("-s") + 1] for a in keychain.argvs}
     assert services == {"resonant", "resonant-cori"}
 
@@ -309,7 +309,7 @@ def test_a_changed_service_says_which(
     write_cori_config(cori_home, "secrets:\n  service: cori-keys\n")
     keychain = TwoServiceKeychain(items={("resonant-cori", "github/token"): "x"})
     out = _secret_list(monkeypatch, keychain, ["--instance", "cori"])
-    assert "0 of 1 present (service cori-keys)" in out
+    assert "0 of 7 present (service cori-keys)" in out
 
 
 @pytest.mark.parametrize("stated", ["resonant", "resonant-dori"])

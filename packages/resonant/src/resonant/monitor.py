@@ -16,6 +16,11 @@
 - ``store``: the DB is writable and free disk is above ``min_free_bytes`` (2GB).
 - ``backup`` (BK-1, ``resonant.backup.health_check``): a successful daily backup within
   ``backup.alert_after_hours`` (36h). Its detail is the last backup's time.
+- ``secrets`` (PER-313, ``resonant.secret_expiry.SecretsHealth``): ``ok`` (the soonest known
+  expiry, or ``no expiries known``), ``degraded`` when a present secret expires within 7
+  days, ``failing`` once one has expired. The only check with a ``failing`` state, and a
+  silent one (``SILENT_CHECKS``): the daily ``core/secrets`` job owns its alerts, so it never
+  reaches the owner alerts, the notify-owner bridge or the dead-man reason.
 - ``ext:<name>`` (dynamic, one per extension): from ``ext_checks``
   (``extensions.host.ExtensionHealth``): the extension's health command, job fail streaks,
   and load refusals or tampering. A removed extension's check is dropped.
@@ -61,8 +66,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-CheckName = Literal["model", "imessage", "loop", "store", "backup"]
-CHECKS: tuple[CheckName, ...] = ("model", "imessage", "loop", "store", "backup")
+CheckName = Literal["model", "imessage", "loop", "store", "backup", "secrets"]
+CHECKS: tuple[CheckName, ...] = ("model", "imessage", "loop", "store", "backup", "secrets")
+# Checks that only show (the snapshot, the heartbeat): never an owner alert, a bridged
+# incident or a dead-man reason. ``secrets``: the daily job alerts (PER-313).
+SILENT_CHECKS: frozenset[str] = frozenset({"secrets"})
 HEALTH_KV_PREFIX = "health."
 EXT_CHECK_PREFIX = "ext:"
 MODEL_PROBE_KV = "model.probe"  # same key and shape as `resonant model probe`
@@ -85,7 +93,8 @@ _PROBE_FIELDS = (
     "detail",
 )
 
-State = Literal["ok", "degraded", "unknown"]
+# ``failing`` (PER-313): only a check whose result says so (``secrets``: a secret expired).
+State = Literal["ok", "degraded", "failing", "unknown"]
 
 
 def scrub(text: str, limit: int = _MAX_DETAIL) -> str:
@@ -130,6 +139,7 @@ class MonitoredChannel(Protocol):
 class CheckResult:
     ok: bool
     detail: str  # short, code-built; scrubbed before it reaches a message
+    failing: bool = False  # not ok and past degraded (PER-313: only ``secrets`` sets it)
 
 
 @dataclass
@@ -168,7 +178,7 @@ class CheckState:
         state = d.get("state")
         window = d.get("alert_window")
         return cls(
-            state=state if state in ("ok", "degraded") else "unknown",
+            state=state if state in ("ok", "degraded", "failing") else "unknown",
             since=_parse_dt(d.get("since")),
             detail=d["detail"] if isinstance(d.get("detail"), str) else None,
             checked_at=_parse_dt(d.get("checked_at")),
@@ -323,6 +333,7 @@ class HealthMonitor:
         send_failures_for_deadman: int = 3,
         ext_checks: DynamicChecks | None = None,
         backup_check: Callable[[datetime], CheckResult | None] | None = None,
+        secrets_check: Callable[[datetime], Awaitable[CheckResult | None]] | None = None,
         channels: Mapping[str, MonitoredChannel] | None = None,
         channel_failures: Callable[[], Mapping[str, str]] | None = None,
         bridge: OwnerBridge | None = None,
@@ -358,6 +369,7 @@ class HealthMonitor:
         self.max_failed_tasks_1h = max_failed_tasks_1h
         self.ext_checks = ext_checks
         self.backup_check = backup_check
+        self.secrets_check = secrets_check
         self.states: dict[str, CheckState] | None = None  # loaded on first evaluate
         self._model_result: CheckResult | None = None
         self._model_probed_at: datetime | None = None
@@ -398,6 +410,7 @@ class HealthMonitor:
             loop=self._check_loop(now),
             store=self._check_store(),
             backup=self._check_backup(now),
+            secrets=await self._check_secrets(now),
         )
         for name, result in results.items():
             if name not in states:
@@ -451,7 +464,9 @@ class HealthMonitor:
         degraded = [
             (n, s)
             for n, s in self.states.items()
-            if s.state == "degraded" and not n.startswith(EXT_CHECK_PREFIX)
+            if s.state == "degraded"
+            and not n.startswith(EXT_CHECK_PREFIX)
+            and n not in SILENT_CHECKS
         ]
         if not degraded:
             return None
@@ -618,6 +633,14 @@ class HealthMonitor:
         except Exception as e:  # the check must never take the monitor down
             return CheckResult(False, f"backup state unreadable ({type(e).__name__})")
 
+    async def _check_secrets(self, now: datetime) -> CheckResult | None:
+        if self.secrets_check is None:
+            return None
+        try:
+            return await self.secrets_check(now)
+        except Exception as e:  # the check must never take the monitor down
+            return CheckResult(False, f"secret expiries unreadable ({type(e).__name__})")
+
     # --- state machine -------------------------------------------------------------------
 
     def _transition(self, s: CheckState, r: CheckResult, now: datetime, *, count: bool) -> None:
@@ -628,8 +651,9 @@ class HealthMonitor:
             s.detail = r.detail
             s.consecutive = 0
             return
-        if s.state != "degraded":
-            s.state, s.since, s.consecutive = "degraded", now, 0
+        bad: State = "failing" if r.failing else "degraded"
+        if s.state != bad:
+            s.state, s.since, s.consecutive = bad, now, 0
             s.alerted, s.alert_window = False, None
             count = True
         if count:
@@ -654,6 +678,8 @@ class HealthMonitor:
         was = {str(n) for n in cast(list[Any], raw)} if isinstance(raw, list) else set[str]()
         now_bridged = set(was)
         for name, s in states.items():
+            if name in SILENT_CHECKS:
+                continue
             if s.state == "degraded" and s.consecutive >= self.alert_after and name not in was:
                 self.bridge.forward(f"health/{name}", scrub(f"{name}: {s.detail or 'degraded'}"))
                 now_bridged.add(name)
@@ -669,6 +695,8 @@ class HealthMonitor:
             return
         changed = False
         for name, s in states.items():
+            if name in SILENT_CHECKS:
+                continue
             if s.state == "degraded" and not s.alerted and s.consecutive >= self.alert_after:
                 cooled = s.last_alert_at is None or now - s.last_alert_at >= self.alert_cooldown
                 if not cooled:

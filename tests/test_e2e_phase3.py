@@ -357,7 +357,8 @@ async def test_e7_env_dump_only_declared_secret_and_never_stored(
             assert form not in logged, form
             assert form not in returned, form
         assert "other-1234" not in stored + returned  # an undeclared secret is never read
-        refs = [c.argv[c.argv.index("-a") + 1] for c in keychain.calls]
+        # values read: only the declared one (PER-313's health row asks other refs by name)
+        refs = [c.argv[c.argv.index("-a") + 1] for c in keychain.calls if c.argv[-1] == "-w"]
         assert set(refs) == {"example/token"}
 
 

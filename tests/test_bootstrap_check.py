@@ -184,7 +184,7 @@ def test_dry_run_off_fails_without_a_phase2_store(resonant_home: Path) -> None:
     )
     rows = _helper(resonant_home)
     assert rows["dry_run"] == ("FAIL", True, "dry_run off on a pre-Phase-2 install")
-    assert rows["store schema 34"][:2] == ("FAIL", True)
+    assert rows["store schema 35"][:2] == ("FAIL", True)
 
 
 def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
@@ -195,8 +195,8 @@ def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
         LIVE_CONFIG.replace("dry_run: true", "dry_run: false")
     )
     rows = _helper(resonant_home)
-    assert rows["store schema 34"][:2] == ("FAIL", True)
-    assert "v2 < v34" in rows["store schema 34"][2]
+    assert rows["store schema 35"][:2] == ("FAIL", True)
+    assert "v2 < v35" in rows["store schema 35"][2]
     assert rows["dry_run"][:2] == ("FAIL", True)
 
 
@@ -205,7 +205,7 @@ def test_dry_run_off_passes_on_phase2_and_needs_uv(resonant_home: Path, tmp_path
     config = LIVE_CONFIG.replace("dry_run: true", "dry_run: false")
     (resonant_home / "config.yaml").write_text(config)
     rows = _helper(resonant_home)
-    assert rows["store schema 34"][:2] == ("PASS", True)
+    assert rows["store schema 35"][:2] == ("PASS", True)
     assert rows["dry_run"] == ("PASS", True, "false (Phase 2 gate installed)")
     assert rows["ops.uv_path set"][:2] == ("FAIL", True)  # required once ops run for real
 
@@ -872,3 +872,66 @@ def test_coris_claude_config_dir_and_session_env_rows(resonant_home: Path, tmp_p
     assert claude[0] == "FAIL" and "log in" not in claude[3]  # never the owner's login
     assert rows["runner claude config dir"][0] == "FAIL"  # the MCP servers above
     assert rows["runner session env"][0] == "FAIL"
+
+
+def test_expiry_rows_flag_unknown_and_expired(resonant_home: Path) -> None:
+    # PER-313: one row per present secret; unknown is advisory with the command, expired FAILs
+    from resonant import secret_expiry as sx
+    from resonant.store import secret_expiry as expiry_store
+
+    check = _load_helper()
+    settings = load_settings()
+    now = datetime(2026, 11, 23, 18, 0, tzinfo=UTC)
+    conn = open_db(resonant_home / "resonant.db")
+    expiry_store.upsert(conn, "runner/github_token", expires_at=now - timedelta(days=2),
+                        source="owner", set_at=now - timedelta(days=92))  # fmt: skip
+    expiry_store.upsert(conn, "linear/token", expires_at=now + timedelta(days=40),
+                        source="owner", set_at=now)  # fmt: skip
+    expiry_store.upsert(conn, "gone/token", expires_at=now, source="owner", set_at=now)
+    keychain = FakeKeychain(
+        items={
+            ref: "not-a-real-value"
+            for ref in (
+                "runner/github_app_key",
+                "runner/github_token",
+                "runner/claude_token",
+                "linear/token",
+            )
+        }
+    )
+    keychain.modified["runner/claude_token"] = now - timedelta(days=65)
+    store = SecretStore(keychain)
+
+    def probe(refs: list[str]) -> sx.Probe:
+        return asyncio.run(sx.probe(store, refs))
+
+    refs = [*sx.known_refs(settings), "linear/token"]
+    rows = check.expiry_rows(settings, conn, refs, now, probe)
+    assert rows == [
+        ("PASS", False, "secret expiry linear/token", "2027-01-02 (40d, owner)"),
+        ("PASS", False, "secret expiry runner/claude_token", "2027-09-19 (300d, assumed)"),
+        ("FAIL", False, "secret expiry runner/github_app_key",
+         "unknown: resonant secret expiry runner/github_app_key --expires-in <N>d"),
+        ("FAIL", True, "secret expiry runner/github_token",
+         "expired 2d ago: resonant secret set runner/github_token --expires-in 90d"),
+    ]  # fmt: skip
+    assert all("-w" not in c.argv for c in keychain.calls)
+    keychain.fail_with = 36
+    assert check.expiry_rows(settings, conn, refs, now, probe) == [
+        ("FAIL", False, "secret expiry",
+         "unavailable: keychain locked or no user interaction allowed (exit 36); "
+         "presence not checked"),
+    ]  # fmt: skip
+    conn.close()
+    cori_settings = load_settings(home=resonant_home.parent / "cori-home",
+                                  instance={"name": "cori"})  # fmt: skip
+    keychain.fail_with = None
+    cori_store = SecretStore(FakeKeychain(service="resonant-cori",
+                                          items={"runner/github_app_key": "not-a-real-value"}),
+                             service="resonant-cori")  # fmt: skip
+
+    def cori_probe(refs: list[str]) -> sx.Probe:
+        return asyncio.run(sx.probe(cori_store, refs))
+
+    (row,) = check.expiry_rows(cori_settings, None, ["runner/github_app_key"], now, cori_probe)
+    assert "resonant --instance cori secret expiry runner/github_app_key" in row[3]
