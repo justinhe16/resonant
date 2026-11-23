@@ -1459,9 +1459,10 @@ def relay_deploy(
         where = settings.relay.fly_path or "fly or flyctl on PATH, or /opt/homebrew/bin/fly"
         raise _relay_refuse(f"no fly binary ({where}): brew install flyctl, or set relay.fly_path")
     checkout = repo.expanduser().absolute() if repo is not None else settings.ops.repo_path
+    if checkout is None:
+        raise _relay_refuse("no repo: set ops.repo_path or pass --repo")
     if problem := rd.repo_problem(checkout):
         raise _relay_refuse(problem)
-    assert checkout is not None
     ref = rd.FLY_DEPLOY_TOKEN_REF
     store = _secret_store()
     argv = rd.deploy_argv(fly, app_name)
@@ -1493,9 +1494,14 @@ def relay_deploy(
     )
     sha = head.tail.strip() if head.returncode == 0 else None
     typer.echo(f"Deploying {app_name} from {checkout} ({sha[:12] if sha else 'HEAD unknown'})")
-    result = runner.run(
-        argv, cwd=checkout, env=env, timeout_s=rd.DEPLOY_TIMEOUT_S, echo=True, mask=(token,)
-    )
+    try:
+        result = runner.run(
+            argv, cwd=checkout, env=env, timeout_s=rd.DEPLOY_TIMEOUT_S, echo=True, mask=(token,)
+        )
+    except KeyboardInterrupt:
+        typer.echo("error: interrupted; fly deploy stopped", err=True)
+        _audit_relay_deploy(settings, app=app_name, exit_code=rd.EXIT_INTERRUPTED, head=sha)
+        raise typer.Exit(rd.EXIT_INTERRUPTED) from None
     code = result.returncode
     if result.timed_out:
         typer.echo(
@@ -1537,10 +1543,18 @@ def _audit_relay_deploy(settings: Settings, *, app: str, exit_code: int, head: s
     except StoreUnavailableError as e:
         typer.echo(f"note: not audited ({e})", err=True)
         return
-    with contextlib.closing(conn), atomic(conn):
-        audit(
-            conn, "relay.deploy", requested_by=_CLI_ACTOR, app=app, exit_code=exit_code, head=head
-        )
+    try:
+        with contextlib.closing(conn), atomic(conn):
+            audit(
+                conn,
+                "relay.deploy",
+                requested_by=_CLI_ACTOR,
+                app=app,
+                exit_code=exit_code,
+                head=head,
+            )
+    except sqlite3.Error as e:
+        typer.echo(f"note: not audited ({type(e).__name__})", err=True)
 
 
 # --- model -----------------------------------------------------------------------------

@@ -50,6 +50,7 @@ INHERITED_TOKENS: Final = ("FLY_API_TOKEN", "FLY_ACCESS_TOKEN")
 TAIL_LINES: Final = 200
 EXIT_TIMEOUT: Final = 124
 EXIT_NO_START: Final = 127
+EXIT_INTERRUPTED: Final = 130
 # Lower-cased phrases fly prints when it refuses a token; matched only on a non-zero exit.
 AUTH_PHRASES: Final = (
     "unauthorized",
@@ -222,6 +223,12 @@ class SubprocessDeployRunner:
                 if echo:
                     self.out(line)
             proc.wait()
+        except BaseException:
+            # Ctrl-C: fly is in its own session, so the terminal's SIGINT never reaches it
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            raise
         finally:
             timer.cancel()
         return RunResult(proc.returncode, "".join(tail), timed_out.is_set())
@@ -257,10 +264,8 @@ def machine_count(status_json: str) -> int | None:
     return len(cast(list[Any], machines))
 
 
-def repo_problem(repo: Path | None) -> str | None:
+def repo_problem(repo: Path) -> str | None:
     """Why ``repo`` can't be deployed from, or None."""
-    if repo is None:
-        return "no repo: set ops.repo_path or pass --repo"
     if not repo.is_dir():
         return f"repo {repo} is not a directory"
     for rel in (FLY_CONFIG, FLY_DOCKERFILE):

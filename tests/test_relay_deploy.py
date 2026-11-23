@@ -330,3 +330,29 @@ def test_config_validates_fly_app() -> None:
     assert RelayConfig(fly_app="resonant-relay-jhe").fly_app == "resonant-relay-jhe"
     with pytest.raises(ValueError, match="Fly app name"):
         RelayConfig(fly_app="Bad App")
+
+
+@dataclass
+class InterruptedRunner(FakeDeployRunner):
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_s: float,
+        echo: bool,
+        mask: Sequence[str] = (),
+    ) -> rd.RunResult:
+        if argv[1] == "deploy":
+            raise KeyboardInterrupt
+        return super().run(argv, cwd=cwd, env=env, timeout_s=timeout_s, echo=echo, mask=mask)
+
+
+def test_interrupt_is_audited(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = InterruptedRunner()
+    monkeypatch.setattr(cli, "_deploy_runner", lambda: runner)
+    code, out = invoke()
+    assert code == rd.EXIT_INTERRUPTED and "interrupted" in out
+    ((_, detail),) = _audits(env.conn)
+    assert json.loads(detail)["exit_code"] == rd.EXIT_INTERRUPTED
