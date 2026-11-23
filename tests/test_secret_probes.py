@@ -540,3 +540,39 @@ def test_describe_and_list_note() -> None:
         "not probed: no free check"
     )
     assert sp.list_note(sp.Target("x/y", None, why="no probe for this ref"), None) is None
+
+
+async def test_health_stays_failing_through_unknown_and_clears_when_the_ref_goes(
+    db: sqlite3.Connection, resonant_home: Path
+) -> None:
+    s = personal(resonant_home)
+    store, fake = keychain(s, {"linear/token": SENTINEL})
+    api = Api(401)
+    d = delivery(Hub())
+    await sp.watch_probes(db, store, s, d, T0, transport=api.transport)
+    assert sp.rejected_refs(db) == ["linear/token"]
+    api.status = 503  # a timeout or 5xx during the incident doesn't clear it
+    await sp.watch_probes(db, store, s, d, T0 + timedelta(days=1), transport=api.transport)
+    assert sp.rejected_refs(db) == ["linear/token"]
+    fake.fail_with = 36  # a locked Keychain forgets nothing
+    await sp.watch_probes(db, store, s, d, T0 + timedelta(days=2), transport=api.transport)
+    assert sp.rejected_refs(db) == ["linear/token"]
+    fake.fail_with = None
+    del fake.items["linear/token"]  # removed: no stale failing
+    await sp.watch_probes(db, store, s, d, T0 + timedelta(days=3), transport=api.transport)
+    assert sp.rejected_refs(db) == []
+    assert kv_get(db, "secrets.probe:linear/token") is None
+    assert kv_get(db, "secrets.probe_incident:linear/token") is None
+
+
+async def test_an_unexpected_error_is_unknown_and_hides_nothing() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.linear.app":
+            raise RuntimeError("odd")
+        return httpx.Response(401)
+
+    async with sp.client(httpx.MockTransport(handler)) as c:
+        odd = await sp.check(TARGETS["linear"], SENTINEL, c)
+        gh = await sp.check(TARGETS["github"], SENTINEL, c)
+    assert odd == sp.Outcome("unknown", None, "error: RuntimeError")
+    assert gh.state == "rejected"

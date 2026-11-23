@@ -93,6 +93,7 @@ INCIDENT_KV = "secrets.probe_incident:"  # + ref: {since, alerted}
 AUDIT_ACTION = "secrets.probe_alert"
 TIMEOUT_S = 10.0
 USER_AGENT = "resonant-probe"
+LOCKED = "keychain unavailable"  # a Result's why when the Keychain didn't answer
 
 GITHUB_API = "https://api.github.com"
 LINEAR_API = "https://api.linear.app/graphql"
@@ -358,6 +359,8 @@ async def check(target: Target, value: str, client: httpx.AsyncClient) -> Outcom
         return Outcome("unknown", None, "timeout")
     except httpx.HTTPError as e:
         return Outcome("unknown", None, f"network: {type(e).__name__}")
+    except Exception as e:  # one odd ref never hides the others' outcomes; type name only
+        return Outcome("unknown", None, f"error: {type(e).__name__}")
     out = classify(resp, kind)
     if out.state != "ok":
         return out
@@ -394,7 +397,7 @@ async def probe_all(
         if not t.probed:
             continue
         if locked:
-            skipped[t.ref] = "keychain unavailable"
+            skipped[t.ref] = LOCKED
             continue
         try:
             values[t.ref] = await store.get(t.ref)
@@ -402,11 +405,11 @@ async def probe_all(
             skipped[t.ref] = "not set"
         except SecretUnavailable:
             locked = True
-            skipped[t.ref] = "keychain unavailable"
+            skipped[t.ref] = LOCKED
     if locked:
         log.warning("secret probes: keychain unavailable; skipped this run")
         values.clear()
-        skipped.update({t.ref: "keychain unavailable" for t in targets if t.probed})
+        skipped.update({t.ref: LOCKED for t in targets if t.probed})
     outcomes: dict[str, Outcome] = {}
     if values:
         by_ref = {t.ref: t for t in targets}
@@ -445,15 +448,29 @@ def apply_expiry(
 
 
 def record(conn: sqlite3.Connection, results: Iterable[Result], now: datetime) -> None:
-    """Every probed result's kv ``{state, status, at}``, and the expiries the APIs reported."""
+    """Every probed result's kv ``{state, status, at}``, and the expiries the APIs reported.
+    A ref no longer probed (gone from the Keychain, ``off``, no app) loses its kv outcome and
+    any open incident, so an old ``rejected`` never keeps the health row ``failing``; a locked
+    Keychain forgets nothing."""
     with atomic(conn):
         for r in results:
             if r.outcome is None:
+                if r.why != LOCKED:
+                    for prefix in (PROBE_KV, INCIDENT_KV):
+                        conn.execute("DELETE FROM kv WHERE key = ?", (prefix + r.ref,))
                 continue
             o = r.outcome
             kv_set(conn, PROBE_KV + r.ref, {"state": o.state, "status": o.status, "at": iso(now)})
             if o.state == "ok" and o.expires_at is not None:
                 apply_expiry(conn, r.ref, o.expires_at, now)
+
+
+def _stale(conn: sqlite3.Connection, results: Iterable[Result]) -> bool:
+    """Whether a ref not probed now still has a kv outcome or incident (only then write)."""
+    gone = {r.ref for r in results if r.outcome is None}
+    return any(ref in gone for ref in last_states(conn)) or any(
+        _incident(conn, ref) is not None for ref in gone
+    )
 
 
 def last_state(conn: sqlite3.Connection, ref: str) -> dict[str, Any] | None:
@@ -462,8 +479,15 @@ def last_state(conn: sqlite3.Connection, ref: str) -> dict[str, Any] | None:
 
 
 def rejected_refs(conn: sqlite3.Connection) -> list[str]:
-    """Refs whose last probe was ``rejected``, sorted (the health row's ``failing``)."""
-    return [ref for ref, st in last_states(conn).items() if st.get("state") == "rejected"]
+    """Refs still taken as rejected, sorted (the health row's ``failing``): the last probe was
+    ``rejected``, or ``unknown`` during an open incident (a timeout doesn't clear it; ``ok``
+    does)."""
+    out: list[str] = []
+    for ref, st in last_states(conn).items():
+        state = st.get("state")
+        if state == "rejected" or (state == "unknown" and _incident(conn, ref) is not None):
+            out.append(ref)
+    return out
 
 
 def last_states(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -586,8 +610,10 @@ async def watch_probes(
 ) -> list[dict[str, Any]]:
     """The probe step of ``core/secrets``: ``[{ref, state, status, alert?}]`` for every ref
     probed (names only), ``[]`` when none was."""
-    results, _ = await probe_all(store, plan(settings), transport=transport)
+    results, locked = await probe_all(store, plan(settings), transport=transport)
     probed = [r for r in results if r.outcome is not None]
+    if not locked and _stale(conn, results):
+        record(conn, [r for r in results if r.outcome is None], now)
     if not probed:
         return []
     record(conn, probed, now)
