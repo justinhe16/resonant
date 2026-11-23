@@ -358,6 +358,8 @@ class Delivery:
         """True when at least one path took it. Never raises for a channel error."""
         text = alert_text(e, settings, now)
         took = False
+        # The bridge never fails here (it queues and retries on its own), so with a bridge the
+        # alert counts as told even when the room post and the DM failed.
         if self.bridge is not None:
             self.bridge.forward(BRIDGE_KEY + e.ref, bridge_text(e, settings, now))
             took = True
@@ -502,8 +504,8 @@ def health_result(found: Iterable[Entry], now: datetime, tz: str) -> CheckResult
     soonest = watched[0]
     assert soonest.expires_at is not None
     days = days_left(soonest.expires_at, now, tz)
-    expired = [e for e in watched if threshold(days_left(cast(datetime, e.expires_at), now, tz),
-                                               cast(datetime, e.expires_at), now) == 0]  # fmt: skip
+    # failing only once the time has passed; "expires today" is degraded (the alert says it)
+    expired = [e for e in watched if cast(datetime, e.expires_at) <= now]
     if expired:
         names = ", ".join(e.ref for e in expired[:3])
         more = f" +{len(expired) - 3} more" if len(expired) > 3 else ""
