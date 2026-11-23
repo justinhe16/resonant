@@ -297,6 +297,9 @@ def shrink(data: dict[str, Any]) -> dict[str, Any]:
        and the diagram's extension children (core jobs stay).
     5. ``items``: every one of those lists, pending approvals, trust rules and repos emptied;
        the counts, health, extensions and jobs stay.
+
+    No step touches ``secrets`` (PER-315: at most 16 ref names and dates, a few hundred
+    bytes): the credential expiries always reach the relay.
     """
     if data_size(data) <= MAX_BYTES:
         return data

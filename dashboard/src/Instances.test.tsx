@@ -145,6 +145,59 @@ describe("instances on the local page", () => {
   });
 });
 
+const expiry = (ref: string, days: number, source: "owner" | "assumed" = "owner") => ({
+  ref,
+  expires_at: new Date(FIXTURE_NOW.getTime() + days * 86_400_000).toISOString(),
+  days_left: days,
+  source,
+  probe: null,
+});
+
+describe("credentials on the local page (PER-315)", () => {
+  it("shows both instances' expiries side by side", async () => {
+    const mine = clone(local, { secrets: [expiry("runner/claude_token", 300)] });
+    const theirs = clone(cori, { secrets: [expiry("runner/claude_token", 364, "assumed")] });
+    stubFetch({
+      "./config.json": json({ source: "local" }),
+      "/api/dashboard": json(mine),
+      "/api/instances": json(BOTH),
+      "/api/instances/cori/dashboard": json(theirs),
+    });
+    render(<App />);
+    await ready();
+    const coriGroup = await screen.findByTestId("credentials-Cori");
+    expect(coriGroup).toHaveTextContent("runner/claude_token364d (assumed)");
+    expect(screen.getByTestId("credentials-Resonant")).toHaveTextContent("runner/claude_token300d");
+    const card = screen.getByTestId("credentials");
+    expect([...card.querySelectorAll("h3")].map((h) => h.textContent)).toEqual(["Resonant", "Cori"]);
+  });
+
+  it("an old Cori (no secrets field) renders nothing for it; none anywhere means no card", async () => {
+    stubFetch({
+      "./config.json": json({ source: "local" }),
+      "/api/dashboard": json(clone(local, { secrets: [expiry("github/token", 3)] })),
+      "/api/instances": json(BOTH),
+      "/api/instances/cori/dashboard": json(cori),
+    });
+    const first = render(<App />);
+    await ready();
+    expect(await screen.findByTestId("credentials-Resonant")).toHaveTextContent("github/token3d");
+    expect(screen.queryByTestId("credentials-Cori")).not.toBeInTheDocument();
+    first.unmount();
+
+    const f = stubFetch({
+      "./config.json": json({ source: "local" }),
+      "/api/dashboard": json(local),
+      "/api/instances": json(BOTH),
+      "/api/instances/cori/dashboard": json(cori),
+    });
+    render(<App />);
+    await ready();
+    await waitFor(() => expect(f).toHaveBeenCalledWith("/api/instances/cori/dashboard", expect.anything()));
+    expect(screen.queryByTestId("credentials")).not.toBeInTheDocument();
+  });
+});
+
 describe("instances on the remote page", () => {
   function twoRows(rows: Record<string, Snapshot>) {
     const client: RemoteClient = {
@@ -193,6 +246,20 @@ describe("instances on the remote page", () => {
     expect(await screen.findByTestId("stale-banner")).toBeInTheDocument();
     await u.click(within(await switcher()).getByRole("button", { name: "Resonant" }));
     await waitFor(() => expect(screen.queryByTestId("stale-banner")).not.toBeInTheDocument());
+  });
+
+  it("shows both snapshot_latest rows' expiries side by side (PER-315)", async () => {
+    const mine = clone(remote, { secrets: [expiry("relay/supabase_key", 6)] });
+    const theirs = clone(remote, {
+      instance: { name: "cori", display_name: "Cori" },
+      secrets: [expiry("slack/bot_token", 90), expiry("runner/claude_token", 364, "assumed")],
+    });
+    const client = twoRows({ resonant: mine, cori: theirs });
+    render(<SupabaseGate client={client} />);
+    expect(await ready()).toBeInTheDocument();
+    expect(await screen.findByTestId("credentials-Cori")).toHaveTextContent("slack/bot_token90d");
+    expect(screen.getByTestId("credentials-Resonant")).toHaveTextContent("relay/supabase_key6d");
+    expect(client.latest).toHaveBeenCalledWith("cori");
   });
 
   it("one row means no switcher", async () => {

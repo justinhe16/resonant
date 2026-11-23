@@ -652,6 +652,21 @@ export interface Snapshot {
   jobs?: RegisteredJob[];
   /** PER-306: live channel adapters beyond iMessage; absent without one */
   channels?: Channels | null;
+  /** PER-315: credential expiries, soonest first (at most 16); absent when none is known */
+  secrets?: SecretExpiry[];
+}
+
+/** PER-315: one Keychain ref's expiry. The ref name and dates only, never a value. */
+export interface SecretExpiry {
+  /** `runner/claude_token` */
+  ref: string;
+  expires_at: Timestamp;
+  /** calendar days left at `taken_at`, in the daemon's time zone; negative once past */
+  days_left: number;
+  /** who said so: the owner (`--expires`), a default lifetime (`assumed`) or a probe */
+  source: "owner" | "assumed" | "probe";
+  /** PER-314's last check of the credential, when there is one */
+  probe: "ok" | "rejected" | "unknown" | null;
 }
 
 /** PER-298's registered job: cron plus a prompt, one worker run per firing (PER-306). */

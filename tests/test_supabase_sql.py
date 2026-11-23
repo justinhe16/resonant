@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 
 from resonant.config import load_settings
-from resonant.dashboard.snapshot import build_snapshot, to_remote
+from resonant.dashboard.snapshot import Snapshot, build_snapshot, to_remote
 from resonant.redact import SECRET_SQL_FAMILY
 from resonant.store.db import open_db
 
@@ -317,7 +317,10 @@ def test_ingest_stores_the_full_snapshot_as_latest_and_a_slim_history_row(
     # The history row: slim. Health (name, state, since) and counts, and no text.
     assert count(db) == 1
     slim = json.loads(db.ok("select data from public.snapshots;"))
-    assert set(slim) == {"schema", "tier", "taken_at", "version", "slim", "health", "counts"}
+    assert set(slim) == {
+        "schema", "tier", "taken_at", "version", "slim", "health", "counts", "secrets",
+    }  # fmt: skip
+    assert slim["secrets"] == []  # PER-315: none known
     assert slim["slim"] is True and slim["schema"] == 2 and slim["tier"] == "remote"
     assert slim["taken_at"] == remote["taken_at"] and slim["version"] == remote["version"]
     assert slim["health"] == [
@@ -1067,8 +1070,9 @@ def test_status_lists_every_instance_and_keeps_the_old_fields(db: Pg, tmp_path: 
     # Cori has a token but never pushed.
     assert [i["instance"] for i in out["instances"]] == ["cori", "resonant"]
     cori, mine = out["instances"]
-    assert cori == {"instance": "cori", "taken_at": None, "health": []}
-    assert set(mine) == {"instance", "taken_at", "health"}
+    assert cori == {"instance": "cori", "taken_at": None, "health": [], "secrets": []}
+    assert set(mine) == {"instance", "taken_at", "health", "secrets"}
+    assert mine["secrets"] == []  # PER-315: none known
     assert datetime.fromisoformat(mine["taken_at"]) == now and mine["health"] == out["health"]
 
     earlier = now - timedelta(minutes=2)
@@ -1102,6 +1106,81 @@ def test_status_keeps_the_old_fields_when_only_another_instance_pushed(
     assert [i["instance"] for i in out["instances"]] == ["cori", "resonant"]
 
 
+# --- PER-315: credential expiries ------------------------------------------------------------
+
+SECRET_EXPIRY_MIGRATION = (
+    ROOT / "supabase" / "migrations" / "20261123000000_relay_secret_expiry.sql"
+)
+
+
+def _expiries(n: int, now: datetime) -> list[dict[str, Any]]:
+    refs = ["relay/supabase_key", "runner/claude_token", "core/notify_token_cori",
+            "slack/bot_token", "github/token", "linear/token", "runner/github_token"]  # fmt: skip
+    return [
+        {"ref": refs[i], "expires_at": (now + timedelta(days=i)).isoformat(), "days_left": i,
+         "source": "assumed" if i == 1 else "owner", "probe": "ok" if i == 2 else None}
+        for i in range(n)
+    ]  # fmt: skip
+
+
+def test_the_slim_row_and_status_keep_the_soonest_5_expiries(db: Pg, tmp_path: Path) -> None:
+    add_cori(db)
+    now = datetime.now(UTC).replace(microsecond=0)
+    secrets = _expiries(7, now)
+    data = remote_snapshot(tmp_path, taken_at=now.isoformat(), secrets=secrets)
+    Snapshot.model_validate(data)  # a snapshot the daemon could send
+    assert ingest(db, data).ok  # ref names like relay/supabase_key aren't secret-shaped
+    assert latest(db)["secrets"] == secrets  # the page's row: all of them, whole
+    slim = json.loads(db.ok("select data from public.snapshots;"))
+    want = [{k: e[k] for k in ("ref", "expires_at", "days_left")} for e in secrets[:5]]
+    assert slim["secrets"] == want
+    out = json.loads(status(db).out)
+    assert set(out) == {"instances", "taken_at", "health"}  # the old checker's shape
+    cori, mine = out["instances"]
+    assert mine["secrets"] == want
+    assert cori["secrets"] == []  # never pushed
+
+
+def test_an_old_daemons_push_has_no_expiries(db: Pg, tmp_path: Path) -> None:
+    data = remote_snapshot(tmp_path)
+    assert "secrets" not in data  # nothing configured: the key is left out
+    assert ingest(db, data).ok
+    assert json.loads(status(db).out)["instances"][0]["secrets"] == []
+    # A schema 1 push (stored whole) and a bad shape read as none too.
+    db.ok("truncate public.snapshots;")
+    assert ingest(db, v1_snapshot()).ok
+    assert json.loads(status(db).out)["instances"][0]["secrets"] == []
+    db.ok("truncate public.snapshots;")
+    db.ok("""insert into public.snapshots (taken_at, data) values (now(), '{"secrets": 3}');""")
+    assert json.loads(status(db).out)["instances"][0]["secrets"] == []
+
+
+def test_the_expiry_migration_on_the_schema_before_it(tmp_path: Path) -> None:
+    """Applied over PER-304's schema with a row from an old daemon: that row reads as no
+    expiries, the old checker's fields are unchanged, and a new push carries them."""
+    before = [m for m in MIGRATIONS if m.name < SECRET_EXPIRY_MIGRATION.name]
+    assert len(before) == MIGRATIONS.index(SECRET_EXPIRY_MIGRATION)
+    with cluster(before) as db:
+        db.ok(
+            f"update relay_private.config set owner_id = '{OWNER}',"
+            f" status_token_sha256 = decode('{_sha(STATUS)}', 'hex');"
+            "insert into relay_private.ingest_tokens (instance, token_sha256)"
+            f" values ('resonant', decode('{_sha(INGEST)}', 'hex'));"
+        )
+        old = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5)
+        assert ingest(db, remote_snapshot(tmp_path, taken_at=old.isoformat())).ok
+        was = json.loads(status(db).out)
+        assert "secrets" not in was["instances"][0]
+        db.ok(SECRET_EXPIRY_MIGRATION.read_text())
+        out = json.loads(status(db).out)
+        assert (out["taken_at"], out["health"]) == (was["taken_at"], was["health"])
+        assert out["instances"][0]["secrets"] == []
+        assert ingest(db, remote_snapshot(tmp_path, secrets=_expiries(1, old))).ok
+        assert json.loads(status(db).out)["instances"][0]["secrets"][0]["ref"] == (
+            "relay/supabase_key"
+        )
+
+
 # --- the migration on today's schema ---------------------------------------------------------
 
 INSTANCES_MIGRATION = ROOT / "supabase" / "migrations" / "20261120000000_relay_instances.sql"
@@ -1112,7 +1191,9 @@ def test_the_migration_keeps_existing_rows_and_the_token_as_resonant(tmp_path: P
     `resonant`'s, the configured ingest token keeps working (now as `resonant`), and an old
     two-argument push lands there."""
     before = [m for m in MIGRATIONS if m.name < INSTANCES_MIGRATION.name]
-    assert INSTANCES_MIGRATION in MIGRATIONS and len(before) == len(MIGRATIONS) - 1
+    assert INSTANCES_MIGRATION in MIGRATIONS and len(before) == MIGRATIONS.index(
+        INSTANCES_MIGRATION
+    )
     with cluster(before) as db:
         db.ok(
             f"update relay_private.config set owner_id = '{OWNER}',"

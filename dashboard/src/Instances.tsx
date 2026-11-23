@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { Dashboard } from "@/Dashboard";
 import { Explainer } from "@/components/Explainer";
-import type { Loader } from "@/lib/hooks";
+import { type Loader, usePeerSnapshots } from "@/lib/hooks";
 import { type InstanceRef, pickInstance, readChoice, writeChoice } from "@/lib/instances";
 import type { DayLoader } from "@/lib/panelDays";
 import { cn } from "@/lib/utils";
@@ -35,6 +35,19 @@ export function InstanceDashboard({
     () => dayLoaderFor?.(many ? current : (instances[0] ?? null)),
     [dayLoaderFor, many, current, instances],
   );
+  // PER-315: the other instances' newest snapshots, for the credentials card side by side.
+  const others = useMemo(
+    () => (many && current ? instances.filter((i) => i.name !== current.name).map((i) => ({ name: i.name, load: loaderFor(i) })) : []),
+    [many, current, instances, loaderFor],
+  );
+  const peerSnaps = usePeerSnapshots(others);
+  const peers = useMemo(
+    () =>
+      many && current
+        ? instances.map((i) => ({ name: i.display_name, snap: i.name === current.name ? undefined : (peerSnaps[i.name] ?? null) }))
+        : undefined,
+    [many, current, instances, peerSnaps],
+  );
   const pick = useCallback((name: string) => {
     setChoice(name);
     writeChoice(name);
@@ -46,6 +59,7 @@ export function InstanceDashboard({
       loadDay={loadDay}
       onSignOut={onSignOut}
       name={many && current ? current.display_name : undefined}
+      peers={peers}
       switcher={many && current ? <InstanceSwitcher instances={instances} current={current.name} onPick={pick} /> : undefined}
     />
   );

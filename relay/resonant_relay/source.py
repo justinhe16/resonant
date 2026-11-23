@@ -5,8 +5,9 @@ implementations, chosen by RELAY_READ (relay/README.md, "The checker's read path
 
 - `RpcSource` (default, least privilege): calls `public.relay_status(token text)`, a
   SECURITY DEFINER function that checks the token and returns only
-  `{"instances": [{"instance", "taken_at", "health"}, ...], "taken_at", "health"}` (PER-304)
-  or null. The old shape, `{"taken_at", "health"}` alone, still parses, as `resonant`'s.
+  `{"instances": [{"instance", "taken_at", "health", "secrets"}, ...], "taken_at", "health"}`
+  (PER-304; `secrets` since PER-315) or null. The old shape, `{"taken_at", "health"}` alone,
+  still parses, as `resonant`'s, and an entry without `secrets` has none.
 - `TableSource`: reads each instance's newest `snapshots` row with a key whose role can
   SELECT it.
 """
@@ -29,9 +30,21 @@ class ReadError(Exception):
 
 
 @dataclass(frozen=True)
+class Expiry:
+    """PER-315: one credential's expiry as the snapshot counted it (names and dates only)."""
+
+    ref: str
+    expires_at: datetime
+    days_left: int
+
+
+@dataclass(frozen=True)
 class Status:
     taken_at: datetime
     failing: tuple[str, ...]  # names of health rows whose state is "failing"
+    # PER-315: the soonest credential expiries (at most 5). Shown, never alerted on here: the
+    # daemon alerts, and an expired one already shows as a failing `secrets` health row.
+    secrets: tuple[Expiry, ...] = ()
 
 
 # Instance name -> its newest snapshot's status, None for one that never pushed. An
@@ -80,7 +93,31 @@ def parse_status(raw: Any) -> Status | None:
         item: dict[str, Any] = h  # pyright: ignore[reportUnknownVariableType]
         if item.get("state") == "failing":
             failing.append(str(item.get("name", "?"))[:64])
-    return Status(taken_at, tuple(sorted(failing)))
+    return Status(taken_at, tuple(sorted(failing)), parse_secrets(row.get("secrets")))
+
+
+def parse_secrets(raw: Any) -> tuple[Expiry, ...]:
+    """`[{"ref", "expires_at", "days_left"}, ...]` (PER-315), at most 5. Absent (an old
+    answer) or malformed is none, never a ReadError: the expiries are only shown, and a bad
+    one must not stop the dead-man check."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[Expiry] = []
+    for it in raw[:5]:  # pyright: ignore[reportUnknownVariableType]
+        if not isinstance(it, dict):
+            continue
+        e: dict[str, Any] = it  # pyright: ignore[reportUnknownVariableType]
+        ref, at, days = e.get("ref"), e.get("expires_at"), e.get("days_left")
+        if not isinstance(ref, str) or not isinstance(at, str) or type(days) is not int:
+            continue
+        try:
+            when = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            continue
+        out.append(Expiry(ref[:64], when, days))
+    return tuple(out)
 
 
 def parse_statuses(raw: Any) -> Statuses:
