@@ -87,6 +87,12 @@ runner:
     APP_STORE_CONNECT_API_ISSUER_ID: dori/asc_issuer
     APP_STORE_CONNECT_API_KEY_CONTENT: dori/asc_key
 
+# PER-314: the daily credential probes find the Vercel and Supabase tokens by their env var;
+# a Fly token needs the app it may read (`resonant --instance cori secret probe` checks now).
+# secrets:
+#   probes:
+#     dori/fly_staging_token: {kind: fly, app: <the DORI staging Fly app>}
+
 # PER-291: the Claude brain's rules and a read scope with nothing personal in it. read_file,
 # list_dir, search, ask_claude and the brain's shell reads all follow it; a read outside is
 # refused, never asked. A non-default instance's read_roots may not overlap another

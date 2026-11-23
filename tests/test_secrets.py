@@ -696,9 +696,11 @@ def test_cli_list_shows_expiries(
     assert code == 0, out
     lines = {line.split()[0]: line.split(maxsplit=1)[1] for line in out.strip().splitlines()[:-1]}
     assert lines["linear/token"].split() == ["missing", "(expiry", "kept)"]
-    assert lines["runner/github_app_key"].endswith("(100d, owner)")
+    assert lines["runner/github_app_key"].endswith(
+        "(100d, owner) · not probed: no runner.github_app"
+    )  # PER-314: the probe note
     assert lines["runner/github_token"].endswith("expired 2d ago")
-    assert lines["runner/claude_token"].endswith("(365d, assumed)")
+    assert lines["runner/claude_token"].endswith("(365d, assumed) · not probed: no free check")
     assert out.strip().splitlines()[-1] == "3 of 7 present (service resonant)"
 
 

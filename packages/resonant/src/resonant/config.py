@@ -527,6 +527,26 @@ class ExtensionsConfig(_Section):
         return self
 
 
+ProbeKind = Literal[
+    "github", "github_app", "linear", "fly", "vercel", "supabase", "anthropic", "off"
+]
+
+
+class SecretProbeConfig(_Section):
+    """One ``secrets.probes`` entry (PER-314, ``resonant.secret_probes``): which read-only
+    call checks a ref (``off``: never probe it) and, for ``fly``, the app it may read."""
+
+    kind: ProbeKind
+    app: str | None = None
+
+    @field_validator("app")
+    @classmethod
+    def _app(cls, v: str | None) -> str | None:
+        if v is not None and not _FLY_APP.fullmatch(v):
+            raise ValueError("secrets.probes.<ref>.app must be a Fly app name (a-z, 0-9 and -)")
+        return v
+
+
 class SecretsConfig(_Section):
     """Keychain access (``resonant.secrets``). Values are never in config."""
 
@@ -537,6 +557,21 @@ class SecretsConfig(_Section):
     # instance (``resonant``, or ``resonant-<name>``); read it as ``Settings.keychain_service``.
     # A stated one may not be another instance's derived service.
     service: str | None = None
+    # PER-314: per-ref probe overrides and additions, ``{<ref>: {kind, app?}}``. Unlisted refs
+    # get the built-in table (``resonant.secret_probes``); a session_env ref by its env var.
+    probes: dict[str, SecretProbeConfig] = Field(default_factory=dict[str, SecretProbeConfig])
+
+    @field_validator("probes")
+    @classmethod
+    def _probes(cls, v: dict[str, SecretProbeConfig]) -> dict[str, SecretProbeConfig]:
+        from resonant.secrets import InvalidSecretRef, validate_ref
+
+        for ref in v:
+            try:
+                validate_ref(ref)
+            except InvalidSecretRef as e:
+                raise ValueError(f"secrets.probes: {e}") from None
+        return v
 
     @field_validator("service")
     @classmethod

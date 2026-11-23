@@ -1471,6 +1471,7 @@ def secret_list(
     import asyncio
 
     from resonant import secret_expiry as sx
+    from resonant import secret_probes as sp
     from resonant.store import secret_expiry as expiry_store
 
     settings = load_settings()
@@ -1478,6 +1479,7 @@ def secret_list(
     found = sorted(installed.glob("*/resonant.yaml")) if installed.is_dir() else []
     declared = _declared_refs([*found, *(dirs or [])])
     rows: list[expiry_store.ExpiryRow] = []
+    probed: dict[str, dict[str, Any]] = {}  # PER-314: each ref's last probe outcome
     try:
         conn = open_existing(settings.db_path, readonly=True)
     except StoreUnavailableError:
@@ -1485,6 +1487,7 @@ def secret_list(
     else:
         try:
             rows = expiry_store.all(conn)
+            probed = sp.last_states(conn)
         except sqlite3.Error:
             rows = []
         finally:
@@ -1507,12 +1510,59 @@ def secret_list(
             continue
         state = {True: "present", False: "missing", None: "unavailable"}[e.present]
         present += e.present is True
-        typer.echo(f"  {ref:<40} {state:<12} {sx.describe(e, now, settings.timezone)}".rstrip())
+        line = f"  {ref:<40} {state:<12} {sx.describe(e, now, settings.timezone)}"
+        if e.present and (note := sp.list_note(sp.target_for(settings, ref), probed.get(ref))):
+            line += f" · {note}"
+        typer.echo(line.rstrip())
     # PER-297: which Keychain service was asked, so a changed secrets.service explains itself
     typer.echo(f"{present} of {total} present (service {store.service})")
     if unavailable:
         typer.echo(f"error: {facts.reason or 'the keychain did not answer'}", err=True)
         raise typer.Exit(EX_TEMPFAIL)
+
+
+def _probe_transport() -> httpx.AsyncBaseTransport | None:
+    """The probes' HTTP transport: None (the network). Tests swap in an ``httpx.MockTransport``."""
+    return None
+
+
+@secret_app.command("probe")
+def secret_probe(
+    ref: Annotated[
+        str | None, typer.Argument(help="One ref to probe; all probe-able ones by default")
+    ] = None,
+) -> None:
+    """PER-314: one read-only API call per credential: ok, rejected (401), unknown (timeout)
+    or not probed (why). Records the outcome and any expiry the API reports; never alerts and
+    never shows a value. Owner-run. Exit 1 when one was rejected."""
+    import asyncio
+
+    from resonant import secret_probes as sp
+
+    settings = load_settings()
+    one = None if ref is None else _checked_ref(ref)
+    targets = sp.plan(settings) if one is None else [sp.target_for(settings, one)]
+    results, locked = asyncio.run(
+        sp.probe_all(_secret_store(), targets, transport=_probe_transport())
+    )
+    if any(r.outcome is not None for r in results):
+        try:
+            conn = open_existing(settings.db_path)
+        except StoreUnavailableError:
+            typer.echo(f"note: not recorded: the store at {settings.db_path} isn't there",
+                       err=True)  # fmt: skip
+        else:
+            try:
+                sp.record(conn, results, utcnow())
+            finally:
+                conn.close()
+    for r in results:
+        typer.echo(f"  {r.ref:<40} {sp.describe(r)}")
+    if locked:
+        typer.echo("error: the keychain did not answer", err=True)
+        raise typer.Exit(EX_TEMPFAIL)
+    if any(r.outcome is not None and r.outcome.state == "rejected" for r in results):
+        raise typer.Exit(1)
 
 
 @secret_app.command("check")

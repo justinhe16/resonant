@@ -66,6 +66,8 @@ from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.store.secret_expiry import ExpiryRow, Source
 
 if TYPE_CHECKING:
+    import httpx
+
     from resonant.config import Settings
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
@@ -363,25 +365,36 @@ class Delivery:
 
     async def send(self, e: Entry, key: str, settings: Settings, now: datetime) -> bool:
         """True when at least one path took it. Never raises for a channel error."""
-        text = alert_text(e, settings, now)
+        return await self.send_text(
+            key,
+            alert_text(e, settings, now),
+            bridge_key=BRIDGE_KEY + e.ref,
+            bridge_title=bridge_text(e, settings, now),
+        )
+
+    async def send_text(
+        self, key: str, text: str, *, bridge_key: str, bridge_title: str, clear: bool = False
+    ) -> bool:
+        """``text`` to the room and the owner (deduped by ``key``), ``bridge_title`` to
+        personal Resonant (``clear``: the problem is over). True when a path took it."""
         took = False
         # The bridge never fails here (it queues and retries on its own), so with a bridge the
         # alert counts as told even when the room post and the DM failed.
         if self.bridge is not None:
-            self.bridge.forward(BRIDGE_KEY + e.ref, bridge_text(e, settings, now))
+            self.bridge.forward(bridge_key, bridge_title, clear=clear)
             took = True
         if self.rooms is not None and self.room is not None:
             try:
                 await self.rooms.post_room(self.room, text, dedupe_key=f"{key}:room")
                 took = True
             except ChannelError as err:
-                log.warning("secret expiry: room post failed (%s)", type(err).__name__)
+                log.warning("secret alert: room post failed (%s)", type(err).__name__)
         if self.channel is not None and self.owner is not None:
             try:
                 await self.channel.send(self.owner, text, dedupe_key=key)
                 took = True
             except ChannelError as err:
-                log.warning("secret expiry: owner DM failed (%s)", type(err).__name__)
+                log.warning("secret alert: owner DM failed (%s)", type(err).__name__)
         return took
 
 
@@ -429,9 +442,11 @@ def secrets_job(
     *,
     clock: Callable[[], datetime] = utcnow,
     store: SecretStore | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> CoreJob | None:
     """The ``CORE_JOBS`` factory. None when no alert could go anywhere (no owner to DM, no
-    bridge, no room)."""
+    bridge, no room). Each run is the expiry step, then the probe step
+    (``resonant.secret_probes``; ``transport``: tests' ``httpx.MockTransport``)."""
     from resonant.extensions.scheduler import CoreJob
     from resonant.gateway.hub import RoomPosting
 
@@ -452,8 +467,16 @@ def secrets_job(
     )
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
+        from resonant.secret_probes import watch_probes
+
         del args, ctx
-        return await watch(conn, keychain, settings, delivery, clock())
+        out = await watch(conn, keychain, settings, delivery, clock())
+        probes = await watch_probes(
+            conn, keychain, settings, delivery, clock(), transport=transport
+        )
+        if not probes:
+            return out
+        return {**{k: v for k, v in out.items() if k != "quiet"}, "probes": probes}
 
     return CoreJob(
         id=JOB_ID, schedule=SCHEDULE, run=run, catchup=CATCHUP, timeout_s=TIMEOUT_S,
@@ -489,7 +512,12 @@ class SecretsHealth:
         rows = rows_store.all(self.conn)
         refs = frozenset({*known_refs(self.settings), *(r.ref for r in rows)})
         facts = await self._fresh(refs, now)
-        return health_result(entries(refs, rows, facts), now, self.settings.timezone)
+        from resonant.secret_probes import rejected_refs
+
+        return health_result(
+            entries(refs, rows, facts), now, self.settings.timezone,
+            rejected=rejected_refs(self.conn),
+        )  # fmt: skip
 
     async def facts(self, now: datetime) -> Probe:
         """The Keychain facts (presence and ``mdat``, never a value) for every known ref and
@@ -514,23 +542,32 @@ class SecretsHealth:
             return self._facts
 
 
-def health_result(found: Iterable[Entry], now: datetime, tz: str) -> CheckResult:
-    """``failing`` once a watched ref has expired, ``degraded`` within 7 days, else ``ok``
-    with the soonest one (or ``no expiries known``)."""
+def _names(refs: list[str]) -> str:
+    more = f" +{len(refs) - 3} more" if len(refs) > 3 else ""
+    return ", ".join(refs[:3]) + more
+
+
+def health_result(
+    found: Iterable[Entry], now: datetime, tz: str, *, rejected: Iterable[str] = ()
+) -> CheckResult:
+    """``failing`` once a watched ref has expired or a probe was rejected (PER-314),
+    ``degraded`` within 7 days, else ``ok`` with the soonest one (or ``no expiries known``)."""
     from resonant.monitor import CheckResult
 
     watched = sorted((e for e in found if e.watched), key=lambda e: cast(datetime, e.expires_at))
+    # failing only once the time has passed; "expires today" is degraded (the alert says it)
+    expired = [e.ref for e in watched if cast(datetime, e.expires_at) <= now]
+    bad = sorted(rejected)
+    if expired or bad:
+        parts = ([f"expired: {_names(expired)}"] if expired else []) + (
+            [f"{_names(bad)} rejected"] if bad else []
+        )
+        return CheckResult(False, "; ".join(parts), failing=True)
     if not watched:
         return CheckResult(True, "no expiries known")
     soonest = watched[0]
     assert soonest.expires_at is not None
     days = days_left(soonest.expires_at, now, tz)
-    # failing only once the time has passed; "expires today" is degraded (the alert says it)
-    expired = [e for e in watched if cast(datetime, e.expires_at) <= now]
-    if expired:
-        names = ", ".join(e.ref for e in expired[:3])
-        more = f" +{len(expired) - 3} more" if len(expired) > 3 else ""
-        return CheckResult(False, f"expired: {names}{more}", failing=True)
     if days <= DEGRADED_DAYS:
         return CheckResult(False, f"{soonest.ref} expires in {days}d")
     return CheckResult(True, f"soonest {soonest.ref} in {days}d")

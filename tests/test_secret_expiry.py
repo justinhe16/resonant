@@ -350,6 +350,29 @@ async def test_health_ok_degraded_failing(db: sqlite3.Connection, resonant_home:
     assert no_value_reads(fake)
 
 
+# --- probes (PER-314) -------------------------------------------------------------------------
+
+
+async def test_a_probe_row_and_a_rejected_probe_in_the_health_row(
+    db: sqlite3.Connection, resonant_home: Path
+) -> None:
+    from resonant.store.db import kv_set
+
+    s = personal(resonant_home)
+    store, _ = keychain(s, "github/token", "linear/token")
+    rows.upsert(db, "github/token", expires_at=T0 + timedelta(days=40), source="probe", set_at=T0)
+    found, _ = await sx.survey(db, store, sx.known_refs(s))
+    (gh,) = [e for e in found if e.ref == "github/token"]
+    assert sx.describe(gh, T0, s.timezone) == "2027-01-02 (40d, probe)"
+    health = sx.SecretsHealth(db, store, s)
+    assert (await health(T0)).detail == "soonest github/token in 40d"
+    kv_set(db, "secrets.probe:linear/token", {"state": "rejected", "status": 401, "at": "x"})
+    r = await health(T0 + timedelta(minutes=1))
+    assert (r.ok, r.failing, r.detail) == (False, True, "linear/token rejected")
+    kv_set(db, "secrets.probe:linear/token", {"state": "ok", "status": 200, "at": "x"})
+    assert (await health(T0 + timedelta(minutes=2))).ok
+
+
 async def test_health_facts_are_shared_with_the_dashboard(
     db: sqlite3.Connection, resonant_home: Path
 ) -> None:

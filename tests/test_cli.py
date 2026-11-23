@@ -28,3 +28,41 @@ def test_instance_flag_and_env_must_agree(monkeypatch: pytest.MonkeyPatch) -> No
     result = CliRunner().invoke(app, ["--instance", "dori", "status"])
     assert result.exit_code == 2
     assert "disagrees with RESONANT_INSTANCE=cori" in result.output
+
+
+def test_secret_probe_prints_outcomes_never_values(
+    resonant_home: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-314: ``resonant secret probe`` over a FakeKeychain and an httpx.MockTransport."""
+    import httpx
+
+    from resonant import cli
+    from resonant.secrets import FakeKeychain, SecretStore
+
+    value = "s3ntinel-cli-value-0123456789"
+    fake = FakeKeychain(items={"linear/token": value, "github/token": value,
+                               "runner/claude_token": value})  # fmt: skip
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.host == "api.linear.app":
+            return httpx.Response(401)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    monkeypatch.setattr(cli, "_secret_store", lambda: SecretStore(fake))
+    monkeypatch.setattr(cli, "_probe_transport", lambda: httpx.MockTransport(handler))
+    result = CliRunner().invoke(app, ["secret", "probe"])
+    assert result.exit_code == 1, result.output
+    lines = {ln.split(maxsplit=1)[0]: ln.split(maxsplit=1)[1] for ln in result.output.splitlines()}
+    assert lines["linear/token"] == "rejected (401)"
+    assert lines["github/token"] == "unknown (timeout)"
+    assert lines["runner/claude_token"] == "not probed: no free check"
+    assert lines["runner/anthropic_key"] == "not probed: not set"
+    assert value not in result.output and len(seen) == 2
+    one = CliRunner().invoke(app, ["secret", "probe", "runner/claude_token"])
+    assert one.exit_code == 0 and one.output.split() == [
+        "runner/claude_token", "not", "probed:", "no", "free", "check"]  # fmt: skip
+    assert len(seen) == 2
+    bad = CliRunner().invoke(app, ["secret", "probe", "-w"])
+    assert bad.exit_code == 2
