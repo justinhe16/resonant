@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -444,6 +445,36 @@ def test_instance_links_are_loopback_only() -> None:
         Settings.model_validate({**base, "instances": [link, link]})
     with pytest.raises(ValidationError, match="this instance"):
         Settings.model_validate({**base, "instances": [{**link, "name": "resonant"}]})
+
+
+async def test_the_dashboard_lists_present_credential_expiries(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """PER-315: the monitor's cached Keychain facts decide which refs are present; a row
+    whose item is gone is left out, and no value is read."""
+    from datetime import timedelta
+
+    from resonant.secret_expiry import SecretsHealth
+    from resonant.secrets import FakeKeychain, SecretStore
+    from resonant.store import secret_expiry as expiry_rows
+
+    settings = load_settings()
+    fake = FakeKeychain(service=settings.keychain_service, items={"github/token": "not-real"})
+    now = utcnow()
+    for ref in ("github/token", "linear/token"):
+        expiry_rows.upsert(db, ref, expires_at=now + timedelta(days=40), source="owner",
+                           set_at=now)  # fmt: skip
+    check = SecretsHealth(db, SecretStore(fake, service=settings.keychain_service), settings)
+    loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
+    state = DaemonState(settings, db, loop, started_at=now)
+    state.monitor = cast(Any, SimpleNamespace(channels={}, secrets_check=check))
+    async with _client(create_app(state, dashboard_dist=tmp_path)) as client:
+        body = (await client.get("/api/dashboard")).json()
+    assert [(e["ref"], e["source"], e["probe"]) for e in body["secrets"]] == [
+        ("github/token", "owner", None)
+    ]
+    assert "not-real" not in json.dumps(body)
+    assert all("-w" not in c.argv for c in fake.calls)
 
 
 async def test_the_dashboard_carries_the_slack_adapters_state(

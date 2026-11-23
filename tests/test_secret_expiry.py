@@ -348,3 +348,22 @@ async def test_health_ok_degraded_failing(db: sqlite3.Connection, resonant_home:
     r = await health(T0 + timedelta(hours=2))  # re-probed: the expired one is gone
     assert (r.ok, r.failing) == (False, False)
     assert no_value_reads(fake)
+
+
+async def test_health_facts_are_shared_with_the_dashboard(
+    db: sqlite3.Connection, resonant_home: Path
+) -> None:
+    """PER-315: the snapshot reads the same cached Keychain facts as the health row, so a
+    dashboard poll never adds a Keychain call within the hour."""
+    s = personal(resonant_home)
+    store, fake = keychain(s, "github/token")
+    health = sx.SecretsHealth(db, store, s)
+    expire(db, "github/token", T0 + timedelta(days=30))
+    await health(T0)
+    calls = len(fake.calls)
+    facts = await health.facts(T0 + timedelta(minutes=5))
+    assert facts.present["github/token"] is True
+    assert len(fake.calls) == calls
+    later = await health.facts(T0 + timedelta(hours=1))  # stale: probed again
+    assert later.present["github/token"] is True and len(fake.calls) > calls
+    assert no_value_reads(fake)

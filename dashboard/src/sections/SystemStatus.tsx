@@ -1,14 +1,17 @@
 import { ChevronDown, OctagonPause } from "lucide-react";
-import { Ago, Dot, OutsideText, Row, RouteLink, Rows, StateBadge } from "@/components/bits";
+import { Ago, Dot, OutsideText, Row, RouteLink, Rows, Section, StateBadge } from "@/components/bits";
+import type { BadgeTone } from "@/components/ui/badge";
 import { Explainer } from "@/components/Explainer";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Separator } from "@/components/ui/separator";
+import { CREDENTIALS_SHOWN, type CredentialGroup, credentialLabel, credentialTone } from "@/lib/credentials";
 import type { ExplainerKey } from "@/lib/explainers";
 import { isOutside, worstHealth } from "@/lib/snapshot";
 import { duration } from "@/lib/time";
 import { healthTone } from "@/lib/tone";
+import { cn } from "@/lib/utils";
 import type { Snapshot } from "@/types";
 
 /** Health rows with their own explainer (the relay is the dead-man switch). */
@@ -112,5 +115,40 @@ export function SystemStatus({ snap, now, stale }: { snap: Snapshot; now: number
         )}
       </CardContent>
     </Card>
+  );
+}
+
+const TONE_TEXT: Partial<Record<BadgeTone, string>> = { bad: "text-bad", warn: "text-warn-foreground" };
+
+/** The soonest credential expiries of each instance, side by side when there is more than one:
+ * "Resonant: runner/claude_token 300d · Cori: runner/claude_token 364d (assumed)". */
+export function Credentials({ groups, now }: { groups: CredentialGroup[]; now: number }) {
+  return (
+    <Section title="Credentials" explainer="credentials">
+      <div className={cn("grid gap-4", groups.length > 1 && "sm:grid-cols-2")} data-testid="credentials">
+        {groups.map((g) => (
+          <div key={g.name} className="min-w-0" data-testid={`credentials-${g.name}`}>
+            {groups.length > 1 && <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">{g.name}</h3>}
+            <ul className="space-y-1">
+              {g.secrets.slice(0, CREDENTIALS_SHOWN).map((e) => {
+                const tone = credentialTone(e, g.taken_at);
+                return (
+                  <li key={e.ref} className="flex items-center gap-2 text-sm" data-tone={tone}>
+                    <Dot tone={tone} className="size-1.5" />
+                    <span className="min-w-0 truncate font-mono text-xs" title={e.expires_at}>
+                      {e.ref}
+                    </span>
+                    <span className={cn("ml-auto shrink-0 tabular-nums", TONE_TEXT[tone])}>{credentialLabel(e, g.taken_at)}</span>
+                  </li>
+                );
+              })}
+            </ul>
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              <Ago iso={g.taken_at} now={now} prefix="as of " />
+            </p>
+          </div>
+        ))}
+      </div>
+    </Section>
   );
 }

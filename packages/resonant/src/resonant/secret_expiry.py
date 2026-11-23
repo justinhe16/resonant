@@ -35,6 +35,7 @@ alerting. Keychain presence and ``mdat`` are re-read at most hourly; the rows ev
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import sqlite3
@@ -482,21 +483,35 @@ class SecretsHealth:
         self._facts: Probe | None = None
         self._probed_at: datetime | None = None
         self._probed_refs: frozenset[str] = frozenset()
+        self._lock = asyncio.Lock()
 
     async def __call__(self, now: datetime) -> CheckResult:
         rows = rows_store.all(self.conn)
         refs = frozenset({*known_refs(self.settings), *(r.ref for r in rows)})
-        stale = (
-            self._facts is None
-            or self._probed_at is None
-            or now - self._probed_at >= self.refresh
-            or not refs <= self._probed_refs
+        facts = await self._fresh(refs, now)
+        return health_result(entries(refs, rows, facts), now, self.settings.timezone)
+
+    async def facts(self, now: datetime) -> Probe:
+        """The Keychain facts (presence and ``mdat``, never a value) for every known ref and
+        row, re-read at most every ``refresh``: what the dashboard snapshot shows (PER-315)."""
+        rows = rows_store.all(self.conn)
+        return await self._fresh(
+            frozenset({*known_refs(self.settings), *(r.ref for r in rows)}), now
         )
-        if stale:
-            self._facts = await probe(self.store, sorted(refs))
-            self._probed_at, self._probed_refs = now, refs
-        assert self._facts is not None
-        return health_result(entries(refs, rows, self._facts), now, self.settings.timezone)
+
+    async def _fresh(self, refs: frozenset[str], now: datetime) -> Probe:
+        async with self._lock:  # the monitor and a dashboard poll share one probe
+            stale = (
+                self._facts is None
+                or self._probed_at is None
+                or now - self._probed_at >= self.refresh
+                or not refs <= self._probed_refs
+            )
+            if stale:
+                self._facts = await probe(self.store, sorted(refs))
+                self._probed_at, self._probed_refs = now, refs
+            assert self._facts is not None
+            return self._facts
 
 
 def health_result(found: Iterable[Entry], now: datetime, tz: str) -> CheckResult:

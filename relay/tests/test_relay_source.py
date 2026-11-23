@@ -10,6 +10,7 @@ import pytest
 
 from resonant_relay import http
 from resonant_relay.source import (
+    Expiry,
     ReadError,
     RpcSource,
     Status,
@@ -148,6 +149,44 @@ def test_parse_statuses_old_shape_is_personal():
         "resonant": Status(datetime(2026, 10, 16, 12, 0, tzinfo=UTC), ())
     }
     assert parse_statuses(None) == {}
+
+
+def test_parse_statuses_reads_each_instances_expiries():
+    """PER-315: `secrets` per instance when present; an old answer (none) still parses."""
+    got = parse_statuses(
+        {
+            "instances": [
+                {"instance": "cori", "taken_at": "2026-11-23T12:00:00Z", "health": []},
+                {
+                    "instance": "resonant",
+                    "taken_at": "2026-11-23T12:00:00Z",
+                    "health": [{"name": "secrets", "state": "failing"}],
+                    "secrets": [
+                        {"ref": "runner/github_token", "expires_at": "2026-11-21T08:00:00Z",
+                         "days_left": -2},
+                        {"ref": "runner/claude_token", "expires_at": "2027-09-19T07:00:00+00:00",
+                         "days_left": 300},
+                        {"ref": "bad/date", "expires_at": "soon", "days_left": 1},
+                        {"ref": "bad/days", "expires_at": "2027-01-01T00:00:00Z",
+                         "days_left": "1"},
+                        "not an object",
+                    ],
+                },
+            ],
+            "taken_at": "2026-11-23T12:00:00Z",
+            "health": [],
+        }
+    )  # fmt: skip
+    cori, mine = got["cori"], got["resonant"]
+    assert cori is not None and cori.secrets == ()
+    assert mine is not None and mine.failing == ("secrets",)
+    assert mine.secrets == (
+        Expiry("runner/github_token", datetime(2026, 11, 21, 8, 0, tzinfo=UTC), -2),
+        Expiry("runner/claude_token", datetime(2027, 9, 19, 7, 0, tzinfo=UTC), 300),
+    )
+    # A `secrets` that isn't a list is none, not an error: it is only shown.
+    odd = parse_statuses({"taken_at": "2026-11-23T12:00:00Z", "health": [], "secrets": {}})
+    assert odd["resonant"] == Status(datetime(2026, 11, 23, 12, 0, tzinfo=UTC), ())
 
 
 @pytest.mark.parametrize(

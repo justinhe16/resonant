@@ -1816,3 +1816,88 @@ def test_the_instance_proxy_strip_leaves_no_link_or_code(db: sqlite3.Connection)
     del expected["future"]
     del out["future"]
     assert out == expected  # nothing else touched
+
+
+# --- PER-315: credential expiries ----------------------------------------------------------
+
+
+def _keychain(settings: Any, items: dict[str, str]) -> tuple[Any, Any]:
+    from resonant.secrets import FakeKeychain, SecretStore
+
+    fake = FakeKeychain(service=settings.keychain_service, items=dict(items))
+    return SecretStore(fake, service=settings.keychain_service), fake
+
+
+def test_without_expiries_the_dump_is_unchanged(db: sqlite3.Connection) -> None:
+    """Nothing configured: no ``secrets`` key, with or without the monitor's facts."""
+    import asyncio
+
+    from resonant import secret_expiry as sx
+
+    now = utcnow().replace(microsecond=0)
+    settings = load_settings()
+    store, _ = _keychain(settings, {"runner/github_token": "not-a-real-value"})
+    facts = asyncio.run(sx.probe(store, sx.known_refs(settings)))
+    for f in (None, facts):
+        s = build_snapshot(db, settings, started_at=now, now=now, secret_facts=f)
+        assert s.secrets == []
+        assert "secrets" not in s.model_dump(mode="json")
+        assert "secrets" not in to_remote(s).model_dump(mode="json")
+
+
+def test_expiries_present_refs_soonest_first_and_never_a_value(db: sqlite3.Connection) -> None:
+    import asyncio
+
+    from resonant import secret_expiry as sx
+    from resonant.secrets import CLAUDE_TOKEN_REF
+    from resonant.store import secret_expiry as expiry_rows
+
+    now = datetime(2026, 11, 23, 18, 0, tzinfo=UTC)
+    settings = load_settings()
+    values = {CLAUDE_TOKEN_REF: "SENTINEL-claude-value", "relay/supabase_key": "SENTINEL-relay",
+              "runner/github_token": "SENTINEL-github"}  # fmt: skip
+    store, fake = _keychain(settings, values)  # values that must never reach the snapshot
+    fake.modified[CLAUDE_TOKEN_REF] = now - timedelta(days=65)  # assumed: 300 days left
+    expiry_rows.upsert(db, "relay/supabase_key", expires_at=now + timedelta(days=5),
+                       source="owner", set_at=now)  # fmt: skip
+    expiry_rows.upsert(db, "runner/github_token", expires_at=now - timedelta(days=2),
+                       source="probe", set_at=now)  # fmt: skip
+    # A row whose Keychain item is gone is not shown.
+    expiry_rows.upsert(db, "runner/anthropic_key", expires_at=now + timedelta(days=1),
+                       source="owner", set_at=now)  # fmt: skip
+    kv_set(db, snap.PROBE_KV + "runner/github_token", {"state": "rejected", "status": 401,
+                                                       "at": iso(now)})  # fmt: skip
+    kv_set(db, snap.PROBE_KV + "relay/supabase_key", {"state": "bogus"})
+    facts = asyncio.run(sx.probe(store, sorted({*sx.known_refs(settings), "runner/anthropic_key"})))
+    s = build_snapshot(db, settings, started_at=now, now=now, secret_facts=facts)
+    got = [(e.ref, e.days_left, e.source, e.probe) for e in s.secrets]
+    assert got == [
+        ("runner/github_token", -2, "probe", "rejected"),
+        ("relay/supabase_key", 5, "owner", None),
+        (CLAUDE_TOKEN_REF, 300, "assumed", None),
+    ]
+    assert s.secrets[2].expires_at == now + timedelta(days=300)
+    for dump in (s.model_dump_json(), to_remote(s).model_dump_json()):
+        assert "SENTINEL" not in dump
+    assert to_remote(s).secrets == s.secrets  # the same on both tiers
+    assert all("-w" not in c.argv and "-g" not in c.argv for c in fake.calls)
+    # Without the monitor's facts: the stored rows only, presence unknown (so all three).
+    rows_only = build_snapshot(db, settings, started_at=now, now=now)
+    assert [e.ref for e in rows_only.secrets] == [
+        "runner/github_token",
+        "runner/anthropic_key",
+        "relay/supabase_key",
+    ]
+
+
+def test_expiries_keep_the_soonest_sixteen(db: sqlite3.Connection) -> None:
+    from resonant.store import secret_expiry as expiry_rows
+
+    now = datetime(2026, 11, 23, 18, 0, tzinfo=UTC)
+    for n in range(20):
+        expiry_rows.upsert(db, f"ext{n:02d}/token", expires_at=now + timedelta(days=100 - n),
+                           source="owner", set_at=now)  # fmt: skip
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    assert len(s.secrets) == snap.SECRET_ITEMS == 16
+    assert [e.days_left for e in s.secrets] == list(range(81, 97))
+    assert s.secrets[0].ref == "ext19/token"

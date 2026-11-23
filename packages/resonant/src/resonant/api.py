@@ -47,6 +47,8 @@ from resonant.monitor import channels_snapshot
 from resonant.notify_owner import MAX_BODY, bearer, parse_body, token_ref_for
 from resonant.notify_owner import PATH as NOTIFY_OWNER_PATH
 from resonant.redact import Redactor
+from resonant.secret_expiry import Probe as SecretFacts
+from resonant.secret_expiry import SecretsHealth
 from resonant.secrets import SecretError, SecretMissing, SecretStore
 from resonant.status import collect_status
 from resonant.store import extensions as ext_store
@@ -219,7 +221,21 @@ async def local_snapshot(state: DaemonState, *, redactor: Redactor | None = None
         launch_agents=await asyncio.to_thread(cached_scan),  # PER-277's diagram, 60 s cache
         owner=_owner(state),
         slack=_slack_health(state),
+        secret_facts=await _secret_facts(state),
     )
+
+
+async def _secret_facts(state: DaemonState) -> SecretFacts | None:
+    """PER-315: the monitor's cached Keychain presence and ``mdat`` for the expiry refs (names
+    and dates; re-read at most hourly), or None without a monitor (the stored expiries only)."""
+    check: object = getattr(state.monitor, "secrets_check", None)  # None without a monitor
+    if not isinstance(check, SecretsHealth):
+        return None
+    try:
+        return await check.facts(utcnow())
+    except Exception as e:  # the dashboard never fails because of the Keychain
+        log.warning("secret expiry facts failed: %s", type(e).__name__)
+        return None
 
 
 def _slack_health(state: DaemonState) -> dict[str, Any] | None:
