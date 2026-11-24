@@ -122,7 +122,7 @@ def digest_lines(state: Any) -> tuple[list[str], int]:
 def _reports(conn: sqlite3.Connection, sources: list[str], now: datetime) -> tuple[Report, ...]:
     if not sources:
         return ()
-    rank = {s: i for i, s in enumerate(sources)}
+    rank = {s: i for i, s in enumerate(sources) if s != "core"}  # core: the owner's own
     items = [i for i in pulse_store.open_items(conn, now) if i.source in rank]
     items.sort(key=lambda i: (rank[i.source], i.key))
     out: list[Report] = []
@@ -257,6 +257,7 @@ def _drop_unsent(conn: sqlite3.Connection, keep: str) -> None:
     """Abandon every unsent digest record but ``keep``'s: a digest is only worth its own day,
     so one that failed is never posted late next to a newer one."""
     rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
+    rows = [r for r in rows if not str(r[0]).startswith(INFLIGHT + "digest:manual:")]
     stale: list[str] = []
     for (k,) in rows:
         rec: Any = kv_get(conn, k)
@@ -296,7 +297,8 @@ async def send_room_digest(
         return {"posted": False, "date": day, "skipped": "paused"}
     prune_inflight(conn, now, inflight=INFLIGHT)
     key = manual_dedupe_key(local) if manual else dedupe_key(local.date())
-    _drop_unsent(conn, keep=INFLIGHT + key)
+    if not manual:  # an on-demand post never touches the day's scheduled record
+        _drop_unsent(conn, keep=INFLIGHT + key)
     d = gather(conn, settings, now)
     text = render(d)
 

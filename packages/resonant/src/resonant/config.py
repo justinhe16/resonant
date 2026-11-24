@@ -668,8 +668,8 @@ class BriefingConfig(_Section):
     @field_validator("reports")
     @classmethod
     def _reports(cls, v: list[str]) -> list[str]:
-        bad = [n for n in v if not _EXT_NAME.match(n)]
-        if bad:
+        bad = [n for n in v if not _EXT_NAME.match(n) or n == "core"]
+        if bad:  # ``core`` items are the owner's own (notices, worker news): never a room's
             raise ValueError(f"briefing.reports must be extension names: {bad}")
         return v
 

@@ -670,7 +670,7 @@ def test_the_owner_briefing_schedule_is_unchanged_and_days_narrow_it() -> None:
 
 @pytest.mark.parametrize(
     "bad", [{"audience": "team"}, {"audience": "room:Bad Room"}, {"days": "mon"},
-            {"reports": ["Not A Name"]}],
+            {"reports": ["Not A Name"]}, {"reports": ["core"]}],
 )  # fmt: skip
 def test_briefing_room_config_is_checked(bad: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
