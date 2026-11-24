@@ -184,6 +184,9 @@ class NeedsApproval:
     level: Level
     require_code: bool  # L1 (destructive or pay): only "yes <code>" approves
     allow_always: bool = False  # a worker's trust check: "yes always" also adds a rule
+    # PER-318: the one approver whose prompt offers ``yes always`` (the owner); every other
+    # approver's prompt leaves the offer out. None: nobody's does.
+    offer_to: str | None = None
     phrased: bool = False  # PER-268: the summary is the tool's own phrase (a question prompt)
     # PER-300: one arg shown in full under the summary (``summary.detail_text``), built by code
     # from the intent; never stored on the approval row (``/approvals <code>`` has the args).
@@ -293,7 +296,8 @@ class ApprovalReply:
     ``require_code`` approval (L1, pay) is approved only by ``yes <code>``; a plain ``no``
     may deny it. ``always`` (``yes always``) binds like a plain or coded yes, but only to an
     approval that offered it (``allow_always``: a worker's trust check, never
-    ``require_code``); for any other it is refused, never read as a plain yes. ``picks``
+    ``require_code``); for any other it is refused, never read as a plain yes. Only the
+    owner's saves a rule (PER-318): anyone else's is a plain yes (``ResolveResult.once``). ``picks``
     (``yes 1,3``, PER-255) binds only to a batch: those changes are approved and the rest
     rejected, and the code is required when any picked change needs it. Anything else is
     refused with a ``ReplyRefusal`` and Resonant re-asks.
@@ -376,6 +380,9 @@ class ResolveResult:
     # Why it was refused: expired, not an approver, ambiguous, pay needs the exact code, ...
     reason: str | None = None
     resolved: tuple[ResolvedApproval, ...] = field(default=())
+    # PER-318: a ``yes always`` from anyone but the owner, read as a plain yes: it approved
+    # this one action and saved no rule (the router says so).
+    once: bool = False
 
 
 class TokenVerifier(Protocol):

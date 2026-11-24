@@ -69,6 +69,26 @@ def sanitize_external(text: str, max_len: int = 60) -> str:
     return f'"{flat}"'
 
 
+# PER-318: the code-built ``yes always`` notes a summary ends with when its prompt offers one:
+# a tool approval's `` (yes always = <rule>)`` (``gate.policy.ALWAYS_NOTE``), a worker check's
+# ``(<reason>; yes always = <rule>)`` (``trust.checks.check_summary``).
+_TOOL_OFFER = " (yes always = "
+_CHECK_OFFER = "; yes always = "
+
+
+def without_offer(summary: str) -> str:
+    """``summary`` without its trailing ``yes always`` note, for an approver who isn't offered
+    one (PER-318). The note is code-built and last, so only the last match of either form is
+    cut, and only when the summary ends with its ``)``: outside text earlier in the summary can
+    never make it cut more than the note."""
+    if not summary.endswith(")"):
+        return summary
+    tool, check = summary.rfind(_TOOL_OFFER), summary.rfind(_CHECK_OFFER)
+    if check > tool:
+        return summary[:check] + ")"
+    return summary[:tool] if tool >= 0 else summary
+
+
 def approval_text(
     code: str,
     summary: str,

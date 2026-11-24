@@ -10,8 +10,9 @@ Roles (PER-293): ``owner | approver | member``.
 - Exactly one principal has ``role: owner``. The owner can do anything, including
   admin actions (kill switch fan-out, ``/update``, ``/ext``, secrets, editing principals).
 - An ``approver`` may ``request`` and ``approve`` everything: every builtin (global scope)
-  and every extension. Never ``admin``, and never an ``ADMIN_TOOLS`` builtin (``/update``,
-  ``/ext``, ``/pulse``'s tools, the brain shell) from any path.
+  and every extension. Never ``admin``, never an ``ADMIN_TOOLS`` builtin (``/update``,
+  ``/ext``, ``/pulse``'s tools, the brain shell) from any path, and never a ``TRUST_TOOLS``
+  one (PER-318: only the owner changes trust rules; an approver approves one action at a time).
 - A ``member`` can only do what ``grants`` lists. A grant is per extension
   (``{dori: [request]}``: every dori tool) or per tool
   (``{dori: {request: [file_ticket], approve: []}}``: only those tools).
@@ -60,11 +61,13 @@ CLAUDE_GRANT = "claude"
 ADMIN_TOOLS: frozenset[str] = frozenset(
     {"update_resonant", "mute_extension", "list_extensions", "pulse_preview", "shell", "shell_read"}
 )
-# PER-294: trust rules stay instance-wide and only the owner and approvers teach them: a member
-# never requests these builtins, whatever their grants say.
+# PER-294, PER-318: trust rules stay instance-wide and only the owner changes them: no one else
+# (an approver included) requests or approves these builtins, whatever their grants say.
 TRUST_TOOLS: frozenset[str] = frozenset(
     {"add_trust_rule", "allow_trust_rule", "remove_trust_rule", "allow_tools"}
 )
+# The builtins only the owner may request or approve: the gate asks the owner alone for them.
+OWNER_TOOLS: frozenset[str] = ADMIN_TOOLS | TRUST_TOOLS
 # chat.db stores handles as E.164 phone numbers or lowercase emails. Requiring the same form
 # here means a handle can only match by exact string comparison.
 _IMESSAGE_HANDLE = re.compile(
@@ -268,7 +271,7 @@ class Principals(BaseModel):
     ) -> bool:
         """``grant`` is the tool's ``ToolSpec.grant``; it matters only for a global request.
         ``tool`` is the tool's name; it matters for a per-tool grant (without it, a per-tool
-        grant covers nothing) and for an approver's builtin (never an ``ADMIN_TOOLS`` one)."""
+        grant covers nothing) and for an approver's builtin (never an ``OWNER_TOOLS`` one)."""
         p = self.get(principal)
         if p is None:
             return False
@@ -277,7 +280,7 @@ class Principals(BaseModel):
         if action == "admin":
             return False
         if p.role == "approver":
-            return extension is not None or tool not in ADMIN_TOOLS
+            return extension is not None or tool not in OWNER_TOOLS
         if extension is None:
             if action != "request" or grant is None or tool in TRUST_TOOLS:
                 return False

@@ -749,21 +749,24 @@ def available(
     """The commands ``principal`` may use, in registry order.
 
     Owner-only commands need ``admin`` (or an approver, for ``staff`` ones). A builtin
-    command with tools needs each of them registered and requestable; an ``/<ext>`` command
-    needs any of them (per-tool grants). Commands with neither (``/help``) are for everyone.
+    command needs its own tool registered and requestable (PER-318: a subcommand the asker
+    can't request, ``/rules forget`` for an approver, is refused when used), or every tool it
+    can call when it has none of its own; an ``/<ext>`` command needs any of them (per-tool
+    grants). Commands with neither (``/help``) are for everyone.
     """
     out: list[Command] = []
     for c in commands:
         if not allowed(c, principal, principals):
             continue
         # An ``/<ext>`` command shows when any of its tools may be requested (PER-293:
-        # per-tool grants); a builtin command needs every tool it can call.
+        # per-tool grants); a builtin command needs its own tool (else every tool it can call).
         check = all if c.extension is None else any
+        tools = (c.tool,) if c.extension is None and c.tool is not None else c.tools
         if not check(
             can_request(
                 principal, t, principals=principals, registry=registry, extension=c.extension
             )
-            for t in c.tools
+            for t in tools
         ):
             continue
         out.append(c)

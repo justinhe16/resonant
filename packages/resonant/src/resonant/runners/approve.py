@@ -13,6 +13,9 @@ system text the brains see, PER-268):
   fails for good.
 - PER-292: the prompt to the asking task's own principal goes to that task's thread
   (``thread_of``); every other approver gets it in their own conversation.
+- PER-318: a prompt that offers ``yes always`` offers it to ``NeedsApproval.offer_to`` (the
+  owner) alone: every other approver gets it as a plain yes / no, the summary's code-built
+  ``yes always`` note cut (``gate.codes.without_offer``). Only the owner widens trust.
 - PER-294: ``in_thread`` overrides that pair: a worker's trust check goes to the run's thread,
   addressed to the run's requester (``trust.checks``); a worker's ``resonant request`` too
   (PER-296, ``runners.worker_requests``), addressed to an approver.
@@ -35,6 +38,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from resonant.gate import ApprovalBatch, NeedsApproval
+from resonant.gate.codes import without_offer
 from resonant.gateway.channel import (
     ApprovalPrompt,
     Channel,
@@ -123,9 +127,13 @@ async def prompt_approvers(
     prompt = approval_prompt(decision)
     if summary is not None:
         prompt = replace(prompt, summary=summary, phrased=False)
+    others = None
+    if prompt.always:  # PER-318: the offer is the owner's alone
+        others = replace(prompt, always=False, summary=without_offer(prompt.summary))
     return await _prompt(
         conn, channel, prompt, decision.approvers, (decision.approval_id,),
         task_id=task_id, now=now, in_thread=in_thread,
+        others=None if others is None else (decision.offer_to, others),
     )  # fmt: skip
 
 
@@ -174,7 +182,9 @@ async def _prompt(
     task_id: str | None,
     now: Callable[[], datetime],
     in_thread: tuple[str, MessageRef] | None = None,
+    others: tuple[str | None, ApprovalPrompt] | None = None,
 ) -> PromptResult:
+    """``others`` (PER-318): ``(offer_to, plain)``: everyone but ``offer_to`` gets ``plain``."""
     reached: list[str] = []
     unreachable: list[str] = []
     error: ChannelError | None = None
@@ -184,10 +194,13 @@ async def _prompt(
     if in_thread is not None:
         whose, thread = in_thread
     for approver in approvers:
+        theirs = prompt
+        if others is not None and approver != others[0]:
+            theirs = others[1]
         try:
             mine = thread is not None and approver == whose
             ref = await channel.request_approval(
-                approver, replace(prompt, thread=thread) if mine else prompt
+                approver, replace(theirs, thread=thread) if mine else theirs
             )
         except ChannelRefused as e:
             unreachable.append(approver)
@@ -214,7 +227,7 @@ async def _prompt(
         # tainted task's args were chosen after outside content, so only a fixed line
         key = approval_dedupe_key(prompt.approval_id, approver)
         outside = asking is not None and system_texts.tainted(asking.checkpoint)
-        system_texts.record(conn, approver, "approval", prompt.text(), ref=key, task_id=task_id,
+        system_texts.record(conn, approver, "approval", theirs.text(), ref=key, task_id=task_id,
                             now=at, outside=outside)  # fmt: skip
     return PromptResult(tuple(reached), tuple(unreachable), error)
 
