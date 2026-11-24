@@ -193,6 +193,7 @@ ap.add_argument("--urgent-note")
 ap.add_argument("--check")
 ap.add_argument("--check-flag", action="append", default=[])
 ap.add_argument("--request", action="append", default=[])  # "ext.tool k=v ..." (PER-296)
+ap.add_argument("--job-note")  # PER-302: `resonant job-note '<json>'` after the requests
 ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
 ap.add_argument("--bash", action="append", default=[])  # Bash tool calls shown, not run (TR-1)
@@ -452,6 +453,8 @@ def first_steps() -> bool:
         if rc != 0:
             result(f"Didn't: {text.strip()[:80]}")
             return False
+    if args.job_note:
+        cli("job-note", args.job_note)
     if args.wait_message:
         end = time.time() + args.wait_message
         while time.time() < end:

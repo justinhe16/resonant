@@ -494,7 +494,7 @@ def is_outside(items: Sequence[store.Item]) -> bool:
 def text_kind(key: str) -> system_texts.Kind:
     """The system text kind of a delivery's dedupe key: ``briefing:…``, ``heartbeat:…`` or
     the pulse's."""
-    if key.startswith("briefing:"):
+    if key.startswith(("briefing:", "digest:")):  # digest: PER-302's room digest
         return "briefing"
     return "heartbeat" if key.startswith("heartbeat:") else "pulse"
 
@@ -731,7 +731,11 @@ async def send_pulse(
     if _paused(conn):
         return {"sent": False, "count": 0, "skipped": "paused"}
     if not manual:
-        if settings.briefing.enabled and local.hour == settings.briefing.local_time.hour:
+        if (
+            settings.briefing.enabled
+            and settings.briefing.room is None  # PER-302: a room digest isn't the owner's
+            and local.hour == settings.briefing.local_time.hour
+        ):
             return {"sent": False, "count": 0, "skipped": "briefing"}
         if settings.pulse.in_quiet(local.time()):
             return {"sent": False, "count": 0, "skipped": "quiet"}

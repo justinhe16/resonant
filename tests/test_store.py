@@ -216,7 +216,7 @@ def test_migration_035_adds_secret_expiry_on_a_v34_db(tmp_path: Path) -> None:
     every = _migrations()
     assert migrate(raw, [m for m in every if m[0] <= 34]) == 34
     raw.execute("INSERT INTO kv (key, value, updated_at) VALUES ('k', '1', 'x')")
-    assert migrate(raw, every) == 35
+    assert migrate(raw, every) == 36
     cols = [r["name"] for r in raw.execute("PRAGMA table_info(secret_expiry)")]
     assert cols == ["ref", "expires_at", "source", "set_at", "note"]  # no value column, ever
     raw.execute("INSERT INTO secret_expiry VALUES ('a/b', 'x', 'owner', 'x', NULL)")
@@ -227,4 +227,32 @@ def test_migration_035_adds_secret_expiry_on_a_v34_db(tmp_path: Path) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         raw.execute("INSERT INTO secret_expiry VALUES ('a/b', 'y', 'owner', 'y', NULL)")
     assert kv_get(raw, "k") == 1
+    raw.close()
+
+
+def test_migration_036_keeps_a_reports_state(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from resonant.store import pulse as pulse_store
+    from resonant.store.db import _migrations  # pyright: ignore[reportPrivateUsage]
+
+    raw = sqlite3.connect(tmp_path / "v35.db", isolation_level=None)
+    raw.row_factory = sqlite3.Row
+    every = _migrations()
+    assert migrate(raw, [m for m in every if m[0] <= 35]) == 35
+    raw.execute(
+        "INSERT INTO pulse_items (source, key, title, urgency, fingerprint, cleared, updated_at,"
+        " expires_at) VALUES ('a', 'k', 't', 'low', 'f', 0, '2026-11-22T00:00:00+00:00',"
+        " '2026-11-24T00:00:00+00:00')"
+    )
+    assert migrate(raw, every) == 36
+    old = pulse_store.get(raw, "a", "k")
+    assert old is not None and old.state is None
+    now = datetime(2026, 11, 23, tzinfo=UTC)
+    state = {"digest": ["one", "two"], "n": 2}
+    _, item = pulse_store.upsert(raw, "a", "k2", "t", "low", state, False, 60, now)
+    assert item.state == state
+    assert {item} == {item}  # still hashable: the rollup keeps Items in sets
+    _, item = pulse_store.upsert(raw, "a", "k2", "t", "low", None, False, 60, now)
+    assert item.state is None
     raw.close()

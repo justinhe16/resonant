@@ -143,6 +143,9 @@ async def test_skips_the_briefing_hour_and_keeps_items_for_the_next_pulse() -> N
     async with harness(briefing={"enabled": False}) as h:
         report(h, "a", "k", "x")
         assert (await pulse(h, local(10, 13, 8)))["sent"] is True  # no briefing to cover it
+    async with harness(briefing={"audience": "room:digest"}) as h:  # PER-302
+        report(h, "a", "k", "x")
+        assert (await pulse(h, local(10, 13, 8)))["sent"] is True  # the room's isn't the owner's
 
 
 async def test_quiet_hours_hold_everything_until_six() -> None:
