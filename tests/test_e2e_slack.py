@@ -29,9 +29,13 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import BaseModel
 from test_e2e_runner import (
     REPO,
     FakeChatDB,
@@ -44,14 +48,18 @@ from test_e2e_runner import (
 )
 from test_runner_claude import until
 
+from resonant import registered_jobs
 from resonant.config import ChannelsConfig, PulseConfig
 from resonant.daemon import Daemon
 from resonant.e2e.extensions import install_fixture
 from resonant.executor import CallContext
+from resonant.extensions.briefing import briefing_job
+from resonant.extensions.cron import parse_schedule
 from resonant.extensions.pulse_job import pulse_job
 from resonant.extensions.scheduler import CoreDeps
 from resonant.gateway.slack import SlackChannel
 from resonant.gateway.slack import channel as slack_module
+from resonant.gateway.slack.client import SlackCallError
 from resonant.gateway.slack.fixtures import (
     FakeSlackSocket,
     FakeSlackTransport,
@@ -65,6 +73,7 @@ from resonant.ops.fakes import FakeOpsRunner
 from resonant.secrets import SecretStore
 from resonant.store import approvals as ap
 from resonant.store import jobs as jobs_store
+from resonant.store import pulse as pulse_store
 from resonant.store.db import open_db
 from resonant.tools.notes import SCOPE as NOTES_SCOPE
 
@@ -111,8 +120,11 @@ async def slack_daemon(
     *,
     heartbeat: bool = False,
     tick_s: float | None = None,
+    fixture: tuple[str, dict[str, str]] | None = None,
+    config: dict[str, object] | None = None,
 ) -> AsyncGenerator[tuple[World, Daemon, FakeSlackWeb, FakeSlackSocket]]:
-    """``extra``: the fake worker's options; with them the dori extension is installed too."""
+    """``extra``: the fake worker's options; with them the fixture extension is installed too
+    (``fixture``: its manifest and files, PER-302). ``config``: more settings sections."""
     w = make_world(tmp_path, home, chat, mp, scenario="happy", runner_opts={"ask_block_s": 0.5},
                    extra=extra or [])  # fmt: skip
     (home / "principals.yaml").write_text(PRINCIPALS)
@@ -131,6 +143,10 @@ async def slack_daemon(
         update["pulse"] = PulseConfig.model_validate({"heartbeat": {"room": "pulse"}})
     if tick_s is not None:  # a button click resolves the gate without waking the loop
         update["loop"] = w.settings.loop.model_copy(update={"tick_s": tick_s})
+    if config:
+        for k, v in config.items():
+            section = cast(BaseModel, getattr(w.settings, k))
+            update[k] = type(section).model_validate(v)
     w.settings = w.settings.model_copy(update=update)
     w.keychain.items.update(
         {"slack/bot_token": "xoxb-e2e-fake", "slack/app_token": "xapp-e2e-fake"}
@@ -138,7 +154,8 @@ async def slack_daemon(
     if extra:
         conn = open_db(w.settings.db_path)
         try:
-            install_fixture(w.settings, conn, DORI, {"cli.py": DORI_CLI})
+            manifest, files = fixture or (DORI, {"cli.py": DORI_CLI})
+            install_fixture(w.settings, conn, manifest, files)
         finally:
             conn.close()
     web, socket = FakeSlackWeb(team_id=TEAM_ID, bot_user_id=BOT), FakeSlackSocket()
@@ -662,3 +679,119 @@ async def test_a_workers_request_is_approved_in_the_runs_thread_and_runs_once(
             "Your request (dori.prod_deploy commit=abc): Approved by Brian: Done: "
         ), prompts[1]
         assert '"version": "v142"' in prompts[1]
+
+
+# --- PER-302: the room digest and a seeded weekly job ---------------------------------------
+
+ACME = """\
+name: acme
+version: 1
+description: A team's tickets (a test fixture).
+tools:
+  file_ticket:
+    description: File a ticket.
+    run: ./cli.py {title} {description}
+    effect: write
+    level: L3
+    args: {title: string, description: string}
+    worker_requestable: true
+"""
+ACME_CLI = r"""
+import json, os, sys
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tickets.log"), "a") as f:
+    f.write(sys.argv[1] + "\n")
+print(json.dumps({"filed": "T-" + str(len(sys.argv[1]))}))
+"""
+SCAN = {
+    "seed": [
+        {
+            "key": "weekly-scan",
+            "name": "weekly improvement scan",
+            "schedule": "0 8 * * 1",
+            "output": "room:digest",
+            "prompt": "Find flaky CI, stale tickets and security gaps; file at most 10 tickets.",
+        }
+    ]
+}
+
+
+async def test_the_seeded_weekly_scan_files_tickets_and_reports_in_the_room(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Monday 08:00 (a fake clock) -> the seeded job's run -> two fake tickets through
+    ``resonant request`` -> its summary in the digest room, its seen keys saved."""
+    extra = [
+        "--request", "acme.file_ticket title=flaky-ci description=retried-3x",
+        "--request", "acme.file_ticket title=stale-ticket description=no-update",
+        "--job-note", '{"seen": ["ci:web:test_login"]}',
+    ]  # fmt: skip
+    async with slack_daemon(
+        tmp_path, resonant_home, chat, monkeypatch, extra, fixture=(ACME, {"cli.py": ACME_CLI}),
+        config={"jobs": SCAN},
+    ) as (w, d, web, _socket):  # fmt: skip
+        (job,) = jobs_store.live(d.conn)  # seeded on the first start, as the owner
+        assert (job.id, job.name, job.output, job.created_by) == (
+            "J1", "weekly improvement scan", "room:digest", "justin"
+        )  # fmt: skip
+        assert job.last_due is not None
+        monday = parse_schedule(job.schedule, job.tz).next_after(job.last_due)
+        assert monday is not None and monday.astimezone(ZoneInfo(job.tz)).weekday() == 0
+        c = d.state.components
+        assert c is not None and d.stack is not None
+        out = await registered_jobs.tick(
+            d.conn, monday + timedelta(seconds=30), runner=cast(Any, c.runners["claude"]),
+            principals=c.principals, channel=d.stack.channel,
+        )  # fmt: skip
+        assert out["started"] == 1
+        await until(lambda: not w.run("R1").active, 60, "R1 to end")
+        tickets = (w.settings.extensions_dir / "acme" / "tickets.log").read_text().splitlines()
+        assert tickets == ["flaky-ci", "stale-ticket"]
+        await until(
+            lambda: any(p.channel == "C0DIGEST" and p.text.startswith("R1") for p in web.posts),
+            60,
+            "the run's summary in the digest room",
+        )
+        after = jobs_store.get(d.conn, "J1")
+        assert after is not None and after.seen == ("ci:web:test_login",)
+
+
+async def test_the_room_digest_posts_once_and_a_lost_room_tells_the_owner_once(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    briefing = {"audience": "room:digest", "at": "09:00", "days": "1-5", "reports": ["acme"]}
+    async with slack_daemon(
+        tmp_path, resonant_home, chat, monkeypatch, config={"briefing": briefing}
+    ) as (_w, d, web, _socket):
+        c = d.state.components
+        assert c is not None and d.stack is not None
+        now = datetime.now(UTC)
+        pulse_store.upsert(
+            d.conn, "acme", "acme/digest", "Acme, last 24h: 2 PRs merged", "low",
+            {"digest": ["Merged: web #12 Fix login", "Deploys: 1 prod"]}, False, 86400, now,
+        )  # fmt: skip
+        job = briefing_job(CoreDeps(d.settings, d.conn, c, d.stack.channel, "justin"))
+        assert job is not None and job.schedule == "0 9 * * 1-5"
+        ctx = CallContext(secrets={}, idempotency_key="e2e", task_id="e2e")
+        due = {"due_at": "2026-11-23T17:00:00+00:00"}  # Monday 09:00 in Los Angeles
+        out = await job.run(due, ctx)
+        assert out["posted"] is True and out["date"] == "2026-11-23"
+        (post,) = [p for p in web.posts if p.channel == "C0DIGEST"]
+        assert post.text.splitlines() == [
+            "Acme, last 24h: 2 PRs merged",
+            "• Merged: web #12 Fix login",
+            "• Deploys: 1 prod",
+        ]
+        assert (await job.run(due, ctx))["skipped"] == "duplicate"
+        assert len([p for p in web.posts if p.channel == "C0DIGEST"]) == 1
+
+        # the bot was removed from the room: one DM to the owner, however often it fails
+        for day in ("2026-11-24", "2026-11-25"):
+            web.fail("chat.postMessage", SlackCallError("chat.postMessage", "not_in_channel"))
+            out = await job.run({"due_at": f"{day}T17:00:00+00:00"}, ctx)
+            assert out["skipped"] == "failed"
+        dms = [p for p in web.posts if p.channel != "C0DIGEST" and "daily digest" in p.text]
+        assert len(dms) == 1 and "not_in_channel" in dms[0].text
+        assert (
+            "room digest: chat.postMessage failed: not_in_channel"
+            in (d.stack.channel.health()["adapters"]["slack"]["detail"])
+        )

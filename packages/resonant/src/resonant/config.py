@@ -415,6 +415,40 @@ class TrustConfig(_Section):
     cost_ask_over_usd: float = Field(default=20.0, ge=0, allow_inf_nan=False)
 
 
+class SeedJob(_Section):
+    """One ``jobs.seed`` entry (PER-302): a registered job the daemon adds once, as the
+    owner, on its first start with it. ``key`` names the seed for good: once added it is
+    never added again, even after the job is deleted."""
+
+    key: str = Field(pattern=r"^[a-z][a-z0-9-]{0,47}$")
+    name: str = Field(min_length=1, max_length=60)
+    schedule: str = Field(min_length=9, max_length=100)  # five-field cron, settings.timezone
+    prompt: str = Field(min_length=1, max_length=2000)
+    repo: str | None = None  # a registered repo's name; None: a scratch run
+    output: str = "dm"  # dm (the owner) or room:<channels.slack.rooms key>
+
+    @field_validator("output")
+    @classmethod
+    def _output(cls, v: str) -> str:
+        if v != "dm" and not (v.startswith("room:") and _ROOM_KEY.match(v[5:])):
+            raise ValueError("jobs.seed output must be dm or room:<channels.slack.rooms key>")
+        return v
+
+
+class JobsConfig(_Section):
+    """Registered jobs config (PER-298's runtime jobs live in the store). ``seed`` (PER-302):
+    jobs the daemon adds once at start (``registered_jobs.seed``)."""
+
+    seed: list[SeedJob] = Field(default_factory=list[SeedJob], max_length=10)
+
+    @model_validator(mode="after")
+    def _unique(self) -> Self:
+        keys = [s.key for s in self.seed]
+        if len(set(keys)) != len(keys):
+            raise ValueError("jobs.seed: each key at most once")
+        return self
+
+
 class WatchersConfig(_Section):
     """Channel watchers (PER-299, ``resonant/channel_watchers.py``): registered jobs that
     start a run per matching Slack message."""
@@ -589,12 +623,26 @@ class SecretsConfig(_Section):
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
+_EXT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")  # resonant_sdk.manifest.SLUG
+_DAYS = re.compile(r"^(\*|[0-7](-[0-7])?(,[0-7](-[0-7])?)*)$")
+
+
 class BriefingConfig(_Section):
-    """The core daily briefing (``core/briefing``), sent to the owner once a day."""
+    """The core daily briefing (``core/briefing``), sent once a day: to the owner (the
+    default), or, with ``audience: room:<key>`` (PER-302), as the team's digest posted to a
+    room (``channels.slack.rooms.<key>``) instead."""
 
     enabled: bool = True
     # Local time in `settings.timezone`, 24-hour "HH:MM".
     at: str = "08:00"
+    # The cron day-of-week field: "*" every day (the default), "1-5" weekdays, "1,3,5".
+    days: str = "*"
+    # PER-302: ``owner`` (the personal briefing, unchanged) or ``room:<key>`` (the room digest:
+    # no reminders, notes or facts; runs, approvals and the listed extensions' reports).
+    audience: str = "owner"
+    # PER-302: the extensions whose open reports the room digest shows (title, then the
+    # report's ``state.digest`` lines). Unlisted extensions never reach the room.
+    reports: list[str] = Field(default_factory=list[str], max_length=10)
 
     @field_validator("at")
     @classmethod
@@ -602,6 +650,33 @@ class BriefingConfig(_Section):
         if not _HHMM.fullmatch(v):
             raise ValueError('briefing.at must be 24-hour "HH:MM", e.g. "08:00"')
         return v
+
+    @field_validator("days")
+    @classmethod
+    def _days(cls, v: str) -> str:
+        if not _DAYS.fullmatch(v):
+            raise ValueError('briefing.days must be a cron day-of-week field: "*", "1-5", "1,3"')
+        return v
+
+    @field_validator("audience")
+    @classmethod
+    def _audience(cls, v: str) -> str:
+        if v != "owner" and not (v.startswith("room:") and _ROOM_KEY.match(v[5:])):
+            raise ValueError("briefing.audience must be owner or room:<channels.slack.rooms key>")
+        return v
+
+    @field_validator("reports")
+    @classmethod
+    def _reports(cls, v: list[str]) -> list[str]:
+        bad = [n for n in v if not _EXT_NAME.match(n) or n == "core"]
+        if bad:  # ``core`` items are the owner's own (notices, worker news): never a room's
+            raise ValueError(f"briefing.reports must be extension names: {bad}")
+        return v
+
+    @property
+    def room(self) -> str | None:
+        """The room key of a ``room:<key>`` audience, else None (the owner's briefing)."""
+        return self.audience[5:] if self.audience.startswith("room:") else None
 
     @property
     def local_time(self) -> time:
@@ -1362,6 +1437,7 @@ class Settings(BaseSettings):
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     trust: TrustConfig = Field(default_factory=TrustConfig)
     watchers: WatchersConfig = Field(default_factory=WatchersConfig)  # PER-299
+    jobs: JobsConfig = Field(default_factory=JobsConfig)  # PER-302: seeded jobs
     brain: BrainConfig = Field(default_factory=BrainConfig)
     # PER-301: another instance's bridge to personal Resonant (None: no forwarding)
     notify_owner: NotifyOwnerConfig | None = None

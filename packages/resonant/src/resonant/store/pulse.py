@@ -30,7 +30,9 @@ The fingerprint hashes ``{"state": ...}`` when the extension gave a ``state``, e
 ``{"title": ...}``, plus the urgency and the ``clear`` flag: a resolve with the same text is
 still news, and so is an escalation from normal to urgent. The daemon never interprets
 ``state`` (at most ``MAX_STATE_BYTES`` of canonical JSON); the extension decides what counts
-as a real change by what it puts there (bucket the PnL, leave timestamps out).
+as a real change by what it puts there (bucket the PnL, leave timestamps out). It is stored
+(``state_json``, migration 036, PER-302) for one reader: the room digest shows a report's
+``state.digest`` lines when its extension is listed in ``briefing.reports``.
 
 Callers own transactions and audit rows. Titles must already be sanitized (the pulse runs
 ``notify.clean_text`` on them); this module only clips them to ``TITLE_MAX``.
@@ -43,7 +45,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -78,6 +80,9 @@ class Item:
     told_at: datetime | None
     acked_at: datetime | None = None
     tone: str | None = None  # ``good``: an urgent item that is good news (display only)
+    # PER-302: the report's ``state`` (migration 036), else None. Out of hash and equality
+    # (a dict isn't hashable; the fingerprint already covers it), so Items stay set members.
+    state: Any | None = field(default=None, hash=False, compare=False)
 
     @property
     def changed(self) -> bool:
@@ -137,7 +142,24 @@ def _row_to_item(r: sqlite3.Row) -> Item:
         told_at=None if told_at is None else datetime.fromisoformat(told_at),
         acked_at=None if acked_at is None else datetime.fromisoformat(acked_at),
         tone=r["tone"],
+        state=_state(r["state_json"]),
     )
+
+
+def _state(raw: str | None) -> Any | None:
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def dump_state(state: Any | None) -> str | None:
+    """The stored form of a report's ``state``: canonical JSON, or None."""
+    if state is None:
+        return None
+    return json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def upsert(
@@ -179,12 +201,14 @@ def upsert(
         told: str | None = None if row is None else row["told_fingerprint"]
         conn.execute(
             "INSERT INTO pulse_items"
-            " (source, key, title, urgency, fingerprint, cleared, updated_at, expires_at, tone)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " (source, key, title, urgency, fingerprint, cleared, updated_at, expires_at, tone,"
+            " state_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (source, key) DO UPDATE SET title = excluded.title,"
             " urgency = excluded.urgency, fingerprint = excluded.fingerprint,"
             " cleared = excluded.cleared, updated_at = excluded.updated_at,"
-            " expires_at = excluded.expires_at, tone = excluded.tone",
+            " expires_at = excluded.expires_at, tone = excluded.tone,"
+            " state_json = excluded.state_json",
             (
                 source,
                 key,
@@ -195,6 +219,7 @@ def upsert(
                 iso(now),
                 iso(now + timedelta(seconds=ttl_s)),
                 tone,
+                dump_state(state),
             ),
         )
     item = get(conn, source, key)

@@ -17,7 +17,7 @@ import pytest
 from resonant import registered_jobs as rj
 from resonant.api import DaemonState
 from resonant.components import Components, build_components
-from resonant.config import Settings, load_settings
+from resonant.config import JobsConfig, Settings, load_settings
 from resonant.executor import CallContext, ToolFailed
 from resonant.extensions.cron import CronError, parse_schedule
 from resonant.extensions.scheduler import CoreDeps, Scheduler
@@ -617,3 +617,80 @@ def test_the_heartbeat_reads_the_next_job_from_the_real_table(db: sqlite3.Connec
                      created_by="brian", channel_ref=None, now=NOW)  # fmt: skip
     store.set_state(db, "J3", "paused", NOW, expect=("active",))
     assert next_registered_job(db, NOW) == ("J2", datetime(2026, 11, 21, 13, 0, tzinfo=UTC))
+
+
+# --- PER-302: jobs.seed ---------------------------------------------------------------------
+
+SEED = {
+    "key": "weekly-scan",
+    "name": "weekly improvement scan",
+    "schedule": "0 8 * * 1",
+    "output": "room:digest",
+    "prompt": "Scan for flaky CI and stale tickets; file at most 10.",
+}
+
+
+def seeded(settings: Settings, *seeds: dict[str, Any]) -> Settings:
+    return settings.model_copy(update={"jobs": JobsConfig.model_validate({"seed": list(seeds)})})
+
+
+def test_a_seed_is_added_once_and_a_deleted_one_stays_deleted(
+    settings: Settings, db: sqlite3.Connection
+) -> None:
+    s = seeded(settings, SEED)
+    assert rj.seed(db, s, owner="justin", now=NOW) == ["J1"]
+    job = store.get(db, "J1")
+    assert job is not None
+    assert (job.name, job.schedule, job.tz, job.output, job.created_by, job.repo) == (
+        "weekly improvement scan", "0 8 * * 1", TZ, "room:digest", "justin", None
+    )  # fmt: skip
+    assert job.channel_ref is None and job.state == "active"
+    assert rj.seed(db, s, owner="justin", now=NOW) == []  # the next start
+    store.set_state(db, "J1", "deleted", NOW, expect=("active",))
+    assert rj.seed(db, s, owner="justin", now=NOW + timedelta(days=1)) == []
+    assert db.execute("SELECT COUNT(*) FROM registered_jobs").fetchone()[0] == 1
+    (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'regjob.seeded'")
+    assert '"seed": "weekly-scan"' in row["detail"]
+
+
+def test_no_seeds_or_no_owner_adds_nothing(settings: Settings, db: sqlite3.Connection) -> None:
+    assert rj.seed(db, settings, owner="justin", now=NOW) == []
+    assert rj.seed(db, seeded(settings, SEED), owner=None, now=NOW) == []
+    assert db.execute("SELECT COUNT(*) FROM registered_jobs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("change", "why"),
+    [
+        ({"output": "room:nowhere"}, "room nowhere isn't in channels.slack.rooms"),
+        ({"schedule": "*/5 * * * *"}, "schedule: "),
+        ({"schedule": "61 8 * * 1"}, "schedule: "),
+        ({"repo": "ghost"}, "repo ghost isn't registered"),
+    ],
+)
+def test_a_seed_that_cant_be_added_is_refused_and_tried_again(
+    settings: Settings, db: sqlite3.Connection, change: dict[str, Any], why: str
+) -> None:
+    s = seeded(settings, {**SEED, **change})
+    assert rj.seed(db, s, owner="justin", now=NOW) == []
+    (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'regjob.seed_refused'")
+    assert why in row["detail"]
+    assert rj.seed(db, s, owner="justin", now=NOW) == []  # not recorded: tried every start
+    assert len(db.execute("SELECT 1 FROM audit_log WHERE action = 'regjob.seed_refused'")
+               .fetchall()) == 2  # fmt: skip
+    assert rj.seed(db, seeded(settings, SEED), owner="justin", now=NOW) == ["J1"]  # fixed
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {**SEED, "output": "thread"},
+        {**SEED, "key": "Bad Key"},
+        {**SEED, "prompt": "x" * 2001},
+    ],
+)
+def test_seed_config_is_checked(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        JobsConfig.model_validate({"seed": [bad]})
+    with pytest.raises(ValueError, match="each key at most once"):
+        JobsConfig.model_validate({"seed": [SEED, SEED]})

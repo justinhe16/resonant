@@ -25,9 +25,16 @@ from resonant.components import Components, build_components
 from resonant.config import Settings, load_settings, resonant_home
 from resonant.executor import CallContext
 from resonant.extensions import briefing as bf
+from resonant.extensions import room_digest as rd
 from resonant.extensions.process import FakeExtProcess
 from resonant.extensions.scheduler import CORE_JOBS, LAST_TICK_KEY, CoreDeps, Scheduler
-from resonant.gateway.channel import ApprovalPrompt, MessageRef, SelfTestResult, Submit
+from resonant.gateway.channel import (
+    ApprovalPrompt,
+    ChannelSendError,
+    MessageRef,
+    SelfTestResult,
+    Submit,
+)
 from resonant.loop import Loop, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, NewTask, TaskStatus, WaitReason
 from resonant.ops.fakes import FakeOpsRunner
@@ -37,7 +44,7 @@ from resonant.store import extensions as ext_store
 from resonant.store import pulse as pulse_store
 from resonant.store import runs as runs_store
 from resonant.store import tasks as repo
-from resonant.store.db import atomic, iso, kv_set, open_db
+from resonant.store.db import atomic, iso, kv_get, kv_set, open_db
 from resonant.tools.reminders import add_reminder
 from resonant_sdk import Effect, Level
 
@@ -623,3 +630,152 @@ async def test_a_guard_miss_sends_exactly_the_code_built_briefing(answer: str) -
         )
         await run_job(h, T0)
         assert h.channel.texts() == [expected]
+
+
+# --- PER-302: the room digest (briefing.audience: room:<key>) --------------------------------
+
+ROOM = {"audience": "room:digest", "at": "09:00", "days": "1-5", "reports": ["acme"]}
+MONDAY_9 = local(10, 12, 9)  # Mon 12 Oct 2026, 09:00 PDT
+
+
+@dataclass
+class RoomChannel(FakeChannel):
+    """The hub as seen by the digest: rooms too, deduping by key; ``fail`` refuses posts."""
+
+    posts: list[tuple[str, str, str | None]] = field(
+        default_factory=list[tuple[str, str, str | None]]
+    )
+    fail: bool = False
+
+    async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
+        if self.fail:
+            raise ChannelSendError("slack: chat.postMessage failed: not_in_channel")
+        if dedupe_key is None or dedupe_key not in self.keys:
+            self.posts.append((key, text, dedupe_key))
+            if dedupe_key is not None:
+                self.keys.add(dedupe_key)
+        return MessageRef("slack", f"room:{len(self.posts)}")
+
+
+def report(db: sqlite3.Connection, source: str, title: str, state: Any, now: datetime) -> None:
+    pulse_store.upsert(db, source, f"{source}/digest", title, "low", state, False, 86400, now)
+
+
+def test_the_owner_briefing_schedule_is_unchanged_and_days_narrow_it() -> None:
+    assert bf.schedule(load_settings(home=resonant_home()).briefing) == "0 8 * * *"
+    s = load_settings(home=resonant_home(), briefing={"at": "09:00", "days": "1-5"})
+    assert bf.schedule(s.briefing) == "0 9 * * 1-5"
+    assert s.briefing.room is None and s.briefing.audience == "owner"
+
+
+@pytest.mark.parametrize(
+    "bad", [{"audience": "team"}, {"audience": "room:Bad Room"}, {"days": "mon"},
+            {"reports": ["Not A Name"]}, {"reports": ["core"]}],
+)  # fmt: skip
+def test_briefing_room_config_is_checked(bad: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        load_settings(home=resonant_home(), briefing=bad)
+
+
+async def test_the_room_digest_posts_once_a_day_and_quiet_day_when_empty() -> None:
+    async with harness(briefing=ROOM, at=local(10, 12, 8, 59)) as h:
+        h.channel = RoomChannel()
+        job = bf.briefing_job(h.deps(h.channel), clock=h.clock)
+        assert job is not None and job.schedule == "0 9 * * 1-5"
+        assert bf.briefing_job(h.deps(FakeChannel())) is None  # no rooms (no Slack)
+        h.scheduler()
+        await h.tick(MONDAY_9)
+        assert h.channel.posts == [("digest", rd.QUIET, "digest:2026-10-12")]
+        assert h.channel.sent == []  # nothing to the owner
+        await h.tick(MONDAY_9 + timedelta(minutes=1))
+        h.scheduler(at=MONDAY_9 + timedelta(minutes=5))  # a restart
+        await h.tick(MONDAY_9 + timedelta(minutes=5))
+        assert len(h.channel.posts) == 1
+        (row,) = h.db.execute(
+            "SELECT principal, kind FROM system_texts WHERE ref = 'digest:2026-10-12'"
+        ).fetchall()
+        assert tuple(row) == ("room:digest", "briefing")
+        await h.tick(local(10, 17, 9))  # Saturday: not a weekday
+        assert len(h.channel.posts) == 1
+
+
+async def test_the_room_digest_has_reports_runs_and_approvals_but_nothing_private() -> None:
+    async with harness(briefing=ROOM, at=MONDAY_9) as h:
+        ch = RoomChannel()
+        now = MONDAY_9
+        remind(h.db, now + timedelta(hours=2), "SECRET-REMINDER", now=now)
+        approval(h.db, "A7", now - timedelta(minutes=40))
+        report(h.db, "acme", "Acme, last 24h: 2 PRs merged",
+               {"digest": ["Merged: web #12 Fix login", "x\u0007y", 7], "n": 2}, now)  # fmt: skip
+        report(h.db, "personal", "SECRET-PNL up $2k", {"digest": ["SECRET"]}, now)
+        failed = runs_store.create(h.db, repo="web", ask="SECRET-ASK", principal=OWNER,
+                                   session_id="s1", max_seconds=60)  # fmt: skip
+        runs_store.finish(h.db, failed.code, status="failed", failure="SECRET-FAILURE")
+        waiting = runs_store.create(h.db, repo="web", ask="SECRET-ASK-2", principal=OWNER,
+                                    session_id="s2", max_seconds=60)  # fmt: skip
+        runs_store.update(h.db, waiting.code, status="waiting", wait_reason="question")
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=now)
+        assert out["posted"] is True and out["sections"] == ["reports", "runs", "approvals"]
+        ((room, text, key),) = ch.posts
+        assert (room, key) == ("digest", "digest:2026-10-12")
+        assert text.splitlines() == [
+            "Acme, last 24h: 2 PRs merged",
+            "• Merged: web #12 Fix login",
+            "• x y",
+            f"Runs: 1 failed ({failed.code}) · 1 waiting ({waiting.code}: question)",
+            "✋ 1 approval waiting (oldest 40m)",
+        ]
+        assert "SECRET" not in text and "A7" not in text
+        # the owner's items stay untold: the room digest marks nothing
+        item = pulse_store.get(h.db, "acme", "acme/digest")
+        assert item is not None and item.told_fingerprint is None
+
+
+async def test_report_lines_are_capped() -> None:
+    lines = [f"line {i} " + "y" * 300 for i in range(15)]
+    got, more = rd.digest_lines({"digest": lines})
+    assert len(got) == rd.REPORT_LINES and more == 3
+    assert all(len(x) <= rd.LINE_MAX for x in got)
+    assert rd.digest_lines({"digest": "not a list"}) == ([], 0)
+    assert rd.digest_lines(None) == ([], 0)
+    d = rd.RoomDigest(reports=(rd.Report("acme", "T", ("a",), 3),))
+    assert rd.render(d) == "T\n• a\n+3 more"
+
+
+async def test_the_room_digest_skips_while_paused() -> None:
+    async with harness(briefing=ROOM, at=MONDAY_9) as h:
+        ch = RoomChannel()
+        killswitch.engage(h.db, actor="test")
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=MONDAY_9)
+        assert out == {"posted": False, "date": "2026-10-12", "skipped": "paused"}
+        assert ch.posts == []
+
+
+async def test_a_lost_room_dms_the_owner_once_until_a_post_works() -> None:
+    async with harness(briefing=ROOM, at=MONDAY_9) as h:
+        ch = RoomChannel(fail=True)
+        for day in (12, 13):
+            out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings,
+                                            now=local(10, day, 9))  # fmt: skip
+            assert out["skipped"] == "failed"
+        assert len(ch.sent) == 1
+        owner, text, _ = ch.sent[0]
+        assert owner == OWNER and "couldn't post the daily digest to the digest room" in text
+        assert "not_in_channel" in text
+        ch.fail = False
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=local(10, 14, 9))
+        assert out["posted"] is True
+        assert [k for _, _, k in ch.posts] == ["digest:2026-10-14"]  # failed days never late
+        assert kv_get(h.db, rd.DOWN_KEY) is None
+        ch.fail = True
+        await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=local(10, 15, 9))
+        assert len(ch.sent) == 2  # a new outage: told again
+
+
+async def test_on_demand_room_digest() -> None:
+    async with harness(briefing=ROOM, at=MONDAY_9) as h:
+        ch = RoomChannel()
+        out = await bf.run_briefing_now(h.deps(ch), now=MONDAY_9)
+        assert out["sent"] is True
+        assert [k for _, _, k in ch.posts] == ["digest:manual:2026-10-12:0900"]
+        assert (await bf.run_briefing_now(h.deps(FakeChannel()), now=MONDAY_9))["sent"] is False

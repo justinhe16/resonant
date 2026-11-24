@@ -56,6 +56,10 @@ On demand (P3-14's ``/ext run core/briefing``): ``run_briefing_now(deps)``. It i
 ``briefing:manual:<local date>:<HHMM>``, so it sends at most once a minute and never uses up
 the scheduled one.
 
+PER-302: ``briefing.days`` narrows the days (a cron day-of-week field, ``*`` by default), and
+``briefing.audience: room:<key>`` makes this job post the team's room digest instead
+(``room_digest.py``); ``owner`` (the default) is everything above, unchanged.
+
 The text that went out is a system text, kind ``briefing`` (PER-274, ``pulse_job.deliver``),
 so both brains read it in the transcript as Resonant's own turn.
 """
@@ -73,7 +77,7 @@ from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext
-from resonant.extensions import notify, rollup
+from resonant.extensions import notify, rollup, room_digest
 from resonant.extensions.pulse_job import (
     NOTICE_PREFIX,
     deliver,
@@ -87,6 +91,7 @@ from resonant.extensions.pulse_job import (
     running_workers,
     worker_entries,
 )
+from resonant.gateway.hub import RoomPosting
 from resonant.monitor import health_snapshot
 from resonant.store import pulse as pulse_store
 from resonant.store.approvals import answerable as pending_for  # BA-1: codes that bind
@@ -127,7 +132,7 @@ OPEN_STATES = ("running", "waiting", "queued")
 def schedule(cfg: BriefingConfig) -> str:
     """The briefing's daily cron, in ``settings.timezone``."""
     at = cfg.local_time
-    return f"{at.minute} {at.hour} * * *"
+    return f"{at.minute} {at.hour} * * {cfg.days}"
 
 
 def dedupe_key(day: date) -> str:
@@ -477,6 +482,15 @@ async def run_briefing_now(deps: CoreDeps, *, now: datetime | None = None) -> di
     """Send the briefing on demand (P3-14's ``/ext run core/briefing``), keyed per minute
     (``manual``). Sent even when ``briefing.enabled`` is false; nothing while paused, and
     ``{sent: False, skipped: "unreachable"}`` with no channel or owner."""
+    if deps.settings.briefing.room is not None:  # PER-302: the room digest
+        rooms = _room_poster(deps.channel)
+        if rooms is None:
+            return {"sent": False, "skipped": "unreachable"}
+        out = await room_digest.send_room_digest(
+            deps.conn, rooms, deps.owner, settings=deps.settings, now=now or utcnow(),
+            manual=True,
+        )  # fmt: skip
+        return {"sent": out["posted"], **out}
     if deps.channel is None or deps.owner is None:
         return {"sent": False, "skipped": "unreachable"}
     return await send_briefing(
@@ -510,6 +524,8 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
     channel, owner = deps.channel, deps.owner
     if not cfg.enabled:
         return None
+    if cfg.room is not None:
+        return _room_job(deps, clock)
     if channel is None or owner is None:
         log.info("briefing not scheduled", extra={"channel": channel is not None})
         return None
@@ -531,6 +547,37 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
     return CoreJob(
         id=JOB_ID,
         schedule=schedule(cfg),
+        run=run,
+        catchup=CATCHUP,
+        timeout_s=TIMEOUT_S,
+    )
+
+
+def _room_poster(channel: Channel | None) -> RoomPosting | None:
+    return channel if isinstance(channel, RoomPosting) else None
+
+
+def _room_job(deps: CoreDeps, clock: Callable[[], datetime]) -> CoreJob | None:
+    """PER-302: ``briefing.audience: room:<key>``: the job posts the room digest
+    (``room_digest.send_room_digest``) instead of the owner's briefing. None with no channel
+    that posts to rooms (no Slack)."""
+    from resonant.extensions.scheduler import CoreJob
+
+    rooms = _room_poster(deps.channel)
+    if rooms is None:
+        log.info("room digest not scheduled: no channel posts to rooms")
+        return None
+    conn, settings, owner = deps.conn, deps.settings, deps.owner
+
+    async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
+        del ctx
+        return await room_digest.send_room_digest(
+            conn, rooms, owner, settings=settings, now=clock(), due=_due(args)
+        )
+
+    return CoreJob(
+        id=JOB_ID,
+        schedule=schedule(settings.briefing),
         run=run,
         catchup=CATCHUP,
         timeout_s=TIMEOUT_S,

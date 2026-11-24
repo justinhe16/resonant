@@ -38,6 +38,10 @@ it has already seen (``context_text``); the worker writes back with ``resonant j
 **Limits.** A schedule that fires more often than every ``MIN_INTERVAL`` (15 minutes) is
 refused (``check_interval``); at most ``MAX_JOBS`` live jobs. DST follows ``cron.decide``.
 
+**Seeds** (PER-302, ``jobs.seed`` in config): :func:`seed`, called once at daemon start,
+adds each seed not added before as the owner (kv ``jobs.seed:<key>``); a deleted seed stays
+deleted.
+
 An idle tick (no active jobs) records nothing: personal Resonant with no jobs sees no new
 rows or audits.
 """
@@ -57,9 +61,10 @@ from resonant.store import jobs as store
 from resonant.store import repos as repos_store
 from resonant.store import runs as runs_store
 from resonant.store.audit import audit
-from resonant.store.db import atomic, utcnow
+from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 
 if TYPE_CHECKING:
+    from resonant.config import Settings
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.principals import Principals
@@ -450,6 +455,65 @@ async def tick(
     return counts
 
 
+# --- seeded jobs (PER-302) -----------------------------------------------------------------
+
+SEED_KEY = "jobs.seed:"  # kv: one record per seed key, {job, at}, kept after the job is deleted
+
+
+def seed(
+    conn: sqlite3.Connection, settings: Settings, *, owner: str | None, now: datetime
+) -> list[str]:
+    """Add each ``jobs.seed`` entry not added before, as ``owner``; returns the new ids.
+
+    Idempotent: a seed is added once (kv ``jobs.seed:<key>`` = ``{job, at}``) and never
+    again, so a job the owner deleted stays deleted. A seed that can't be added (a schedule
+    that doesn't parse or fires too often, an unregistered repo, an unknown room,
+    ``MAX_JOBS``) is logged and audited ``regjob.seed_refused`` and tried on the next start.
+    No seeds or no owner: nothing happens."""
+    seeds = settings.jobs.seed
+    if not seeds or owner is None:
+        return []
+    added: list[str] = []
+    rooms = settings.channels.slack.rooms
+    for s in seeds:
+        if kv_get(conn, SEED_KEY + s.key) is not None:
+            continue
+        why: str | None = None
+        try:
+            parse(s.schedule, settings.timezone)
+        except CronError as e:
+            why = f"schedule: {e}"
+        if why is None and s.repo is not None and repos_store.find(conn, s.repo) is None:
+            why = f"repo {s.repo} isn't registered"
+        room = s.output.partition(":")[2] if s.output.startswith("room:") else None
+        if why is None and room is not None and room not in rooms:
+            why = f"room {room} isn't in channels.slack.rooms"
+        if why is None and store.count_live(conn) >= MAX_JOBS:
+            why = f"{MAX_JOBS} jobs already"
+        if why is not None:
+            log.warning("seeded job not added: %s", why, extra={"seed": s.key})
+            with atomic(conn):
+                audit(conn, "regjob.seed_refused", requested_by=owner, seed=s.key, reason=why)
+            continue
+        with atomic(conn):  # the job and its seed record together: never added twice
+            job = store.create(
+                conn,
+                name=s.name,
+                schedule=s.schedule,
+                tz=settings.timezone,
+                prompt=s.prompt,
+                repo=s.repo,
+                output=s.output,
+                created_by=owner,
+                channel_ref=None,
+                now=now,
+            )
+            kv_set(conn, SEED_KEY + s.key, {"job": job.id, "at": iso(now)})
+            audit(conn, "regjob.seeded", requested_by=owner, seed=s.key, job=job.id)
+        added.append(job.id)
+    return added
+
+
 def registered_jobs_job(
     deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow
 ) -> CoreJob | None:
@@ -484,6 +548,7 @@ __all__ = [
     "post",
     "registered_jobs_job",
     "run_context",
+    "seed",
     "start",
     "tick",
 ]

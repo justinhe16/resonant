@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING
 
 import uvicorn
 
+from resonant import registered_jobs
 from resonant.api import DaemonState, create_app, local_snapshot, runner_missing
 from resonant.components import build_components
 from resonant.config import Settings
@@ -201,6 +202,17 @@ class Daemon:
     def stop(self) -> None:
         self._stop.set()
 
+    def _seed_jobs(self) -> None:
+        """PER-302: add the ``jobs.seed`` entries not added before (``registered_jobs.seed``),
+        as the owner. Never stops the start."""
+        c = self.state.components
+        if not self.settings.jobs.seed or c is None or not c.principals_loaded:
+            return
+        try:
+            registered_jobs.seed(self.conn, self.settings, owner=c.principals.owner, now=utcnow())
+        except Exception:
+            log.exception("seeded jobs not added")
+
     async def _serve(self) -> None:
         # uvicorn calls sys.exit() when it can't bind. asyncio would let a SystemExit escape
         # the event loop, so turn it into an ordinary error.
@@ -239,6 +251,7 @@ class Daemon:
             from resonant.wiring import start_asks
 
             await start_asks(self.state.components)  # PER-262: the brain's leftovers
+        self._seed_jobs()
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
