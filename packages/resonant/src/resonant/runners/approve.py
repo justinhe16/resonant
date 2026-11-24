@@ -86,6 +86,7 @@ def approval_prompt(decision: NeedsApproval) -> ApprovalPrompt:
         require_code=decision.require_code,
         always=decision.allow_always,
         phrased=decision.phrased,
+        detail=decision.detail,
     )
 
 

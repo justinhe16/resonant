@@ -26,6 +26,12 @@ Invariants, enforced here at registration:
   a template can't hide what a call does. An arg outside ``[...]`` that is missing falls
   back to the arg list. Write it as what the tool
   would do, lower case: it follows "OK to", "Couldn't" and "Dry run: would".
+- ``approval_detail`` (PER-300) names one string arg an approval prompt shows **in full**
+  under its summary line (a SQL statement, a request body), where ``approval_summary`` and
+  the arg list clip every value to 40 characters. The gate builds the block from the call's
+  args (``gate.summary.detail_text``): verbatim but for anything that could pass for an
+  approval code (masked, and said so) and at most ``DETAIL_MAX`` characters. A batch prompt
+  lists summaries only.
 - ``worker_requestable=True`` (PER-296) marks an extension tool a Claude worker may ask for
   with ``resonant request <ext>.<tool>``: the call goes through the gate as the run's
   requester, and the approval is asked in the run's thread. Only extension tools carry it.
@@ -132,6 +138,7 @@ class ToolSpec(BaseModel):
     taint_exempt: bool = False
     grant: str | None = Field(default=None, pattern=GRANT_PATTERN)
     approval_summary: str | None = None
+    approval_detail: str | None = Field(default=None, pattern=r"^[a-z_][a-z0-9_]*$")  # PER-300
     worker_requestable: bool = False  # PER-296: ``resonant request`` may name it
 
     @model_validator(mode="after")

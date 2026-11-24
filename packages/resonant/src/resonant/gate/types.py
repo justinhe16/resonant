@@ -185,6 +185,9 @@ class NeedsApproval:
     require_code: bool  # L1 (destructive or pay): only "yes <code>" approves
     allow_always: bool = False  # a worker's trust check: "yes always" also adds a rule
     phrased: bool = False  # PER-268: the summary is the tool's own phrase (a question prompt)
+    # PER-300: one arg shown in full under the summary (``summary.detail_text``), built by code
+    # from the intent; never stored on the approval row (``/approvals <code>`` has the args).
+    detail: str | None = None
 
 
 @dataclass(frozen=True)

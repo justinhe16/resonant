@@ -91,11 +91,14 @@ class ToolSpec(BaseModel, frozen=True, extra="forbid"):
     taint_exempt: bool = False  # PER-245: runs on its level even in a tainted task (ToolCore gates it as inferred); builtin L2/L3 writes only
     grant: str | None = None  # BR-2: ^[a-z][a-z0-9_-]{0,31}$; a member may request it with grants {"builtin:<grant>": [request]}
     approval_summary: str | None = None  # PER-268: "merge PR #{number} in {repo}"; see below
+    approval_detail: str | None = None  # PER-300: one string arg shown in full under the prompt; see below
     worker_requestable: bool = False  # PER-296: a worker may ask for it with `resonant request`; extension tools only
     effective_level: Level  # property
 ```
 
 `approval_summary` (PER-268) is the tool's own phrase for approval prompts, failure texts and dry runs, filled from the call's args (`gate.summary.fill_summary`), lower case, as what the tool would do: `{arg}` is the arg's value (`clean_external`'d, clipped to 40 with `...`), `[...]` a part shown only when every arg in it is set (a boolean prints nothing: it is the condition), e.g. `start a run[ on {repo}]: "{ask}"[{merge} (merges if clean)]`; `{~arg}` names an arg left out on purpose (`merge PR #{number} in {repo}{~head_sha}`). Every other set arg follows the phrase in parentheses (`describe_args`: `create a GitHub repo named garden (private=false)`), so a template never hides what a call does. `resonant_sdk.tool.parse_summary` checks it (one printable line of at most 120 characters, `[ ]` not nested, braces only as `{arg_name}`). A missing arg outside `[...]`, or a list or object value, falls back to the arg list.
+
+`approval_detail` (PER-300) names one declared **string** arg the approval prompt shows in full, for what a 40-character value can't carry (a SQL statement, a request body). `gate.summary.detail_text(intent)` builds the block from the call's args: the value in a code fence, line breaks kept, tabs as spaces, a ```` ``` ```` inside shown as `'''`, approval-code look-alikes masked with `mask_codes` (so a `yes K4` inside can't answer another prompt), at most `DETAIL_MAX` (4000) characters; a mask or a cut adds `(code-like text shown as ?; cut at 4000 characters; /approvals shows it unchanged)`. Unset, blank or not configured: None. The filled `approval_summary` then leaves that arg out of its trailing `(…)` list (`fill_summary(…, below=arg)`). The gate sets it on `NeedsApproval.detail` (both a new ask and the pending one asked again; never stored on the approval row: `/approvals <code>` shows the args), `approval_prompt` copies it to `ApprovalPrompt.detail`, and `ApprovalPrompt.text()` appends it on its own lines after the question. Batch prompts carry summaries only. Slack splits a prompt longer than a section (`blocks.split_sections`: at line ends, at most 3000 characters and 10 sections, a fence open at a split closed and reopened), for the buttons message and its resolved edit alike.
 
 These invariants are enforced at registration:
 - `pay` is always L1.
@@ -119,6 +122,7 @@ jobs:     [{id, schedule (5-field cron), tz?, critical?, run,
             catchup? (none | duration <= 24h, default none)}]
 tools:    {<name>: {run, description?, effect, level?, args: {<arg>: string|integer|number|boolean},
                     secrets?, commit?, timeout_s? (<= 300), approval_summary?,
+                    approval_detail? (PER-300, a declared string arg),
                     worker_requestable? (PER-296, default false)}}
           # {placeholders} in run and approval_summary must be declared args
 mcp:      {servers: {<id>: {transport: stdio, command, args?: [<literal>, ...],

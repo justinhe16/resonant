@@ -70,6 +70,9 @@ class ApprovalPrompt:
     # PER-292: the asking task's thread (``thread_of``), set only on the prompt to that task's
     # own principal; the hub sends there, an unthreaded adapter ignores it. Not in the text.
     thread: MessageRef | None = None
+    # PER-300: one arg in full (a code fence built by ``gate.summary.detail_text``), under
+    # the question. Never on a batch prompt.
+    detail: str | None = None
 
     def text(self) -> str:
         """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay,
@@ -82,7 +85,7 @@ class ApprovalPrompt:
                 destructive=self.destructive,
             )
         destructive = self.level == Level.L1.value and self.effect != Effect.PAY.value
-        return approval_text(
+        text = approval_text(
             self.code,
             self.summary,
             require_code=self.require_code,
@@ -90,6 +93,7 @@ class ApprovalPrompt:
             always=self.always and not self.require_code and not destructive,
             phrased=self.phrased,
         )
+        return f"{text}\n{self.detail}" if self.detail else text
 
 
 def approval_dedupe_key(approval_id: str, principal: str) -> str:

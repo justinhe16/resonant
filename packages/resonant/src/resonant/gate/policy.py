@@ -90,7 +90,7 @@ from typing import Literal, Protocol
 
 from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external, new_code
-from resonant.gate.summary import phrased, summarize, unsafe_args
+from resonant.gate.summary import detail_text, phrased, summarize, unsafe_args
 from resonant.gate.types import (
     Allow,
     ApprovalBatch,
@@ -556,7 +556,7 @@ class PolicyGate:
                                unattended=approved.decided_by == OWNER_ASKED)  # fmt: skip
         pending = ap.pending_for_intent(self.conn, intent.task_id, intent.hash, now)
         if pending is not None:
-            return _needs(pending)
+            return _needs(pending, detail_text(intent))
         if last is not None:
             return Deny(APPROVAL_USED if last.status == "approved" else APPROVAL_EXPIRED)
         task = self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (intent.task_id,))
@@ -603,7 +603,7 @@ class PolicyGate:
         approval_id = ap.insert_approval(self.conn, spec, now)
         created = ap.get_approval(self.conn, approval_id)
         assert created is not None
-        return _needs(created)
+        return _needs(created, detail_text(intent))
 
     @staticmethod
     def _own_stale(intent: Intent, held: ap.Approval) -> bool:
@@ -1206,7 +1206,7 @@ def _add_standing_rule(conn: sqlite3.Connection, a: ap.Approval, actor: str, now
         )
 
 
-def _needs(a: ap.Approval) -> NeedsApproval:
+def _needs(a: ap.Approval, detail: str | None = None) -> NeedsApproval:
     assert a.code is not None
     return NeedsApproval(
         approval_id=a.id,
@@ -1219,4 +1219,5 @@ def _needs(a: ap.Approval) -> NeedsApproval:
         require_code=a.require_code,
         allow_always=a.allow_always,
         phrased=a.phrased,
+        detail=detail,
     )
