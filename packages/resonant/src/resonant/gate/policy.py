@@ -35,11 +35,12 @@ Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (m
 garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
 
 Approvers (``approvers``, PER-293): a builtin's (``extension=None``) are the owner and every
-``role: approver``. An extension tool's are those, plus each principal its manifest names
-(``approvers_for``) that holds ``approve`` for that extension (for that tool, under a per-tool
-grant) in principals.yaml. The grant check runs here, so a manifest can't grant itself
-approvers: a name without the grant, unknown, or a workspace-default member is dropped and
-logged. Self-approval is allowed: an approver may answer the prompt for their own request.
+``role: approver`` (the owner alone for an ``OWNER_TOOLS`` one: admin and trust, PER-318).
+An extension tool's are those, plus each principal its manifest names (``approvers_for``)
+that holds ``approve`` for that extension (for that tool, under a per-tool grant) in
+principals.yaml. The grant check runs here, so a manifest can't grant itself approvers: a
+name without the grant, unknown, or a workspace-default member is dropped and logged.
+Self-approval is allowed: an approver may answer the prompt for their own request.
 
 Approvals, per (task, intent hash):
 - "ask" reuses the pending approval if there is one, else inserts a new one (approvers as
@@ -55,7 +56,9 @@ iMessage parser match, and the approval's prompt sent to the actor before the re
 is pending for the actor, now and when the reply was sent. ``require_code`` needs
 ``yes <code>``; a plain no may deny. ``yes always`` binds the same way but only to an
 approval that offered it (``allow_always``: a worker's trust check or an owner's L2 chat
-call; never ``require_code``) and only from the owner, else ``always_unsupported``.
+call; never ``require_code``), else ``always_unsupported``. Only the owner widens trust
+(PER-318): anyone else's ``yes always`` on such an approval is a plain yes (no rule), and the
+result says so (``ResolveResult.once``) so the router can tell them.
 Resolution is idempotent per reply event (``resolved_event_id``). A Slack button
 (PER-295, ``path="button"``) is a reply that always carries its prompt's code: it binds like
 ``yes <code>``/``no <code>`` (L1 too), its sent-before rule is that the prompt reached some
@@ -84,7 +87,7 @@ import logging
 import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
@@ -106,7 +109,7 @@ from resonant.gate.types import (
     ReplyRefusal,
     ResolveResult,
 )
-from resonant.principals import ADMIN_TOOLS, KNOWN_CHANNELS, Principals
+from resonant.principals import KNOWN_CHANNELS, OWNER_TOOLS, Principals
 from resonant.store import approvals as ap
 from resonant.store import outbound
 from resonant.store import trust as trust_store
@@ -516,7 +519,7 @@ class PolicyGate:
         per-tool grant covers only its tools)."""
         staff = (self.principals.owner, *self.principals.approver_names)
         if extension is None:
-            return (self.principals.owner,) if tool in ADMIN_TOOLS else staff
+            return (self.principals.owner,) if tool in OWNER_TOOLS else staff
         named = self.approvers_for(extension)
         if isinstance(named, str):  # a bare name is a seam bug, never a list of letters
             raise TypeError("approvers_for must return a sequence of names, not a str")
@@ -556,7 +559,7 @@ class PolicyGate:
                                unattended=approved.decided_by == OWNER_ASKED)  # fmt: skip
         pending = ap.pending_for_intent(self.conn, intent.task_id, intent.hash, now)
         if pending is not None:
-            return _needs(pending, detail_text(intent))
+            return _needs(pending, detail_text(intent), self.principals.owner)
         if last is not None:
             return Deny(APPROVAL_USED if last.status == "approved" else APPROVAL_EXPIRED)
         task = self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (intent.task_id,))
@@ -603,7 +606,7 @@ class PolicyGate:
         approval_id = ap.insert_approval(self.conn, spec, now)
         created = ap.get_approval(self.conn, approval_id)
         assert created is not None
-        return _needs(created, detail_text(intent))
+        return _needs(created, detail_text(intent), self.principals.owner)
 
     @staticmethod
     def _own_stale(intent: Intent, held: ap.Approval) -> bool:
@@ -780,23 +783,22 @@ class PolicyGate:
                 if unit.batch is not None and unit.batch.principal != resolution.actor:
                     reason = "not an approver"  # a batch is the owner's to answer
                 elif resolution.always and (
-                    unit.batch is not None
-                    or not approval.allow_always
-                    or approval.require_code
-                    or resolution.actor != self.principals.owner
+                    unit.batch is not None or not approval.allow_always or approval.require_code
                 ):
                     reason = "always_unsupported"  # as for "yes always" by text
                 else:
                     reason = self._resolve_unit(
                         unit, approved=resolution.approved, actor=resolution.actor, now=now,
-                        always=resolution.always,
+                        always=self._widens(resolution.always, resolution.actor),
                     )  # fmt: skip
             # A non-approver can't tell an existing approval from a missing one.
             shown = "not_found" if reason == "not an approver" else reason
             result = ResolveResult(ok=False, reason=shown)
+            once = resolution.always and resolution.actor != self.principals.owner
             if reason is None and unit is not None:
                 done = [ap.get_approval(self.conn, m.id) for m in unit.members]
                 result = ap.resolve_result([d for d in done if d is not None])
+                result = replace(result, once=once and result.ok)
                 head = done[0]
                 if (
                     unit.batch is None
@@ -827,10 +829,16 @@ class PolicyGate:
                 path=resolution.path,
                 comments=resolution.comments,
                 always=resolution.always,
+                once=result.once or None,
                 ok=result.ok,
                 reason=reason,
             )
         return result
+
+    def _widens(self, always: bool, actor: str) -> bool:
+        """PER-318: whether a ``yes always`` from ``actor`` saves its rule. Only the owner's
+        does; anyone else's approves this one action (``ResolveResult.once``)."""
+        return always and actor == self.principals.owner
 
     def _unit_of(self, approval: ap.Approval) -> _Unit:
         """``approval`` alone, or the open batch it is in (its approvals, in order)."""
@@ -867,7 +875,7 @@ class PolicyGate:
                     actor=reply.actor,
                     now=now,
                     event_id=reply.event_id,
-                    always=reply.always,
+                    always=self._widens(reply.always, reply.actor),
                     picks=reply.picks,
                 )
             result = ResolveResult(ok=False, reason=reason)
@@ -875,6 +883,8 @@ class PolicyGate:
                 rows = [ap.get_approval(self.conn, m.id) for m in unit.members]
                 done_rows = [d for d in rows if d is not None]
                 result = ap.resolve_result(done_rows)
+                once = reply.always and reply.actor != self.principals.owner
+                result = replace(result, once=once and result.ok)
                 done = done_rows[0]
                 if reply.comments and reply.decision == "approve" and done.task_id is not None:
                     _add_comments(self.conn, done, reply)
@@ -907,6 +917,7 @@ class PolicyGate:
                 raw_text=reply.raw_text,
                 comments=reply.comments,
                 always=reply.always,
+                once=result.once or None,
                 ok=result.ok,
                 reason=reason,
             )
@@ -959,13 +970,11 @@ class PolicyGate:
             if any(n < 1 or n > len(target.members) for n in reply.picks):
                 return None, "unknown_pick"
         if reply.always and (
-            target.batch is not None
-            or not target.head.allow_always
-            or target.require_code
-            or reply.actor != self.principals.owner
+            target.batch is not None or not target.head.allow_always or target.require_code
         ):
             # Never read as a plain yes: "always" asked for more than this approval offers
-            # (a batch never offers it), and only the owner widens trust.
+            # (a batch never offers it). Only the owner widens trust: anyone else's "yes
+            # always" on one that offers it is a plain yes (PER-318, ``_widens``).
             return None, "always_unsupported"
         if reply.code is None:
             # Judge a plain reply against what the actor had been shown when they sent it,
@@ -1206,7 +1215,7 @@ def _add_standing_rule(conn: sqlite3.Connection, a: ap.Approval, actor: str, now
         )
 
 
-def _needs(a: ap.Approval, detail: str | None = None) -> NeedsApproval:
+def _needs(a: ap.Approval, detail: str | None, owner: str) -> NeedsApproval:
     assert a.code is not None
     return NeedsApproval(
         approval_id=a.id,
@@ -1218,6 +1227,7 @@ def _needs(a: ap.Approval, detail: str | None = None) -> NeedsApproval:
         level=a.level,
         require_code=a.require_code,
         allow_always=a.allow_always,
+        offer_to=owner,
         phrased=a.phrased,
         detail=detail,
     )

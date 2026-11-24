@@ -575,6 +575,15 @@ class FastPath:
                 return self._result(cmd, self._start_work(principal))
             return self._result(cmd, NOT_ALLOWED)
         if cmd.slash and not self._may_use(cmd, principal):
+            with atomic(self.conn):  # PER-318: e.g. an approver's /rules forget (owner only)
+                audit(
+                    self.conn,
+                    "router.command_refused",
+                    requested_by=principal,
+                    trace_id=trace_id,
+                    command=cmd.name,
+                    tool=cmd.tool,
+                )
             return self._result(cmd, NOT_ALLOWED)
         if cmd.unknown is not None:
             if (hint := self._not_installed(cmd.unknown, principal)) is not None:
@@ -643,10 +652,13 @@ class FastPath:
         return self._result(cmd, text, cmd.tool)
 
     def _may_use(self, cmd: FastCommand, principal: str) -> bool:
-        """A builtin command needs every tool it can call. An ``/<ext>`` command (PER-293:
-        per-tool grants) needs the tool it names, or any of its tools for a usage line."""
+        """A builtin command needs the tool it calls (PER-318: ``/rules`` lists for an
+        approver, ``/rules forget`` is the owner's), or every tool it can call for a usage
+        line. An ``/<ext>`` command (PER-293: per-tool grants) needs the tool it names, or any
+        of its tools for a usage line."""
         if cmd.extension is None:
-            return all(self._can_request(principal, t) for t in cmd.tools)
+            tools = (cmd.tool,) if cmd.tool is not None else cmd.tools
+            return all(self._can_request(principal, t) for t in tools)
         tools = (cmd.tool,) if cmd.tool is not None else cmd.tools
         return any(self._can_request(principal, t, cmd.extension) for t in tools)
 

@@ -204,12 +204,15 @@ def test_standing_allow_is_never_for_members(db: sqlite3.Connection, gate: Polic
     assert isinstance(d, NeedsApproval) and not d.allow_always
 
 
-def test_only_the_owner_can_answer_yes_always(db: sqlite3.Connection, gate: PolicyGate) -> None:
+def test_only_the_owners_yes_always_saves_a_rule(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """PER-318: anyone else's ``yes always`` is a plain yes: approved once, no rule."""
     d = gate.evaluate(call(db, DORI_SYNC))
     assert isinstance(d, NeedsApproval) and d.allow_always
     sent(db, d.approval_id, "cofounder")
     result = always(gate, d.code, actor="cofounder")
-    assert not result.ok and result.reason == "always_unsupported"
+    assert result.ok and result.once
+    row = ap.get_approval(db, d.approval_id)
+    assert row is not None and row.status == "approved" and not row.always
     assert store.list_rules(db) == []
 
 

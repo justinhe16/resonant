@@ -41,8 +41,11 @@ What it does:
 3. It waits (polling the row) until the owner answers or the approval expires
    (``gate.approval_ttl_s``). A ``yes`` returns ``"ok"`` and marks (system, action) seen.
    ``yes always`` also adds ``allow <action> on <system>`` (``created_from="yes always"``)
-   and texts ``Rule added: don't ask before deploy in dori-api (rule 5)``. A ``no``, an
-   expiry, a run that isn't active, or no reachable owner returns ``"denied"``.
+   and texts ``Rule added: don't ask before deploy in dori-api (rule 5)``; only the owner's
+   does (PER-318): the ``yes always`` offer is in the owner's prompt alone, and an approver's
+   ``yes always`` is a plain yes (``Approved this once. Only <owner> can make it standing.``,
+   the router). A ``no``, an expiry, a run that isn't active, or no reachable owner returns
+   ``"denied"``.
 
 The replies are bound by the gate's ``resolve_reply`` like any approval: only the owner,
 over iMessage, after the prompt was sent. A worker can't answer its own check: it has no
@@ -326,6 +329,7 @@ class TrustChecks:
             level=row.level,
             require_code=row.require_code,
             allow_always=row.allow_always,
+            offer_to=self.principals.owner,
         )
 
     def _approvers(self, run: runs_store.Run) -> tuple[str, ...]:
@@ -394,9 +398,9 @@ class TrustChecks:
             # only the first spends it and adds the rule. A later check asks again.
             first = ap.mark_used(self.conn, row.id, now)
             store.mark_seen(self.conn, system, action, now)
-            # PER-294: only the owner and approvers teach rules (a ``yes always`` from anyone
-            # else is a plain yes).
-            teacher = row.decided_by is not None and self.principals.is_approver(row.decided_by)
+            # PER-318: only the owner teaches rules (the gate already reads anyone else's
+            # ``yes always`` as a plain yes; this is defense in depth).
+            teacher = row.decided_by == self.principals.owner
             if first and teacher and row.always and row.allow_always and not row.require_code:
                 added = store.add_rule(
                     self.conn,

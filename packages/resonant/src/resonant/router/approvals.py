@@ -10,7 +10,9 @@ never read as a reply) and before keywords and the brain:
    the gate trusts ``reply.actor``. The reply's ``channel`` is the event's source.
 3. ``gate.resolve_reply`` binds, resolves and wakes in one transaction, idempotent per
    event id. On success (or a replay of the same event) nothing is sent here: the woken
-   runner sends the templated confirmation.
+   runner sends the templated confirmation. PER-318: anyone but the owner who answered
+   ``yes always`` (a plain yes for them, ``ResolveResult.once``) also hears ``once_reply``:
+   ``Approved this once. Only <owner> can make it standing.``
 4. A refusal gets a short, code-built reply (``refusal_reply``). A non-approver always gets
    ``NOTHING_WAITING``, so pending approvals are never revealed.
 
@@ -39,7 +41,14 @@ from resonant_sdk import Event
 
 NOTHING_WAITING = "Nothing is waiting for approval."
 ALWAYS_UNSUPPORTED = "Not done: yes always isn't offered for that one."
+
 MAX_ARGS_CHARS = 1500
+
+
+def once_reply(owner: str) -> str:
+    """PER-318: an approver's ``yes always``, read as a plain yes (``owner``: as replies say it)."""
+    return f"Approved this once. Only {owner} can make it standing."
+
 
 Outcome = Literal["resolved", "replay", "refused", "unauthenticated"]
 
@@ -153,7 +162,12 @@ class ApprovalInbox:
             )
         )
         if result.ok:
-            return InboxResult(None, "replay" if replay else "resolved")
+            if replay:
+                return InboxResult(None, "replay")
+            if result.once:
+                owner = self.principals.display(self.principals.owner)
+                return InboxResult(once_reply(owner), "resolved", "approved_once")
+            return InboxResult(None, "resolved")
         sent = self.sent_pending(principal)
         return InboxResult(
             refusal_reply(result.reason, parsed.code, sent, parsed.picks), "refused", result.reason
