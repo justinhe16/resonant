@@ -372,6 +372,7 @@ class CliTool(_Strict):
     commit: bool = False
     timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
     approval_summary: str | None = None  # PER-268: see ToolSpec; uses only declared args
+    approval_detail: str | None = None  # PER-300: a declared string arg shown in full
     worker_requestable: bool = False  # PER-296: a worker may ask for it (`resonant request`)
 
     @model_validator(mode="after")
@@ -390,6 +391,9 @@ class CliTool(_Strict):
         summary = self.approval_summary
         if summary is not None and (missing := summary_args(summary) - set(self.args)):
             raise ValueError(f"approval_summary uses undeclared args: {sorted(missing)}")
+        detail = self.approval_detail
+        if detail is not None and self.args.get(detail) != "string":
+            raise ValueError(f"approval_detail must name a declared string arg, not {detail!r}")
         return self
 
 
@@ -758,6 +762,7 @@ class Manifest(BaseModel):
                 secrets=t.secrets,
                 commit=t.commit,
                 approval_summary=t.approval_summary,
+                approval_detail=t.approval_detail,
                 worker_requestable=t.worker_requestable,
             )
             for name, t in self.tools.items()

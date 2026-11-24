@@ -19,13 +19,14 @@ import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
-from resonant.gate.codes import clean_external
+from resonant.gate.codes import clean_external, mask_codes
 from resonant.gate.types import Intent
 from resonant_sdk.tool import parse_summary, summary_args
 
 MAX_ARGS = 3  # args shown; the rest become "+N more args"
 MAX_KEY_LEN = 20
 MAX_VALUE_LEN = 40
+DETAIL_MAX = 4096  # PER-300: one arg shown in full under the summary
 
 # Ordinary whitespace controls are readable once whitespace is collapsed for display.
 _ALLOWED_CONTROLS = frozenset("\t\n\r")
@@ -180,7 +181,43 @@ def phrased(intent: Intent) -> str | None:
     """The intent's summary from its tool's template, or None when it has none or it can't
     be filled."""
     template = intent.spec.approval_summary
-    return None if template is None else fill_summary(template, intent.args)
+    if template is None:
+        return None
+    # The detail arg stays in the line (clipped) too: a batch prompt shows lines only.
+    return fill_summary(template, intent.args)
+
+
+def detail_arg(intent: Intent) -> str | None:
+    """The arg the prompt shows in full (``approval_detail``), when the call sets it."""
+    name = intent.spec.approval_detail
+    value = intent.args.get(name) if name is not None else None
+    return name if isinstance(value, str) and value.strip() else None
+
+
+def detail_text(intent: Intent) -> str | None:
+    """PER-300: the tool's ``approval_detail`` arg as a block under the prompt's line: the
+    value verbatim (not normalised) in a code fence (line breaks kept, tabs as spaces, a
+    fence inside shown as ``'''``), with anything that could pass for an approval code
+    masked (``mask_codes``: a ``yes A7`` inside can't answer another prompt) and at most
+    ``DETAIL_MAX`` characters.
+    What was changed is said under the block. None when the tool has none or the arg is
+    unset. Bidi, zero-width and control characters never get here: ``unsafe_args`` makes the
+    gate deny such an intent outright."""
+    name = detail_arg(intent)
+    if name is None:
+        return None
+    # The value as it will run (no NFKC: what the approver reads is what executes).
+    text = str(intent.args[name]).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\t", "    ").replace("```", "'''").strip("\n")
+    notes: list[str] = []
+    masked = mask_codes(text)
+    if masked != text:
+        notes.append("code-like text shown as ?")
+    if len(masked) > DETAIL_MAX:
+        masked = masked[:DETAIL_MAX].rstrip()
+        notes.append(f"cut at {DETAIL_MAX} characters")
+    block = f"```\n{masked}\n```"
+    return block + (f"\n({'; '.join(notes)}; /approvals shows it unchanged)" if notes else "")
 
 
 def summarize(intent: Intent, *, action: str | None = None) -> str:
