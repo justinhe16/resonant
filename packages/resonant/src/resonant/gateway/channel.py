@@ -93,7 +93,10 @@ class ApprovalPrompt:
             always=self.always and not self.require_code and not destructive,
             phrased=self.phrased,
         )
-        return f"{text}\n{self.detail}" if self.detail else text
+        if not self.detail:
+            return text
+        # a fence in the line above would unbalance the block's fence (Slack renders both)
+        return text.replace("```", "'''") + "\n" + self.detail
 
 
 def approval_dedupe_key(approval_id: str, principal: str) -> str:

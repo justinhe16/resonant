@@ -93,10 +93,22 @@ def test_detail_is_the_value_in_full_in_a_fence() -> None:
     assert len(LONG_SQL) > 200  # far past the 40 characters a summary value gets
 
 
-def test_the_line_doesnt_repeat_the_detail_arg_after_it() -> None:
+def test_the_line_still_names_the_arg_clipped_for_batch_prompts() -> None:
     spec = RUN_SQL.model_copy(update={"approval_summary": "run on PROD (reason: {reason})"})
     line = phrased(make(spec, statement=LONG_SQL, reason="refund"))
-    assert line == "run on PROD (reason: refund)"  # statement is below, not "(statement=…)"
+    assert line is not None and line.startswith(
+        'run on PROD (reason: refund) (statement="update orders'
+    )
+    batch = ApprovalPrompt("b1", "K4", "2 changes", "write", "L1", NOW, lines=(line, "other"))
+    assert "update orders" in batch.text()  # a batch shows lines only: the clipped value is there
+
+
+def test_tool_spec_refuses_a_detail_that_isnt_a_string_arg() -> None:
+    schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
+    with pytest.raises(ValidationError, match="approval_detail"):
+        ToolSpec(name="t", effect=Effect.WRITE, args_schema=schema, approval_detail="n")
+    with pytest.raises(ValidationError, match="approval_detail"):
+        ToolSpec(name="t", effect=Effect.WRITE, args_schema=schema, approval_detail="missing")
 
 
 def test_codes_are_masked_and_said() -> None:
@@ -114,7 +126,7 @@ def test_long_values_are_cut_and_said_and_fences_cant_be_closed_early() -> None:
     body = text.split("\n```")[0]
     assert body.count("```") == 1  # only the opening fence
     assert "'''" in body
-    assert "cut at 4000 characters" in text
+    assert f"cut at {DETAIL_MAX} characters" in text
 
 
 def test_none_without_the_field_or_the_arg() -> None:
@@ -155,6 +167,15 @@ def test_gate_puts_the_detail_on_the_ask_and_the_prompt(gate: tuple[PolicyGate, 
     assert rest == decision.detail
 
 
+def test_a_fence_in_the_line_cant_unbalance_the_block() -> None:
+    prompt = ApprovalPrompt("a1", "K4", "run ```x", "write", "L1", NOW, detail="```\nselect 1\n```")
+    assert prompt.text().count("```") == 2
+    from dataclasses import replace
+
+    asked = replace(prompt, summary="R4 asks to run it", phrased=False)  # a worker request's prompt
+    assert asked.text().endswith("```\nselect 1\n```")
+
+
 def test_prompt_without_detail_is_unchanged() -> None:
     prompt = ApprovalPrompt("a1", "K4", "restart the thing", "write", "L2", NOW)
     assert "\n" not in prompt.text()
@@ -175,6 +196,16 @@ def test_slack_splits_a_long_prompt_keeping_the_fence() -> None:
     assert [b["type"] for b in built] == ["section"] * len(parts) + ["actions"]
     resolved = blocks.resolved_blocks(text, "Approved by Brian")
     assert [b["type"] for b in resolved] == ["section"] * len(parts) + ["context"]
+
+
+def test_slack_never_cuts_inside_an_entity() -> None:
+    text = blocks.format_text("[K4] OK?\n```\n" + "&" * 4096 + "\n```")
+    parts = blocks.split_sections(text)
+    for p in parts:
+        body = p.removeprefix("```\n").removesuffix("\n```")
+        assert body.replace("&amp;", "").count("&") == 0 or body.startswith("[K4]"), body[-12:]
+        assert len(p) <= blocks.SECTION_MAX
+    assert len(parts) <= blocks.SECTIONS_MAX
 
 
 def test_slack_short_text_is_one_section() -> None:

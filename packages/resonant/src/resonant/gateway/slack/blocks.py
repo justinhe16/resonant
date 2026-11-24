@@ -26,7 +26,8 @@ from resonant_sdk import Level
 
 MAX_CHUNK = 3000  # a message is split into parts of at most this many characters
 SECTION_MAX = 3000  # Slack's limit for a section's text
-SECTIONS_MAX = 10  # a long prompt's sections (Slack allows 50 blocks a message)
+SECTIONS_MAX = 20  # a long prompt's sections (Slack allows 50 blocks a message)
+_ENTITY_TAIL = re.compile(r"&[a-z]{0,3}$")  # a cut inside &amp; &lt; &gt; moves before it
 _FENCE = "```"
 
 _PR = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/(\d+)(?![\w/])")
@@ -72,8 +73,11 @@ def split_sections(text: str) -> list[str]:
     lines: list[str] = []
     for line in text.split("\n"):
         while len(line) > room:
-            lines.append(line[:room])
-            line = line[room:]
+            cut = room
+            if m := _ENTITY_TAIL.search(line[:cut]):
+                cut = m.start() or room
+            lines.append(line[:cut])
+            line = line[cut:]
         lines.append(line)
     packed: list[str] = []
     current: list[str] = []

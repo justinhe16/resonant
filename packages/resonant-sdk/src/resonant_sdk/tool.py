@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -162,6 +162,13 @@ class ToolSpec(BaseModel):
             self.extension is not None or self.effect is not Effect.READ or self.secrets
         ):
             raise ValueError(f"{self.name}: only builtin L0 reads can carry a member grant")
+        if self.approval_detail is not None:
+            props: Any = self.args_schema.get("properties")
+            prop: Any = None
+            if isinstance(props, dict):
+                prop = cast(dict[str, Any], props).get(self.approval_detail)
+            if not isinstance(prop, dict) or cast(dict[str, Any], prop).get("type") != "string":
+                raise ValueError(f"{self.name}: approval_detail must name a string arg")
         if self.worker_requestable and self.extension is None:
             raise ValueError(f"{self.name}: only extension tools can be worker requestable")
         return self
