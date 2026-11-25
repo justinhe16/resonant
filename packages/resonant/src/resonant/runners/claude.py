@@ -3186,11 +3186,9 @@ class ClaudeRunner:
             log.exception("remote control not recorded", extra={"run": run.code})
         if why is not None:
             log.warning("remote control unavailable", extra={"run": run.code, "reason": why})
-        text = (
-            f"{run.code} Remote Control: {url}"
-            if url is not None
-            else f"{run.code}: Remote Control unavailable: {why}."
-        )
+        if url is None:  # logged and audited above; not the thread's business
+            return
+        text = f"{run.code} Remote Control: {url}"
         try:  # once per run, whichever comes first (a resume's new URL is in /runs)
             await self._send_run(run, text, dedupe_key=f"run:{run.code}:remote")  # fmt: skip
         except ChannelError as e:

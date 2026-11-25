@@ -355,6 +355,21 @@ async def test_start_run_announces_only_when_the_brain_started_it(
     assert runner.announced == [False, True, False]
 
 
+async def test_start_run_marks_a_run_that_announced_itself(
+    components: Components, runner: FakeRunner
+) -> None:
+    """The brain's reply must not append the start text of a run that announced itself."""
+    handler = cast(Any, components.handlers[(None, "start_run")])
+    args = {"repo": "demo", "ask": "fix the typo"}
+    out = {}
+    for origin in ("explicit", "inferred"):
+        ctx = CallContext(secrets={}, idempotency_key=f"m-{origin}", task_id="t-none",
+                          origin=origin)  # fmt: skip
+        out[origin] = await handler(args, ctx)
+    assert "announced" not in out["explicit"]
+    assert out["inferred"]["announced"] is True
+
+
 async def test_start_run_passes_free_text_to_the_runner(
     components: Components, runner: FakeRunner
 ) -> None:

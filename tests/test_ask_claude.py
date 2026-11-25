@@ -944,3 +944,36 @@ async def test_brain_rules_follow_the_ask_prompt_and_a_bad_file_warns_once(
     assert "xxxx" not in system
     warns = [t for t in h.channel.texts if t.startswith("⚠ Brain instructions")]
     assert warns == [f"⚠ Brain instructions {rules} is over 8 KB: sessions start without them."]
+
+
+async def test_ack_is_skipped_when_a_run_already_announced_in_the_thread() -> None:
+    """The shared thread's ``On it.`` isn't sent after a run's own start line."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from resonant.runners import ask as ask_mod
+    from resonant.runners.ask_tools import mark_announced
+
+    sent: list[str] = []
+
+    async def send(_p: str, text: str, **_kw: object) -> None:
+        sent.append(text)
+
+    stub = SimpleNamespace(
+        _answered=set(), _acks=set(), conn=None, channel=SimpleNamespace(send=send),
+        _has_answer=lambda _t: False,  # pyright: ignore[reportUnknownLambdaType]
+    )  # fmt: skip
+    with (
+        mock.patch.object(ask_mod, "get_task", return_value=None),
+        mock.patch.object(ask_mod, "thread_of", return_value=None),
+    ):
+        ask_mod.AskRunner._ack_later(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, stub), "t-quiet", "owner", ask_mod.SHARED_ACK, 0.0
+        )
+        mark_announced("t-announced")
+        ask_mod.AskRunner._ack_later(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, stub), "t-announced", "owner", ask_mod.SHARED_ACK, 0.0
+        )
+        await asyncio.gather(*stub._acks)
+    assert sent == [ask_mod.SHARED_ACK]

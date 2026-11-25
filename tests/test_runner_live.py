@@ -378,9 +378,7 @@ async def test_remote_control_refused_leaves_the_run_going(
     await h.drain()
     run = h.run(code)
     assert run.status == "done" and run.remote_url is None
-    assert f"{code}: Remote Control unavailable: Remote Control requires a claude.ai login." in [
-        t for _who, t in h.chan.sent
-    ]
+    assert not [t for _who, t in h.chan.sent if "Remote Control" in t]  # never in the thread
     [entry] = audits(h, "run.remote_control")
     assert entry["ok"] is False
     seen = kv_get(db, REMOTE_KV)
@@ -397,9 +395,7 @@ async def test_remote_control_with_no_answer_times_out(
     code = await start(h)
     await h.drain()
     assert h.run(code).status == "done"
-    assert f"{code}: Remote Control unavailable: no answer in 0.3s." in [
-        t for _who, t in h.chan.sent
-    ]
+    assert not [t for _who, t in h.chan.sent if "Remote Control" in t]
 
 
 async def test_a_timeout_turns_remote_control_off_before_the_kill(

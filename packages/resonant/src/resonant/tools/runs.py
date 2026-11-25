@@ -489,8 +489,11 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)
-        return {"started": True, "code": started.code, "repo": started.repo or None,
-                "text": started.text}  # fmt: skip
+        out: dict[str, Any] = {"started": True, "code": started.code,
+                               "repo": started.repo or None, "text": started.text}  # fmt: skip
+        if announce:  # the run posts its own start line: the reply must not repeat it
+            out["announced"] = True
+        return out
 
     def _known(conn: sqlite3.Connection, code: str) -> bool:
         """PER-270: the owner was already texted how this run ended (its pulse item is

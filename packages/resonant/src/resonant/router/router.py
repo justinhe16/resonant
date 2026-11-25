@@ -265,6 +265,18 @@ class Router:
             if plain_reply_clashes(sent, opens, check=check):
                 return relayed(clash_text(sent, opens))
             skip_inbox = not sent
+        # A bare yes/no with nothing pending isn't an approval reply: it answers whatever
+        # was just asked in the conversation (the brain's own question, in Slack), so it goes on to
+        # the brain instead of "Nothing is waiting for approval". A replayed event is still
+        # the inbox's (its first delivery resolved it).
+        if (
+            event.source == "slack"
+            and plain is not None
+            and plain.code is None
+            and not self.inbox.gate.pending_for(principal)
+            and not ap.by_resolved_event(self.conn, event.id)
+        ):
+            skip_inbox = True
         skip_inbox = skip_inbox or voice
         answered = None if skip_inbox else self.inbox.handle(event, text, principal, spans=spans)
         if answered is not None:
