@@ -800,6 +800,8 @@ async def test_no_blocks_without_a_report_that_has_them() -> None:
         [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
             {"type": "usergroup", "usergroup_id": "S1"}]}]}],
         [{"type": "actions", "elements": []}],
+        [{"type": ["x"]}],
+        [{"type": "context", "elements": [{"type": {"a": 1}}]}],
     ],
 )  # fmt: skip
 def test_invalid_report_blocks_are_ignored(bad: Any) -> None:

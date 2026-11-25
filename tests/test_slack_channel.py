@@ -509,6 +509,8 @@ async def test_a_room_post_carries_blocks_with_the_text_as_fallback(
         [{"type": "section", "text": {"type": "mrkdwn", "text": "x"},
           "accessory": {"type": "image", "image_url": "https://example.com/p.png"}}],
         [{"type": "input"}],
+        [{"type": ["x"]}],
+        [{"type": "section", "text": {"type": {"a": 1}, "text": "x"}}],
     ],
 )  # fmt: skip
 async def test_invalid_room_blocks_post_the_text_alone(

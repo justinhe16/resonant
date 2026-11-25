@@ -127,10 +127,10 @@ def _display_only(value: object, *, top: bool = False) -> bool:
         return all(_display_only(v) for v in cast(list[Any], value))
     if isinstance(value, dict):
         obj = cast(dict[Any, Any], value)
-        kind = obj.get("type")
-        if top and kind not in BLOCK_TYPES:
+        kind: object = obj.get("type")
+        if top and not (isinstance(kind, str) and kind in BLOCK_TYPES):
             return False
-        if not top and "type" in obj and kind not in INNER_TYPES:
+        if not top and "type" in obj and not (isinstance(kind, str) and kind in INNER_TYPES):
             return False
         return all(_display_only(k) and _display_only(v) for k, v in obj.items())
     return True
