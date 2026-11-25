@@ -42,6 +42,12 @@ notes), ``"delay": <s>`` waits before answering, ``"hang": true`` never answers,
 ``"limit": <epoch or null>`` answers with a usage limit error. A success ``result`` carries a
 fixed ``usage`` and ``duration_ms`` (``USAGE``).
 
+**Continuations** (PER-321): a message carrying ``CONTINUED`` (Resonant feeding a decided
+approval back, ``runners/continuation.py``) takes the next plan of the top-level
+``"continued": [plan, ...]`` list instead (the last one repeats; counted in the notes dir, so
+a restart goes on with the next), else an empty answer (Claude ended without one, so
+Resonant's code-built text goes out instead, as before PER-321).
+
 ``--notes DIR`` writes ``session.json`` after each turn: the argv, the prompt (this turn's
 message), the MCP tool list and every call's result text (what Claude saw), plus in a session
 the session id, ``resumed``, the pid and every message so far, for tests to check (an
@@ -65,6 +71,11 @@ from pathlib import Path
 from typing import Any, cast
 
 BUILTINS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
+# The start of a continuation's last line (``runners/continuation.py`` TAIL; stdlib only here).
+CONTINUED = "Carry on with the request now:"
+# No ``continued`` plan: Claude ends without an answer, so Resonant's code-built text goes out
+# (what a test written before PER-321 expects after a yes or a no).
+CONTINUED_DEFAULT: dict[str, Any] = {"answer": ""}
 # A success ``result`` reports usage as the real CLI does (PER-250: the live eval reads it).
 USAGE: dict[str, Any] = {"usage": {"input_tokens": 1200, "output_tokens": 80}, "duration_ms": 40}
 
@@ -122,6 +133,7 @@ class Fake:
         self.names: list[str] = []
         self.listed: list[dict[str, Any]] = []
         self.n = 0
+        self.served = 0  # continuation messages answered (without --notes)
         for path in list(a.mcp_config or []):
             config = json.loads(Path(path).read_text())
             for name, spec in cast(dict[str, Any], config.get("mcpServers") or {}).items():
@@ -138,12 +150,25 @@ class Fake:
         asks: Any = perms.get("ask") or []
         self.ask_rules = [str(r) for r in cast(list[Any], asks)]
 
-    def plan(self, message: str) -> dict[str, Any]:
+    def plan(self, message: str, full: str = "") -> dict[str, Any]:
         plan: dict[str, Any] = json.loads(Path(self.a.script).read_text())
+        if CONTINUED in (full or message):
+            return self.continued(plan)
         for turn in cast(list[dict[str, Any]], plan.get("turns") or []):
             if str(turn.get("when", "")) in message:
                 return turn
         return plan
+
+    def continued(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """The next of the plan's ``continued`` plans (the last repeats)."""
+        plans = cast(list[dict[str, Any]], plan.get("continued") or [CONTINUED_DEFAULT])
+        mark = Path(self.a.notes) / "continued-n" if self.a.notes else None
+        known = mark is not None and mark.exists()
+        n = int(mark.read_text() or "0") if mark is not None and known else self.served
+        self.served = n + 1
+        if mark is not None:
+            mark.write_text(str(n + 1))
+        return plans[min(n, len(plans) - 1)]
 
     def init(self, session_id: str, extra_tools: Sequence[str] = ()) -> None:
         out({"type": "system", "subtype": "init", "session_id": session_id,
@@ -353,7 +378,7 @@ class Fake:
             if history is not None:
                 history.write_text(json.dumps(messages))
             self.init(sid)
-            plan = self.plan(text.splitlines()[-1] if text else "")  # the owner's text
+            plan = self.plan(text.splitlines()[-1] if text else "", text)  # the owner's text
             results = self.act(plan)
             self.shell(plan, results)
             self.notes(prompt=text, results=results, session_id=sid, resumed=bool(a.resume),

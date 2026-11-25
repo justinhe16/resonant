@@ -438,8 +438,12 @@ def reply(r: Running, text: str) -> None:
 
 
 def ask_task(r: Running) -> sqlite3.Row:
-    """The one Claude brain turn a plain-words text made."""
-    (task,) = r.rows("SELECT * FROM tasks WHERE runner = 'ask'")
+    """The one Claude brain turn a plain-words text made (PER-321: not the continuation a
+    decided approval queues after it)."""
+    (task,) = r.rows(
+        "SELECT * FROM tasks WHERE runner = 'ask' "
+        "AND json_extract(checkpoint, '$.continuation') IS NULL"
+    )
     return task
 
 
