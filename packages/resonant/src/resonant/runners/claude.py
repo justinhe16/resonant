@@ -82,7 +82,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 import psutil
@@ -158,7 +158,7 @@ from resonant.runner.workspace import (
     upstream_merges,
     write_session_credentials,
 )
-from resonant.runners import activity, reaper, status, worker_cli
+from resonant.runners import activity, milestones, reaper, status, worker_cli
 from resonant.runners.live import (
     RC_OFF_TIMEOUT_S,
     RC_TIMEOUT_S,
@@ -971,6 +971,8 @@ class ClaudeRunner:
         resonant_home: Path | None = None,
         instance: str = inst.DEFAULT_INSTANCE,
         requests: GatedTools | None = None,
+        milestones_mode: milestones.Mode = "off",
+        milestone_quiet_s: float = milestones.QUIET_S,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -1010,8 +1012,16 @@ class ClaudeRunner:
 
         PER-291: ``resonant_home`` (default ``$RESONANT_HOME`` or ``~/.resonant``) and
         ``instance`` are put in every session's environment (``RESONANT_HOME``,
-        ``RESONANT_INSTANCE``), so a stray real ``resonant`` call targets this instance."""
+        ``RESONANT_INSTANCE``), so a stray real ``resonant`` call targets this instance.
+
+        PER-323: ``milestones_mode`` (``runs.milestones``) posts a run's milestones in its
+        conversation (``thread``) or records them only (``off``); nothing is posted before
+        the session has worked ``milestone_quiet_s``."""
         self.conn = conn
+        self.milestones_mode: milestones.Mode = milestones_mode
+        self.milestone_quiet_s = milestone_quiet_s
+        self._loud: set[str] = set()  # codes past the quiet window: milestones post at once
+        self._milestone_locks: dict[str, asyncio.Lock] = {}
         self.api_port = api_port
         self.bridge = bridge
         self.resonant_home = resonant_home or default_resonant_home()
@@ -2023,6 +2033,67 @@ class ClaudeRunner:
             return
         self.reports.told(item)
 
+    # -- milestones in the asking conversation (PER-323) --
+
+    def _track(self, run: Run, tracker: milestones.Tracker, msg: dict[str, Any]) -> None:
+        """Feed one stream message to the session's milestone tracker; a new milestone is
+        recorded and, past the quiet window with ``runs.milestones: thread``, posted. Never
+        raises: the stream must keep flowing."""
+        try:
+            if msg.get("type") == "assistant":
+                tracker.calls(msg)
+                return
+            found = tracker.results(msg)
+            new = [m for m in found if milestones.record(self.conn, run.code, m)]
+        except Exception:
+            log.exception("milestone tracking failed", extra={"run": run.code})
+            return
+        for m in new:
+            with contextlib.suppress(Exception), atomic(self.conn):
+                audit(self.conn, "run.milestone", run=run.code, kind=m.kind)
+        if new and run.code in self._loud:
+            self._spawn(self._post_milestones(run.code))
+
+    async def _post_milestones(self, code: str) -> None:
+        """Post run ``code``'s milestones not yet said, in its conversation, each once (the
+        channel dedupes ``status:<task>:milestone:<kind>``). Only while the run is running,
+        Resonant isn't paused and ``runs.milestones`` is ``thread``; a failed send stays
+        pending for the next one. Never raises."""
+        if self.milestones_mode != "thread":
+            return
+        async with self._milestone_locks.setdefault(code, asyncio.Lock()):
+            try:
+                run = runs.get(self.conn, code)
+                if run is None or run.status != "running" or run.task_id is None:
+                    return
+                if self._paused():
+                    return
+                todo = milestones.pending(self.conn, code)
+            except Exception:
+                log.exception("milestones not read", extra={"run": code})
+                return
+            for key, m in todo:
+                dedupe = status.status_key(run.task_id, milestones.dedupe_suffix(key))
+                try:
+                    await self._send_run(run, milestones.line(code, m), dedupe_key=dedupe)
+                except ChannelError as e:
+                    why = {"run": code, "kind": m.kind, "error": type(e).__name__}
+                    log.warning("milestone not sent", extra=why)
+                    return
+                with contextlib.suppress(Exception):
+                    milestones.mark(self.conn, code, key, "posted")
+
+    async def _end_milestones(self, code: str) -> None:
+        """The run ended: milestones not posted yet are the final result's to say. A post in
+        flight finishes first, so the final result always comes after the lines."""
+        self._loud.discard(code)
+        async with self._milestone_locks.setdefault(code, asyncio.Lock()):
+            try:
+                milestones.fold(self.conn, code)
+            except Exception:
+                log.exception("milestones not folded", extra={"run": code})
+        self._milestone_locks.pop(code, None)
+
     def _peer_ok(self, code: str, pid: int | None) -> bool:
         """A CLI caller speaks for run ``code`` only from inside its live session."""
         target = self._live.get(code)
@@ -2670,6 +2741,7 @@ class ClaudeRunner:
             assert proc.stdout
             counted = False
             seen = self._side_effect_context(run, p)
+            tracker = milestones.Tracker()  # PER-323
             async for raw, truncated in read_lines(proc.stdout):
                 last_line = time.monotonic()
                 writer.write(raw, truncated)
@@ -2679,6 +2751,9 @@ class ClaudeRunner:
                     last_kind = kind
                 if kind == "assistant" and msg is not None:
                     self._detect(run, msg, seen)
+                    self._track(run, tracker, msg)
+                elif kind == "user" and msg is not None:
+                    self._track(run, tracker, msg)
                 elif kind == "control_response" and msg is not None:
                     live.feed(msg)
                 elif kind == "result" and msg is not None:
@@ -2784,6 +2859,9 @@ class ClaudeRunner:
                 if _bucket(used) != bucket:
                     bucket = _bucket(used)
                     self._pulse_open(self._must_get(run.code), bucket)
+                if used >= self.milestone_quiet_s and run.code not in self._loud:
+                    self._loud.add(run.code)  # PER-323: past the quiet window
+                    self._spawn(self._post_milestones(run.code))
         finally:
             # Also on cancellation: nothing of the session may outlive the step. The socket
             # goes first, so no CLI call still in flight texts anyone after a stop.
@@ -3521,6 +3599,7 @@ class ClaudeRunner:
         reply (once), and tell the loop how the task ended. ``watching`` and ``note`` are
         the auto-merge's (it will merge once CI is green; why it won't)."""
         self._forks.pop(run.code, None)
+        await self._end_milestones(run.code)
         if run.status == "cancelled":
             await self._finish_cancelled(run.code, send=False)
         else:
@@ -3589,6 +3668,9 @@ class ClaudeRunner:
             extra = [*warn, *setup, *([note] if note else []), *lines, *([also] if also else []),
                      *said]  # fmt: skip
             text = end_text(head, extra)
+        nxt = self._next_step(run)  # PER-323: the suggested next step, code-built
+        if text is not None and nxt is not None:
+            text = f"{text}\n{nxt}"
         held = any(
             e.high and e.kind in HELD_KINDS for e in detected_list(self.conn, run.code)
         )  # a merge the end text says: the side effect's level applies to it
@@ -3620,7 +3702,8 @@ class ClaudeRunner:
                                   merged=merged, merged_by=merged_by, warn=[*warn, *setup],
                                   note=note,
                                   lines=parts[1], also=also,
-                                  going=self._still_names(run))  # fmt: skip
+                                  going=self._still_names(run), next_step=nxt,
+                                  audience=self._audience(run))  # fmt: skip
             if facts is not None:
                 voiced = await self.voice.write(facts, text, ref=f"run:{run.code}:{run.status}")
                 if voiced.used:
@@ -3669,9 +3752,27 @@ class ClaudeRunner:
 
     def _voiced(self, run: Run) -> bool:
         """Whether ``run``'s outcome text is written by the voice: one the owner asked for
-        (PER-294: the requester, not the run's principal), not a cancel (the owner did it, the
+        (PER-294: the requester, not the run's principal) or, PER-323, any run asked for in a
+        thread (a teammate's final result in plain words); not a cancel (the owner did it, the
         text is one line of ours)."""
-        return run.status != "cancelled" and (self.owner is None or run.requester == self.owner)
+        if run.status == "cancelled":
+            return False
+        return self._audience(run) == "owner" or run_thread(self.conn, run) is not None
+
+    def _audience(self, run: Run) -> Literal["owner", "team"]:
+        """Who reads the run's final result: the owner, or the teammate who asked."""
+        return "owner" if self.owner is None or run.requester == self.owner else "team"
+
+    def _next_step(self, run: Run) -> str | None:
+        """PER-323: the final result's suggested next step (staging has it, production
+        doesn't), for a run that ended with its work in; None otherwise or on any trouble."""
+        if run.status not in ("done", "ready", "merged"):
+            return None
+        try:
+            return milestones.next_step(milestones.deployed_envs(self.conn, run.code))
+        except Exception:
+            log.exception("next step unavailable", extra={"run": run.code})
+            return None
 
     def _still_names(self, run: Run) -> list[str]:
         """The owner's other active runs, by name (at most two, then ``N more``); [] when

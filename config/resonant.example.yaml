@@ -112,6 +112,13 @@ pulse:
   remention_after: 10m                  # a pending approval is mentioned once more after this (capped at half gate.approval_ttl_s)
   # heartbeat: {room: null}            # PER-303: an hourly alive line to a channels.slack.rooms key (Cori)
 
+# PER-323: a run's milestone lines (PR opened, CI failed and being fixed, review asked for
+# changes, merged, deployed to staging) in the conversation that asked, each once, after a
+# minute of work. Unset: thread when channels.slack.enabled, else off (iMessage gets only the
+# final result).
+# runs:
+#   milestones: off                     # thread | off
+
 # The brain's read tools (docs/brain-plan.md D5; read_file, list_dir, search, tail_log,
 # read_transcript) and ask_claude (D8). Defaults shown commented out:
 # brain:
