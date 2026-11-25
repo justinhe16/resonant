@@ -78,6 +78,11 @@ class ApprovalPrompt:
     # PER-300: one arg in full (a code fence built by ``gate.summary.detail_text``), under
     # the question. Never on a batch prompt.
     detail: str | None = None
+    # PER-324: the brain's stated reason, cleaned (``gate.summary.plain_line``): the question
+    # in plain words, with the code-built ``summary`` under it as the exact call. None: the
+    # summary is the question, as before. ``plains``: a batch's, by position with ``lines``.
+    plain: str | None = None
+    plains: tuple[str | None, ...] = ()
 
     def text(self) -> str:
         """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay,
@@ -88,6 +93,7 @@ class ApprovalPrompt:
                 self.lines,
                 require_code=self.require_code,
                 destructive=self.destructive,
+                plains=self.plains,
             )
         destructive = self.level == Level.L1.value and self.effect != Effect.PAY.value
         text = approval_text(
@@ -97,6 +103,7 @@ class ApprovalPrompt:
             destructive=destructive,
             always=self.always and not self.require_code and not destructive,
             phrased=self.phrased,
+            plain=self.plain,
         )
         if not self.detail:
             return text

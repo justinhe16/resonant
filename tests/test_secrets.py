@@ -12,16 +12,18 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus
+from zoneinfo import ZoneInfo
 
 import pytest
 from typer.testing import CliRunner
 
 from resonant import cli
 from resonant.cli import EX_TEMPFAIL, app
+from resonant.config import load_settings
 from resonant.redact import REDACTED, Redactor
 from resonant.secrets import (
     EXIT_NOT_FOUND,
@@ -681,7 +683,10 @@ def test_cli_list_shows_expiries(
 ) -> None:
     conn = expiry_db(resonant_home)
     now = datetime.now(UTC)
-    later = now + timedelta(days=100, hours=1)
+    # noon, 100 calendar days from today in the configured zone: "100d" whatever the hour
+    zone = ZoneInfo(load_settings().timezone)
+    today = now.astimezone(zone).date() + timedelta(days=100)
+    later = datetime.combine(today, time(12), tzinfo=zone).astimezone(UTC)
     expiry_store.upsert(conn, "runner/github_app_key", expires_at=later, source="owner",
                         set_at=now)  # fmt: skip
     expiry_store.upsert(conn, "runner/github_token", expires_at=now - timedelta(days=2, hours=1),

@@ -585,6 +585,74 @@ async def test_a_write_after_claude_read_outside_content_asks(
         assert [a["detail"]["origin"] for a in evaluated] == ["tainted"] * 3
 
 
+async def test_a_gated_call_with_a_reason_asks_in_plain_words_first(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-324: Claude's ``approval_reason`` is the prompt's question, the exact call under
+    it; the bridge strips it, so the tool runs with its own args on the yes."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        assert await w.say("/note buy milk") == ['Saved note 1: "buy milk"']
+        w.model.triage = CLAUDE
+        reason = "remove the old shopping note."
+        w.claude(
+            calls=[{"name": "delete_note", "args": {"id": 1, "approval_reason": reason},
+                    "after_read": True}],
+            answer="{r0}",
+        )  # fmt: skip
+        answer, prompt = await w.say("read that page and tidy my notes", replies=2)
+        assert "asked the owner" in answer
+        (row,) = w.rows("SELECT code, summary FROM approvals WHERE status = 'pending'")
+        call = json.loads(w.ask_tasks()[-1]["checkpoint"])["call"]
+        assert call["args"] == {"id": 1} and call["reason"] == "Remove the old shopping note"
+        assert prompt.split("\n")[:2] == [
+            f"Remove the old shopping note? [{row['code']}] yes / no",
+            f"`{row['summary']}`",
+        ]
+        listed = {t["name"]: t["inputSchema"] for t in w.session()["tools"]}
+        assert "approval_reason" in listed["delete_note"]["properties"]
+        assert "approval_reason" not in listed["list_notes"]["properties"]
+        await w.prompt_recorded()
+        (done,) = await w.say("yes")
+        assert done == "Deleted note 1."
+
+
+async def test_a_batch_shows_each_reason_over_its_exact_line(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as w:
+        assert await w.say("/note buy milk") == ['Saved note 1: "buy milk"']
+        assert await w.say("/note call mom") == ['Saved note 2: "call mom"']
+        w.model.triage = CLAUDE
+        w.claude(
+            calls=[
+                {"name": "delete_note", "args": {"id": 1, "approval_reason": "Remove note one"},
+                 "after_read": True},
+                {"name": "delete_note", "args": {"id": 2}},
+            ],
+            answer="{r0} {r1}",
+        )  # fmt: skip
+        _, prompt = await w.say("read that page and tidy my notes", replies=2)
+        lines = prompt.split("\n")
+        assert lines[0].endswith("OK to make these 2 changes?")
+        assert lines[1] == "1. Remove note one"
+        assert lines[2].startswith("   `") and lines[2].endswith("`")
+        assert lines[3].startswith("2. ") and "`" not in lines[3]
+
+
+async def test_a_gated_call_without_a_reason_keeps_todays_prompt(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as w:
+        assert await w.say("/note buy milk") == ['Saved note 1: "buy milk"']
+        w.model.triage = CLAUDE
+        w.claude(calls=[{"name": "delete_note", "args": {"id": 1}, "after_read": True}],
+                 answer="{r0}")  # fmt: skip
+        _, prompt = await w.say("read that page and tidy my notes", replies=2)
+        (row,) = w.rows("SELECT code, summary FROM approvals WHERE status = 'pending'")
+        assert prompt == f"OK to {row['summary']}? [{row['code']}] yes / no"
+        assert "`" not in prompt
+
+
 async def test_an_untainted_l3_write_runs_with_its_report_line(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:

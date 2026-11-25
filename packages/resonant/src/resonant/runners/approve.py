@@ -48,7 +48,7 @@ pulse's ``core/approval/<code>`` re-mention.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -113,12 +113,17 @@ def approval_prompt(decision: NeedsApproval) -> ApprovalPrompt:
         always=decision.allow_always,
         phrased=decision.phrased,
         detail=decision.detail,
+        plain=decision.plain,
     )
 
 
-def batch_prompt(batch: ApprovalBatch) -> ApprovalPrompt:
-    """BA-1: one prompt for a batch (deduped per approver by the batch's id)."""
+def batch_prompt(
+    batch: ApprovalBatch, plains: Mapping[str, str | None] | None = None
+) -> ApprovalPrompt:
+    """BA-1: one prompt for a batch (deduped per approver by the batch's id). ``plains``
+    (PER-324): each approval's plain sentence by approval id."""
     assert batch.expires_at is not None
+    by_id = plains or {}
     return ApprovalPrompt(
         approval_id=batch.batch_id,
         code=batch.code,
@@ -129,6 +134,7 @@ def batch_prompt(batch: ApprovalBatch) -> ApprovalPrompt:
         require_code=batch.require_code,
         lines=batch.lines,
         destructive=batch.destructive,
+        plains=tuple(by_id.get(i) for i in batch.approval_ids) if by_id else (),
     )
 
 
@@ -166,11 +172,13 @@ async def prompt_batch(
     batch: ApprovalBatch,
     *,
     now: Callable[[], datetime],
+    plains: Mapping[str, str | None] | None = None,
 ) -> PromptResult:
     """BA-1: send a batch's one prompt to its approver (the owner), recording the sent ref on
-    every approval in it (the sent-before rule reads each). Same failure rules."""
+    every approval in it (the sent-before rule reads each). Same failure rules. ``plains``
+    (PER-324): each change's plain sentence by approval id."""
     return await _prompt(
-        conn, channel, batch_prompt(batch), batch.approvers, batch.approval_ids,
+        conn, channel, batch_prompt(batch, plains), batch.approvers, batch.approval_ids,
         task_id=batch.task_id, now=now,
     )  # fmt: skip
 

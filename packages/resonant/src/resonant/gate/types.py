@@ -191,6 +191,10 @@ class NeedsApproval:
     # PER-300: one arg shown in full under the summary (``summary.detail_text``), built by code
     # from the intent; never stored on the approval row (``/approvals <code>`` has the args).
     detail: str | None = None
+    # PER-324: the brain's stated reason for the call, cleaned (``summary.plain_line``), the
+    # prompt's plain first line. Set by ``ToolCore`` from the pinned call (never by the gate,
+    # never stored on the approval row, never part of the intent hash). None: no plain line.
+    plain: str | None = None
 
 
 @dataclass(frozen=True)
