@@ -161,7 +161,13 @@ LIST_PAGES = 5  # conversations.list pages looked at to find a channel by name
 _RATE_WINDOW = timedelta(minutes=1)
 # Slack's answers that mean "these blocks", not "this room": a room post then goes as text
 BLOCK_ERRORS = frozenset(
-    {"invalid_blocks", "invalid_blocks_format", "msg_blocks_too_long", "too_many_blocks"}
+    {
+        "invalid_blocks",
+        "invalid_blocks_format",
+        "msg_blocks_too_long",
+        "too_many_blocks",
+        "invalid_arguments",
+    }
 )
 
 

@@ -23,7 +23,7 @@ Nothing at all: ``Quiet day.``. Code-built, no voice.
 **Blocks** (PER-332). A report may also carry ``state.blocks``: Slack Block Kit blocks the
 extension builds itself (a header, sections with fields, a table, ...). When at least one
 listed report has valid ones (``slack.blocks.valid_blocks``: a list of 1..50 objects with a
-string ``type``, no ``<!channel>``-style mention), the post also carries blocks
+string ``type``, display-only, no ping), the post also carries blocks
 (:func:`render_blocks`): each report's own blocks, or a plain-text section of its title and
 lines when it has none, then a section with the runs and approvals lines, a divider between
 parts. Over 50 blocks in all: no blocks. The text above is always posted with them as the

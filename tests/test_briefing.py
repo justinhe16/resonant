@@ -797,8 +797,11 @@ async def test_no_blocks_without_a_report_that_has_them() -> None:
         [{"no": "type"}],
         [{"type": "section", "text": {"type": "mrkdwn", "text": "<!here> look"}}],
         [{"type": "divider"}] * 51,
+        [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+            {"type": "usergroup", "usergroup_id": "S1"}]}]}],
+        [{"type": "actions", "elements": []}],
     ],
-)
+)  # fmt: skip
 def test_invalid_report_blocks_are_ignored(bad: Any) -> None:
     assert rd.report_blocks({"blocks": bad}) == []
     assert rd.report_blocks({"digest": ["x"]}) == [] and rd.report_blocks(None) == []

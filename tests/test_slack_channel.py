@@ -480,6 +480,16 @@ async def test_a_room_post_carries_blocks_with_the_text_as_fallback(
     assert len(w.web.posts) == 1 and dropped(db) == []
     await w.slack.post_room("digest", "x" * 3200, blocks=[HEADER])
     assert len(w.web.posts[-1].text) == 3000 and w.web.posts[-1].blocks == [HEADER]
+    rich: list[dict[str, Any]] = [
+        HEADER,
+        {"type": "section", "fields": [{"type": "mrkdwn", "text": "*Web*\n<https://x.test|ok>"}]},
+        {"type": "divider"},
+        {"type": "context", "elements": [{"type": "plain_text", "text": "today", "emoji": True}]},
+        {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+            {"type": "text", "text": "PRs "}, {"type": "link", "url": "https://x.test/pr/1"}]}]},
+    ]  # fmt: skip
+    await w.slack.post_room("digest", "Daily", blocks=rich)
+    assert w.web.posts[-1].blocks == rich and dropped(db) == []
 
 
 @pytest.mark.parametrize(
@@ -490,8 +500,17 @@ async def test_a_room_post_carries_blocks_with_the_text_as_fallback(
         ["not a block"],
         [{"text": "no type"}],
         [{"type": "section", "text": {"type": "mrkdwn", "text": "hi <!channel>"}}],
+        [{"type": "section", "text": {"type": "mrkdwn", "text": "hi <@U123>"}}],
+        [{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "broadcast", "range": "channel"}]}
+        ]}],
+        [{"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text",
+                                                                      "text": "Go"}}]}],
+        [{"type": "section", "text": {"type": "mrkdwn", "text": "x"},
+          "accessory": {"type": "image", "image_url": "https://example.com/p.png"}}],
+        [{"type": "input"}],
     ],
-)
+)  # fmt: skip
 async def test_invalid_room_blocks_post_the_text_alone(
     w: World, db: sqlite3.Connection, bad: list[Any]
 ) -> None:
