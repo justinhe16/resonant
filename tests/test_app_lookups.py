@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 from github_app_fakes import FakeGitHubApi, private_pem_one_line
 from github_public_fakes import FakePublicApi, public
-from test_runner_capabilities import assert_no_github_in_session, claude_only, owner_checkout
+from test_runner_capabilities import claude_only, owner_checkout
 from test_runner_claude import Harness, build
 
 from resonant.config import GitHubAppConfig
@@ -156,7 +156,7 @@ def unregistered_private(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_app_only_registers_an_unregistered_private_repo_and_the_run_starts(
     tmp_path: Path, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    h = build(tmp_path, db, scenario="happy", extra=["--no-push"])
+    h = build(tmp_path, db, scenario="happy")
     app_only(h)
     unregistered_private(h, monkeypatch)
     tokens: list[str | None] = []
@@ -174,10 +174,11 @@ async def test_app_only_registers_an_unregistered_private_repo_and_the_run_start
     assert repo is not None and (repo.mode, repo.ci) == ("push", True)
     await h.drain()
     run = h.run()
-    assert run.status == "done" and run.branch is not None  # a local branch: no daemon token
+    # PER-334: the App alone pushes, and Resonant finds and checks the PR through it
+    assert run.status == "ready" and run.pr_number is not None, run.failure
     assert h.checkout().is_dir()  # cloned with the App's read token
     assert tokens and all(t is not None and t.startswith("ghs_") for t in tokens)
-    assert_no_github_in_session(h, app_reads=True)
+    assert READ in [m["permissions"] for m in h.api.mints]
     assert all(m["repositories"] == ["proj"] for m in h.api.mints)
 
 

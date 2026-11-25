@@ -294,25 +294,16 @@ async def test_token_without_the_app_runs_from_the_mirror_and_commits_locally(
     assert (await h.runner.capabilities()).no_push == "app"
 
 
-async def test_app_without_the_token_cant_push_either(
-    tmp_path: Path, db: sqlite3.Connection
-) -> None:
-    """Pushing needs both: the App for the session's token, the daemon's token for finding
-    and checking the PR (and the base-push watch)."""
-    h = build(tmp_path, db, scenario="happy", extra=["--no-push"])
+async def test_app_without_the_token_pushes(tmp_path: Path, db: sqlite3.Connection) -> None:
+    """PER-334: the App alone is enough to push: Resonant finds and checks the PR with App
+    tokens (``test_app_worker_calls.py`` has the whole run)."""
+    h = build(tmp_path, db, scenario="happy")
     del h.keychain.items[GITHUB_TOKEN_REF]
     h.api.add_repo("own/proj")  # PER-327: the installation can read it
-    owner_checkout(h)
+    caps = await h.runner.capabilities()
+    assert caps.no_push is None and caps.notes() == []
     res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now")
-    assert isinstance(res, Started)
-    assert res.limits == (
-        "Heads up: no push yet (runner/github_token not set); the work stays on a local branch."
-    )
-    await h.drain()
-    assert h.run().failure == "can't push yet: runner/github_token isn't set"
-    # PER-327: the mirror is fetched with the App's read token; the session still gets none
-    assert (h.cfg.mirror_dir / "proj.git" / "HEAD").exists()
-    assert_no_github_in_session(h, app_reads=True)
+    assert isinstance(res, Started) and res.limits is None
 
 
 # --- everything -----------------------------------------------------------------------------
@@ -337,6 +328,7 @@ async def test_merge_without_the_token_is_refused_on_its_own(
     await h.drain()
     assert h.run(code).status == "ready"
     del h.keychain.items[GITHUB_TOKEN_REF]
+    del h.keychain.items[GITHUB_APP_KEY_REF]  # PER-334: the App alone would merge
     assert await h.runner.merge_run(code) == Refused(needs_github_token("Merging R1"))
     assert h.gh_calls("merge") == []
 
@@ -391,6 +383,7 @@ async def test_a_push_run_whose_token_went_before_prepare_fails_clearly(
     h = build(tmp_path, db)
     code = await h.start()
     del h.keychain.items[GITHUB_TOKEN_REF]  # removed while the run was queued
+    del h.keychain.items[GITHUB_APP_KEY_REF]  # PER-334: the App alone would do
     await h.drain()
     run = h.run(code)
     assert run.status == "failed"

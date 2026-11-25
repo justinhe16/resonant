@@ -735,8 +735,9 @@ def _home(path: str) -> str:
 class Capabilities:
     """What the runner can do beyond starting a Claude session (RX-1). The Claude credential
     and the CLI are required for any run (``setup_missing``); the GitHub pieces each unlock
-    more: the daemon's token (lookups, private clones, the PR checks, merges, new repos, fork
-    runs) and the GitHub App (a session token, so the worker can push and open its PR)."""
+    more: the GitHub App (a session token, so the worker can push and open its PR; PER-327/334:
+    and, with no daemon token, the lookups, clones, PR checks, CI and merges) and the daemon's
+    token (all of those when the App isn't set up; new repos and fork runs always)."""
 
     github_token: bool
     app_key: bool
@@ -749,13 +750,9 @@ class Capabilities:
     @property
     def no_push(self) -> str | None:
         """Why a repo run can't push (a key of ``NO_PUSH_SHORT``), or None. Pushing needs the
-        App (the session's token) and the daemon's token (Resonant finds and checks the PR
-        with it, and watches the base for direct pushes)."""
-        if not self.app:
-            return "app"
-        if not self.github_token:
-            return "token"
-        return None
+        App (the session's token). PER-334: the App alone is enough: with no daemon token,
+        Resonant finds and checks the PR, reads its CI and merges with App tokens too."""
+        return None if self.app else "app"
 
     def notes(self) -> list[str]:
         """One line per missing piece: what it unlocks and how to set it."""
@@ -768,10 +765,9 @@ class Capabilities:
                 "No push or PRs yet: the GitHub App isn't set up, so workers commit to a "
                 f"local branch. On the Mini: {'; '.join(how)}."
             )
-        if not self.github_token:
-            push = "" if not self.app else "push, PRs, "
+        if not self.github_token and not self.app:  # PER-334: the App covers it when set up
             notes.append(
-                f"No {push}merges, repo lookups, private clones, new repos or fork runs yet: "
+                "No merges, repo lookups, private clones, new repos or fork runs yet: "
                 f"runner/github_token isn't set. On the Mini: {GITHUB_TOKEN_HOW}."
             )
         return notes
@@ -1083,6 +1079,8 @@ class ClaudeRunner:
         self.app = github_app or (
             GitHubApp(runner.github_app, secrets) if runner.github_app is not None else None
         )
+        if self.workspace.app is None:  # PER-334: its own GitHub calls, with no daemon token
+            self.workspace.app = self.app
         self.refresh_s = refresh_s
         self.merge_wait_s = merge_wait_s
         self.merge_poll_s = merge_poll_s
@@ -1903,7 +1901,7 @@ class ClaudeRunner:
             secrets = await load_runner_secrets(self.secrets, claude=False)
         except SecretError:
             return Refused("The runner's secrets can't be read.")
-        if secrets.github_token is None:
+        if secrets.github_token is None and not await self._app_ready():  # PER-334
             return Refused(needs_github_token(f"Merging {run.code}"))
         result = await self._merge(
             run.code, secrets, by="owner", allow_flagged=not unattended,
@@ -2408,8 +2406,14 @@ class ClaudeRunner:
 
     async def _prepare(self, w: _Work, run: Run) -> Run:
         self._check_stop(run.code)
-        if not run.scratch and w.local is None and w.secrets.github_token is None:
-            # started to push, and the token went since: never prepare a push run tokenless
+        if (
+            not run.scratch
+            and w.local is None
+            and w.secrets.github_token is None
+            and not await self._app_ready()
+        ):
+            # started to push, and the token and the App went since: never prepare a push run
+            # with nothing to check its PR with (PER-334: the App alone is enough)
             gap = github_token_gap("Pushing")
             raise SetupFailed(
                 replace(

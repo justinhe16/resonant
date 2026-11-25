@@ -489,11 +489,10 @@ async def test_the_github_pieces_are_capability_notes_not_blockers(
     assert app.startswith("No push or PRs yet")
     assert token.startswith("No merges, repo lookups, private clones, new repos or fork runs")
     assert f"resonant secret set {GITHUB_TOKEN_REF}" in token
-    # the token alone missing: pushing needs it too (Resonant checks the PR with it)
+    # PER-334: the token alone missing is no gap: the App covers push, PRs, CI and merges
     h.keychain.items[GITHUB_APP_KEY_REF] = private_pem_one_line()
     h.runner.app = h.app
-    [token] = await h.runner.capability_notes()
-    assert token.startswith("No push, PRs, merges, repo lookups")
+    assert await h.runner.capability_notes() == []
 
 
 async def test_a_refresh_revokes_the_previous_token_at_once(

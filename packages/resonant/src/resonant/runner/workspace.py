@@ -49,6 +49,11 @@ Trust rules this module keeps:
   the honor-system trust of docs/employee-plan.md D4.
 - Branch hygiene: a run's ``resonant/…`` branch is deleted only by compare-and-delete against
   the sha the run left, and never while a worktree has it checked out.
+- PER-334: on an instance with no daemon token but the GitHub App set up (``app``), each of the
+  daemon's own GitHub calls on a repo (``gh`` for the PR, its checks and the merge; the
+  mirror's fetches) uses an installation token minted for that one repo with only what the
+  call needs, kept like the daemon's token (a 0600 file, never env or argv, redacted) and
+  revoked right after, success or not. The daemon's token, when set, is used as before.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -64,7 +70,7 @@ import sqlite3
 import stat
 import tempfile
 import weakref
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +90,7 @@ from resonant.runner.checks import (
     run_checks,
 )
 from resonant.runner.cleanup import RUN_CODE, rmtree_nofollow
+from resonant.runner.github_app import GitHubApp, GitHubAppError, InstallationToken
 from resonant.secrets import RunnerSecrets
 from resonant.store import repos as repo_store
 from resonant.store.db import atomic
@@ -141,6 +148,24 @@ CLONE_TIMEOUT_S = 120.0  # an add's clone (owner_checkout); a run's first clone 
 # CLONE_TIMEOUT_S is the real bound (most links can't clone 2 GB in it).
 CLONE_MAX_KB = 2_000_000
 GH_TIMEOUT_S = 120.0
+# PER-334: what each of the daemon's own GitHub calls asks the App for when the daemon has no
+# token (``metadata: read`` is always added): the least that call needs.
+APP_READ = {"contents": "read"}  # the mirror's fetches, the base branch, its activity
+APP_PRS = {"pull_requests": "read"}  # finding and reading the PR
+APP_PR_FILES = {"contents": "read", "pull_requests": "read"}  # the add-CI PR's files
+APP_CI = {"pull_requests": "read", "checks": "read", "statuses": "read", "actions": "read"}
+
+
+def app_merge_perms(*, workflows: bool) -> dict[str, str]:
+    """The App token for ``gh pr merge``: contents and PRs write (workflows write too when the
+    PR may change ``.github/workflows``), and the PR's checks read."""
+    perms = {"contents": "write", "pull_requests": "write", "checks": "read", "statuses": "read"}
+    if workflows:
+        perms["workflows"] = "write"
+    return perms
+
+
+log = logging.getLogger(__name__)
 COMMITTER_NAME = "Resonant runner"
 COMMITTER_EMAIL = "resonant-runner@users.noreply.github.com"
 _SAFE_PATH = "/usr/bin:/bin"
@@ -744,13 +769,17 @@ class Workspace:
         fork_wait_s: float = FORK_READY_WAIT_S,
         guard: Callable[[Sequence[str]], Sequence[str]] | None = None,
         api_port: int | None = None,
+        github_app: GitHubApp | None = None,
     ) -> None:
         """``guard`` wraps every git command run in a checkout (whose ``.git`` a worker can
         write) so it runs under the thin guard (EM-3): by default ``sandbox.wrap`` when
         ``runner.guard`` is ``thin``, and nothing when it is ``off`` (GD-1: a worker runs
         unguarded then, so guarding the daemon's git from it would protect nothing, and the
-        daemon's own checkout, write-protected by the profile, can be a run's repo)."""
+        daemon's own checkout, write-protected by the profile, can be a run's repo).
+        ``github_app`` (PER-334): the instance's GitHub App, used for the daemon's own GitHub
+        calls when it has no token of its own."""
         self.cfg = cfg
+        self.app = github_app
         self.api_port = api_port  # the instance's api.port for the thin guard (None: 7777)
         self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
@@ -1396,6 +1425,51 @@ class Workspace:
         """Run ``gh`` with the token in a throwaway config dir (for the repo resolver)."""
         return await self._gh(args, secrets, stdin=stdin)
 
+    async def app_ready(self) -> bool:
+        """PER-334: whether the GitHub App can stand in for the daemon's token (configured,
+        and its key is in the store)."""
+        return self.app is not None and await self.app.ready()
+
+    @contextlib.asynccontextmanager
+    async def _app_token(self, repo: Repo, perms: Mapping[str, str]) -> AsyncGenerator[str]:
+        """PER-334: an App token for ``repo`` with ``perms``, revoked on exit (an error or a
+        cancel too). Raises ``RunnerError`` when GitHub won't mint one."""
+        assert self.app is not None
+        try:
+            got = await self.app.mint_scoped(repo.slug, perms)
+        except GitHubAppError as e:
+            raise RunnerError(
+                f"the GitHub App can't reach {repo.slug} or lacks a permission there: {e}"
+            ) from None
+        try:
+            yield got.token
+        finally:
+            with contextlib.suppress(GitHubAppError):
+                await self.app.revoke(got.token)
+
+    @contextlib.asynccontextmanager
+    async def _fetch_token(self, repo: Repo, secrets: RunnerSecrets) -> AsyncGenerator[str | None]:
+        """The token the daemon's git fetches ``repo`` into the mirror with: the daemon's own;
+        with none, a read-only App token (PER-334, revoked on exit); else None (anonymous,
+        which a public repo is fine with)."""
+        if secrets.github_token is not None or not await self.app_ready():
+            yield secrets.github_token
+            return
+        assert self.app is not None
+        got: InstallationToken | None = None
+        try:
+            got = await self.app.mint_scoped(repo.slug, APP_READ)
+        except GitHubAppError as e:  # not installed there, or GitHub refused: anonymous
+            log.info("no app read token", extra={"repo": repo.name, "why": str(e)})
+        if got is None:
+            yield None
+            return
+        try:
+            yield got.token
+        finally:
+            with contextlib.suppress(GitHubAppError):
+                await self.app.revoke(got.token)
+
     async def _gh(
         self,
         args: Sequence[str],
@@ -1403,20 +1477,28 @@ class Workspace:
         *,
         stdin: bytes | None = None,
         public: bool = False,
+        app: tuple[Repo, Mapping[str, str]] | None = None,
     ) -> Exec:
         """``gh`` with the daemon's token, or with ``public`` the ``public_repo`` token (fork
-        mode only: making the fork, and opening or closing the upstream PR)."""
-        token = secrets.github_token
-        if token is None and not public:
-            raise RunnerError(needs_github_token("Asking GitHub"))
+        mode only: making the fork, and opening or closing the upstream PR). PER-334: with no
+        daemon token, ``app`` (the repo and what the call needs) lets the GitHub App's token
+        for that one repo stand in, revoked right after."""
         if public:
             if not secrets.github_public_token:
                 raise RunnerError(FORK_NEEDS_PUBLIC_REPO)
-            token = secrets.github_public_token
+            return await self._run_gh(args, secrets.github_public_token, secrets, stdin)
+        if secrets.github_token is not None:
+            return await self._run_gh(args, secrets.github_token, secrets, stdin)
+        if app is not None and await self.app_ready():
+            async with self._app_token(*app) as token:
+                return await self._run_gh(args, token, secrets, stdin)
+        raise RunnerError(needs_github_token("Asking GitHub"))
+
+    async def _run_gh(
+        self, args: Sequence[str], token: str, secrets: RunnerSecrets, stdin: bytes | None
+    ) -> Exec:
         # Everything gh reads or writes lives in one throwaway dir; the token is in its
         # hosts.yml (which gh prefers to the Keychain) and never in env or argv.
-        if token is None:  # unreachable: both cases above raise
-            raise RunnerError(needs_github_token("Asking GitHub"))
         with secret_dir(self.cfg.secrets_dir) as tmp:
             config = write_gh_config(tmp, token)
             env = {
@@ -1436,7 +1518,7 @@ class Workspace:
                 cwd=tmp,
                 stdin=stdin,
                 timeout_s=GH_TIMEOUT_S,
-                redact=secrets.values(),
+                redact=[*secrets.values(), token],
             )
 
     # -- the base branch --
@@ -1445,7 +1527,9 @@ class Workspace:
         """Whether the base branch has protection (``GET /repos/{o}/{r}/branches/{base}``,
         daemon token). None when GitHub can't say."""
         repo = self._repo(repo_name)
-        res = await self._gh(["api", f"repos/{repo.slug}/branches/{repo.base}"], secrets)
+        res = await self._gh(
+            ["api", f"repos/{repo.slug}/branches/{repo.base}"], secrets, app=(repo, APP_READ)
+        )
         if res.returncode != 0:
             return None
         try:
@@ -1470,7 +1554,9 @@ class Workspace:
             query = (
                 f"ref=refs/heads/{repo.base}&actor={quote(actor)}&activity_type={kind}&per_page=100"
             )
-            res = await self._gh(["api", f"repos/{repo.slug}/activity?{query}"], secrets)
+            res = await self._gh(
+                ["api", f"repos/{repo.slug}/activity?{query}"], secrets, app=(repo, APP_READ)
+            )
             if res.returncode != 0:
                 raise RunnerError(f"couldn't read {repo.base}'s activity: {res.stderr[-120:]}")
             try:
@@ -1491,7 +1577,7 @@ class Workspace:
         listed = await self._gh(
             ["pr", "list", "--repo", repo.slug, "--head", branch, "--state", "all", "--json",
              "number,url,state,baseRefName,headRefOid,isCrossRepository,changedFiles"],
-            secrets,
+            secrets, app=(repo, APP_PRS),
         )  # fmt: skip
         if listed.returncode != 0:
             raise RunnerError(f"gh pr list failed: {listed.stderr[-120:]}")
@@ -1526,8 +1612,9 @@ class Workspace:
     async def pushed_commits(self, p: Prepared, secrets: RunnerSecrets) -> int:
         """How many commits ``p.branch`` has on the remote beyond the run's base (0 if the
         branch was never pushed)."""
-        async with self.mirror_lock(p.repo_name):
-            await self._refresh(p.repo_name, secrets.github_token)
+        repo = self._repo(p.repo_name)
+        async with self._fetch_token(repo, secrets) as token, self.mirror_lock(p.repo_name):
+            await self._refresh(p.repo_name, token)
             try:
                 out = await self._mirror_git(p.repo_name)(
                     "rev-list", "--count", f"{p.base_sha}..refs/heads/{p.branch}"
@@ -1546,7 +1633,7 @@ class Workspace:
             viewed = await self._gh(
                 ["pr", "view", str(pr_number), "--repo", repo.slug, "--json",
                  "mergeStateStatus"],
-                secrets,
+                secrets, app=(repo, APP_CI),
             )  # fmt: skip
             state = ""
             if viewed.returncode == 0:
@@ -1560,16 +1647,20 @@ class Workspace:
 
     async def ci_state(self, repo_name: str, pr_number: int, secrets: RunnerSecrets) -> CiState:
         """The PR's checks: ``gh pr checks`` exits 0 (green), 8 (pending) or 1 (red, or none
-        reported)."""
+        reported). PER-334: with no daemon token, through the GitHub App; and when the
+        daemon's token can't read them (a fine-grained token can't have Checks: GitHub's 403)
+        and the App is set up, asked again through the App."""
         repo = self._repo(repo_name)
-        checks = await self._gh(["pr", "checks", str(pr_number), "--repo", repo.slug], secrets)
-        if checks.returncode == 0:
-            return "green"
-        if checks.returncode == 8:
-            return "pending"
-        if checks.returncode == 1:
-            return "none" if "no checks reported" in checks.stderr else "red"
-        return "error"
+        argv = ["pr", "checks", str(pr_number), "--repo", repo.slug]
+        checks = await self._gh(argv, secrets, app=(repo, APP_CI))
+        unreadable = checks.returncode not in (0, 1, 8) or (
+            checks.returncode == 1 and _FORBIDDEN.search(checks.stderr) is not None
+        )
+        if unreadable and secrets.github_token is not None and await self.app_ready():
+            app_only = replace(secrets, github_token=None)
+            with contextlib.suppress(RunnerError):
+                return _ci_word(await self._gh(argv, app_only, app=(repo, APP_CI)))
+        return _ci_word(checks)
 
     async def check_pr(
         self,
@@ -1593,8 +1684,9 @@ class Workspace:
         if pr_number < 1 or not re.fullmatch(r"[\w./-]+", branch) or ".." in branch:
             raise MergeRefused("bad PR reference")
         viewed = await self._gh(
-            ["pr", "view", str(pr_number), "--repo", repo.slug, "--json", _PR_FIELDS], secrets
-        )
+            ["pr", "view", str(pr_number), "--repo", repo.slug, "--json", _PR_FIELDS],
+            secrets, app=(repo, APP_PRS),
+        )  # fmt: skip
         if viewed.returncode != 0:
             raise MergeRefused(f"couldn't read the PR (gh pr view: {viewed.stderr[-120:]})")
         try:
@@ -1620,18 +1712,18 @@ class Workspace:
             )
         ref = f"refs/runs/pr-{pr_number}"
         mirror = self.mirror_path(repo_name)
-        async with self.mirror_lock(repo_name):
+        async with self._fetch_token(repo, secrets) as token, self.mirror_lock(repo_name):
             await self._ensure_mirror(repo_name)
             try:
                 await self._git(
                     ["-C", str(mirror), "-c", "transfer.fsckObjects=true",
                      "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags",
                      "--no-write-fetch-head", self._url_for(repo), f"+refs/heads/{branch}:{ref}"],
-                    token=secrets.github_token,
+                    token=token,
                 )  # fmt: skip
             except GitError as e:
                 raise MergeRefused(f"fetching the PR's branch failed: {e.message[-120:]}") from None
-            await self._refresh(repo_name, secrets.github_token)  # the base as it is now
+            await self._refresh(repo_name, token)  # the base as it is now
             git = self._mirror_git(repo_name)
             try:
                 fetched = (await git("rev-parse", "--verify", ref)).decode().strip()
@@ -1866,7 +1958,7 @@ class Workspace:
         from resonant.runner.create import adds_only_starter_ci
 
         async def run(args: Sequence[str]) -> tuple[int, bytes]:
-            res = await self._gh(args, secrets)
+            res = await self._gh(args, secrets, app=(repo, APP_PR_FILES))
             return res.returncode, res.stdout
 
         return await adds_only_starter_ci(run, repo.slug, pr_number, head_sha)
@@ -1874,10 +1966,13 @@ class Workspace:
     async def _recheck_ci(self, repo: Repo, secrets: RunnerSecrets) -> bool:
         """Look again before refusing a merge for no CI: it may have been added since. Records
         what it finds. Fails closed."""
-        try:
-            has_ci = await self.repo_has_ci(repo.name, github_token=secrets.github_token)
-        except GitError:
-            return False
+        async with self._fetch_token(repo, secrets) as token:
+            if token is None:  # nothing to bring the mirror up to date with
+                return False
+            try:
+                has_ci = await self.repo_has_ci(repo.name, github_token=token)
+            except GitError:
+                return False
         with atomic(self.conn):
             repo_store.set_ci(self.conn, repo.slug, has_ci)
         return has_ci
@@ -1929,7 +2024,8 @@ class Workspace:
             raise MergeRefused(upstream_merges(repo.slug))
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
-        if secrets.github_token is None:  # the mirror's checks and the merge itself use it
+        # the mirror's checks and the merge itself use the daemon's token, else the App's
+        if secrets.github_token is None and not await self.app_ready():
             raise MergeRefused(needs_github_token("Merging"))
         if starter_ci and (
             not branch.startswith(CI_BRANCH_PREFIX)
@@ -1982,14 +2078,30 @@ class Workspace:
                 no_ci = False  # it has CI after all, and it passed
         if require_clean:
             await self._require_clean(repo, pr_number, secrets)
+        perms = app_merge_perms(workflows=starter_ci or repo.allow_github_changes)
         merged = await self._gh(
             ["pr", "merge", number, "--repo", repo.slug, "--squash",
              "--match-head-commit", head_sha],
-            secrets,
+            secrets, app=(repo, perms),
         )  # fmt: skip
         if merged.returncode != 0:
             raise MergeRefused(f"gh pr merge failed: {merged.stderr[-120:]}")
         return MergeDone(result, no_ci=no_ci)
+
+
+# gh's words for a token GitHub refused (a fine-grained token can't have Checks)
+_FORBIDDEN = re.compile(r"HTTP 403|Resource not accessible", re.IGNORECASE)
+
+
+def _ci_word(checks: Exec) -> CiState:
+    """``gh pr checks``'s exit as a :data:`CiState`."""
+    if checks.returncode == 0:
+        return "green"
+    if checks.returncode == 8:
+        return "pending"
+    if checks.returncode == 1:
+        return "none" if "no checks reported" in checks.stderr else "red"
+    return "error"
 
 
 def _drop_admin_entry(checkout: Path, worktree: Path) -> None:
