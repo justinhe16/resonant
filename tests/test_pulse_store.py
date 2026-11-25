@@ -203,7 +203,7 @@ def test_mark_told_is_compare_and_set(db: sqlite3.Connection) -> None:
         {"title": "   "},
         {"title": ""},
         {"state": {"x": object()}},
-        {"state": {"x": "y" * 3000}},
+        {"state": {"x": "y" * pulse.MAX_STATE_BYTES}},
     ],
 )
 def test_upsert_refuses_unusable_input(db: sqlite3.Connection, kwargs: dict[str, object]) -> None:

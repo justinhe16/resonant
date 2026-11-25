@@ -87,7 +87,12 @@ class RoomPosting(Protocol):
     """An adapter with named rooms (``SlackChannel``): ``post_room`` refuses unknown keys."""
 
     async def post_room(
-        self, key: str, text: str, *, dedupe_key: str | None = None
+        self,
+        key: str,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> MessageRef: ...
 
 
@@ -202,12 +207,20 @@ class ChannelHub:
             prompt = replace(prompt, thread=None)
         return await adapter.request_approval(principal, prompt)
 
-    async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
-        """Post ``text`` to the room ``key`` (see "Rooms" above). Raises ``ChannelRefused``."""
+    async def post_room(
+        self,
+        key: str,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> MessageRef:
+        """Post ``text`` to the room ``key`` (see "Rooms" above). Raises ``ChannelRefused``.
+        ``blocks`` (PER-332): optional Slack Block Kit blocks, ``text`` the fallback."""
         for name in self.running:
             adapter = self._adapters[name]
             if isinstance(adapter, RoomPosting):
-                return await adapter.post_room(key, text, dedupe_key=dedupe_key)
+                return await adapter.post_room(key, text, dedupe_key=dedupe_key, blocks=blocks)
         self._audit("channel.send_refused", room=key, reason="no running channel has rooms")
         raise ChannelRefused("no running channel has rooms")
 

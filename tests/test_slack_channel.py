@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -457,6 +458,80 @@ async def test_a_failed_room_post_is_noted_in_health_until_the_room_works(w: Wor
     assert "room gone: unknown room 'gone'" in w.slack.health()["detail"]
     await w.slack.post_room("pulse", "alive", dedupe_key="heartbeat:2026-10-13:10")
     assert "room pulse" not in w.slack.health()["detail"]
+
+
+HEADER = {"type": "header", "text": {"type": "plain_text", "text": "Daily"}}
+
+
+def dropped(db: sqlite3.Connection) -> list[str]:
+    q = "SELECT json_extract(detail, '$.reason') FROM audit_log WHERE action = ?"
+    return [r[0] for r in db.execute(q, ("slack.room_blocks_dropped",))]
+
+
+async def test_a_room_post_carries_blocks_with_the_text_as_fallback(
+    w: World, db: sqlite3.Connection
+) -> None:
+    # PER-332: one message, the blocks plus the text (notifications); the hub passes them on
+    hub = ChannelHub({"slack": w.slack}, principals(), db)
+    await hub.post_room("digest", "Daily: 3 orders", blocks=[HEADER], dedupe_key="d:1")
+    post = w.web.posts[-1]
+    assert (post.channel, post.text, post.blocks) == ("C0DIGEST", "Daily: 3 orders", [HEADER])
+    await hub.post_room("digest", "Daily: 3 orders", blocks=[HEADER], dedupe_key="d:1")
+    assert len(w.web.posts) == 1 and dropped(db) == []
+    await w.slack.post_room("digest", "x" * 3200, blocks=[HEADER])
+    assert len(w.web.posts[-1].text) == 3000 and w.web.posts[-1].blocks == [HEADER]
+    rich: list[dict[str, Any]] = [
+        HEADER,
+        {"type": "section", "fields": [{"type": "mrkdwn", "text": "*Web*\n<https://x.test|ok>"}]},
+        {"type": "divider"},
+        {"type": "context", "elements": [{"type": "plain_text", "text": "today", "emoji": True}]},
+        {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+            {"type": "text", "text": "PRs "}, {"type": "link", "url": "https://x.test/pr/1"}]}]},
+    ]  # fmt: skip
+    await w.slack.post_room("digest", "Daily", blocks=rich)
+    assert w.web.posts[-1].blocks == rich and dropped(db) == []
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [],
+        [HEADER] * 51,
+        ["not a block"],
+        [{"text": "no type"}],
+        [{"type": "section", "text": {"type": "mrkdwn", "text": "hi <!channel>"}}],
+        [{"type": "section", "text": {"type": "mrkdwn", "text": "hi <@U123>"}}],
+        [{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "broadcast", "range": "channel"}]}
+        ]}],
+        [{"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text",
+                                                                      "text": "Go"}}]}],
+        [{"type": "section", "text": {"type": "mrkdwn", "text": "x"},
+          "accessory": {"type": "image", "image_url": "https://example.com/p.png"}}],
+        [{"type": "input"}],
+        [{"type": ["x"]}],
+        [{"type": "section", "text": {"type": {"a": 1}, "text": "x"}}],
+    ],
+)  # fmt: skip
+async def test_invalid_room_blocks_post_the_text_alone(
+    w: World, db: sqlite3.Connection, bad: list[Any]
+) -> None:
+    await w.slack.post_room("digest", "Daily: 3 orders", blocks=bad)
+    assert [(p.text, p.blocks) for p in w.web.posts] == [("Daily: 3 orders", None)]
+    assert dropped(db) == ["invalid"]
+
+
+async def test_blocks_slack_rejects_fall_back_to_the_text(w: World, db: sqlite3.Connection) -> None:
+    w.web.fail("chat.postMessage", SlackCallError("chat.postMessage", "invalid_blocks"))
+    ref = await w.slack.post_room("digest", "Daily: 3 orders", blocks=[HEADER])
+    assert [(p.text, p.blocks) for p in w.web.posts] == [("Daily: 3 orders", None)]
+    assert ref.ref == f"C0DIGEST:{w.web.posts[0].ts}" and dropped(db) == ["invalid_blocks"]
+    assert "room digest" not in w.slack.health()["detail"]
+    # any other failure is the room's, not the blocks': it raises, no text retry
+    w.web.fail("chat.postMessage", SlackCallError("chat.postMessage", "not_in_channel"))
+    with pytest.raises(ChannelSendError, match="not_in_channel"):
+        await w.slack.post_room("digest", "Daily", blocks=[HEADER])
+    assert len(w.web.posts) == 1
 
 
 # --- approval buttons -------------------------------------------------------------------------

@@ -455,7 +455,7 @@ Your processes report what happened by emitting events: either an `"events"` lis
 
 ### Reports
 
-`from emit import report; report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent", state={"status": "triaging"})` tells the owner about a thing, by `key` (1..120 of `[a-z0-9/._:-]`). It is mentioned again only when its fingerprint changes: the hash of `state` when given, else of `title`, plus the urgency and `clear`, so a resolve or an escalation always counts. `state` is at most 2000 bytes of JSON. Keep `state` coarse (bucket a PnL, leave timestamps out) or every report counts as news. `clear=True` marks it over; `ttl` (`30m`, `24h`; 1 minute to `168h`) is how long it stays open without a new report. Urgency is clamped to the manifest's `report.max_urgency`. An optional `tone` in the item's `data` (`report(..., tone="good")` in the item JSON: `{"text", "data": {..., "tone": "good"}}`) turns the urgent marker green (`[<name>] 🟢 <title>`) for good news such as a profit target hit. `"good"` is the only value with an effect; absent or anything else is the usual red, and it never changes urgency, routing or whether the item is texted at once. It affects urgent items only, and extensions still can't put their own emoji in text.
+`from emit import report; report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent", state={"status": "triaging"})` tells the owner about a thing, by `key` (1..120 of `[a-z0-9/._:-]`). It is mentioned again only when its fingerprint changes: the hash of `state` when given, else of `title`, plus the urgency and `clear`, so a resolve or an escalation always counts. `state` is at most 16 KiB of JSON. Keep `state` coarse (bucket a PnL, leave timestamps out) or every report counts as news. `clear=True` marks it over; `ttl` (`30m`, `24h`; 1 minute to `168h`) is how long it stays open without a new report. Urgency is clamped to the manifest's `report.max_urgency`. An optional `tone` in the item's `data` (`report(..., tone="good")` in the item JSON: `{"text", "data": {..., "tone": "good"}}`) turns the urgent marker green (`[<name>] 🟢 <title>`) for good news such as a profit target hit. `"good"` is the only value with an effect; absent or anything else is the usual red, and it never changes urgency, routing or whether the item is texted at once. It affects urgent items only, and extensions still can't put their own emoji in text.
 
 What the grant means (shown on the `ext add` review screen and in the `ext update` diff, and printed by `ext validate`):
 
@@ -467,6 +467,26 @@ What the grant means (shown on the `ext add` review screen and in the `ext updat
 | absent | none | Reports are refused (audit `pulse.refused`) and never retried. |
 
 A bad report (key, urgency, state, ttl, empty title) is refused the same way. Titles are cleaned like notification text, with a code-built `[<name>]` prefix. A job's first run after install is a baseline: its reports are stored as already told and never sent. A `clear=True` report of an item last stored urgent counts as urgent too (still clamped to the grant), so "recovered" is texted at once; a clear of an item the owner never heard still sends. If no recipient can be reached the item stays pending for the hourly pulse. Changing `report.max_urgency` changes the manifest hash, so `ext update` shows the change and asks for a fresh approval.
+
+#### Room digest lines and blocks
+
+When the owner lists your extension in `briefing.reports` and sets `briefing.audience: room:<key>`, the daily room digest shows each of your open reports in a team room (Slack). Two optional keys of `state` feed it; the daemon reads nothing else in `state`:
+
+- `state.digest`: a list of strings, shown under the report's title as `• <line>` (cleaned, at most 12 lines of 200 characters).
+- `state.blocks` (PER-332): a list of Slack [Block Kit](https://api.slack.com/block-kit) block objects you build yourself (`header`, `section` with `fields`, `divider`, `context`, `table`, ...). When a report has them, the post carries Block Kit: your blocks in place of your title and lines, other reports as plain sections, then the runs and approvals lines. The plain text (title and `state.digest` lines) is always sent with them as the notification fallback, so keep `state.digest` meaningful.
+
+```python
+report("acme/daily", "Acme daily", urgency="low", state={
+    "digest": ["Orders 141 (+12%)", "No deploys yesterday"],
+    "blocks": [
+        {"type": "header", "text": {"type": "plain_text", "text": "Acme daily"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": "*Orders*\n141"}, {"type": "mrkdwn", "text": "*Deploys*\nnone"}]},
+    ],
+})
+```
+
+Blocks are display-only and checked defensively; a bad one never fails the post. They must be a list of 1 to 50 blocks of type `header`, `section`, `divider`, `context`, `table` or `rich_text`. Anything inside them that has a `type` must be one of `plain_text`, `mrkdwn`, `raw_text`, `rich_text`, `rich_text_section`, `rich_text_list`, `rich_text_preformatted`, `rich_text_quote`, `text`, `link`, `emoji`, `date` or `color`. That rules out buttons, inputs, images and `user`/`usergroup`/`broadcast` elements. No string in them may ping anyone (`<!channel>`, `<!here>`, any `<!...>`, `<@U...>`); links (`<https://...|label>`) are fine. Your blocks reach the room as you built them, with no `[name]` prefix and none of the cleaning titles get: listing the extension in `briefing.reports` is the owner's trust in it. The whole post must also stay within Slack's 50 blocks (a divider goes between parts). If any check fails, or Slack rejects the blocks (`invalid_blocks`, `invalid_arguments`, `msg_blocks_too_long`, ...), the digest posts the text alone and the daemon logs it (audit `slack.room_blocks_dropped`; a Slack rejection also leaves a `slack.send_failed` row). A daemon from before PER-332 refuses `state` over 2000 bytes. Only Slack renders blocks; any other channel gets the text. `state` is at most 16 KiB of canonical JSON, blocks included; remember that `state` is also the fingerprint, so leave timestamps out of the blocks too.
 
 #### Walkthrough: the example extension
 

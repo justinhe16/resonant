@@ -59,7 +59,7 @@ KEY_MAX = 120
 TITLE_MAX = 200
 DEFAULT_TTL_S = 24 * 3600
 MAX_TTL_S = 7 * 24 * 3600
-MAX_STATE_BYTES = 2000
+MAX_STATE_BYTES = 16 * 1024  # PER-332: room for a report's Block Kit `blocks`
 PRUNE_AFTER = timedelta(days=7)
 PRUNE_UNTOLD_CLEAR_AFTER = timedelta(days=30)  # a clear nobody ever heard is kept longer
 

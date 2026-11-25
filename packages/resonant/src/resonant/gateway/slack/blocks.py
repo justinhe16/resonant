@@ -12,13 +12,16 @@
   (``SlackChannel`` sends it as text: only a typed ``yes <code>`` approves pay).
 - :func:`resolved_blocks`: the prompt's text with the outcome line and no buttons:
   ``Approved by Brian``, ``Denied by Justin``, ``Expired, not done``.
+- :func:`valid_blocks` (PER-332): a room post's caller-built Block Kit ``blocks``, checked
+  defensively (a list of 1..``MAX_BLOCKS`` display-only blocks: ``BLOCK_TYPES`` holding only
+  ``INNER_TYPES``, no ``<!…>``/``<@…>`` ping anywhere), else None (post the text alone).
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from resonant.gateway.channel import ApprovalPrompt
 from resonant.gateway.slack.events import APPROVE_ACTION, DENY_ACTION
@@ -27,6 +30,17 @@ from resonant_sdk import Level
 MAX_CHUNK = 3000  # a message is split into parts of at most this many characters
 SECTION_MAX = 3000  # Slack's limit for a section's text
 SECTIONS_MAX = 20  # a long prompt's sections (Slack allows 50 blocks a message)
+MAX_BLOCKS = 50  # Slack's limit for one message's blocks
+# Caller blocks (PER-332) are display-only: these block types, and these types anywhere inside
+# (text objects, rich text and table cells). No buttons, inputs, images, or user, usergroup or
+# broadcast mention elements.
+BLOCK_TYPES = frozenset({"header", "section", "divider", "context", "table", "rich_text"})
+INNER_TYPES = frozenset(
+    {"plain_text", "mrkdwn", "raw_text", "rich_text", "rich_text_section", "rich_text_list",
+     "rich_text_preformatted", "rich_text_quote", "text", "link", "emoji", "date", "color"}
+)  # fmt: skip
+# <!channel>, <!here>, <!everyone>, <!subteam^…>, <@U…>: no pings from caller blocks
+_PINGS = ("<!", "<@")
 _ENTITY_TAIL = re.compile(r"&[a-z]{0,3}$")  # a cut inside &amp; &lt; &gt; moves before it
 _FENCE = "```"
 
@@ -102,6 +116,47 @@ def split_sections(text: str) -> list[str]:
 
 def _sections(text: str) -> list[dict[str, Any]]:
     return [_section(part) for part in split_sections(text)]
+
+
+def _display_only(value: object, *, top: bool = False) -> bool:
+    """Every object's ``type`` allowed (``BLOCK_TYPES`` at the top, ``INNER_TYPES`` inside)
+    and no ping (``<!…>``, ``<@…>``) in any string, keys included."""
+    if isinstance(value, str):
+        return not any(p in value for p in _PINGS)
+    if isinstance(value, list):
+        return all(_display_only(v) for v in cast(list[Any], value))
+    if isinstance(value, dict):
+        obj = cast(dict[Any, Any], value)
+        kind: object = obj.get("type")
+        if top and not (isinstance(kind, str) and kind in BLOCK_TYPES):
+            return False
+        if not top and "type" in obj and not (isinstance(kind, str) and kind in INNER_TYPES):
+            return False
+        return all(_display_only(k) and _display_only(v) for k, v in obj.items())
+    return True
+
+
+def valid_blocks(raw: object) -> list[dict[str, Any]] | None:
+    """``raw`` as a message's Block Kit blocks, or None when it can't be: not a list, empty,
+    over ``MAX_BLOCKS``, an item that isn't an object with an allowed ``type``
+    (``BLOCK_TYPES``), anything inside of a type not in ``INNER_TYPES`` (no buttons, inputs,
+    images or mention elements), or a ping (``<!channel>``, ``<!here>``, ``<@U…>``) in any
+    string. Slack checks the rest (it answers ``invalid_blocks``; the caller then posts the
+    text alone)."""
+    if not isinstance(raw, list):
+        return None
+    items = cast(list[Any], raw)
+    if not 1 <= len(items) <= MAX_BLOCKS:
+        return None
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        block = cast(dict[str, Any], item)
+        if not _display_only(block, top=True):
+            return None
+        out.append(block)
+    return out
 
 
 def button_value(approval_id: str, code: str) -> str:
