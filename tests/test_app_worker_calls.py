@@ -198,8 +198,20 @@ async def test_ci_the_daemon_token_cant_read_is_asked_again_through_the_app(
     monkeypatch.setattr(env.ws, "_run_gh", forbidden_for_the_pat)
     assert await env.ws.ci_state("proj", 41, SECRETS) == "green"
     assert api.issued == 1 and api.live == set()
-    env.ws.app = None  # without the App it stays unreadable, as before
-    assert await env.ws.ci_state("proj", 41, SECRETS) == "error"
+
+    # gh's usual shape for it: exit 1 with GitHub's 403 on stderr (not "red")
+    async def forbidden_exit_1(
+        args: Sequence[str], token: str, secrets: RunnerSecrets, stdin: bytes | None
+    ) -> Exec:
+        if token == GH_TOKEN:
+            return Exec(1, b"", "GraphQL: Resource not accessible by personal access token")
+        return await run_gh(args, token, secrets, stdin)
+
+    monkeypatch.setattr(env.ws, "_run_gh", forbidden_exit_1)
+    assert await env.ws.ci_state("proj", 41, SECRETS) == "green"
+    assert api.issued == 2 and api.live == set()
+    env.ws.app = None  # without the App it reads as it always did
+    assert await env.ws.ci_state("proj", 41, SECRETS) == "red"
 
 
 # --- capabilities ---------------------------------------------------------------------------

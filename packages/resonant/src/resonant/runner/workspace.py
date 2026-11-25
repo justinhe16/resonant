@@ -1438,7 +1438,9 @@ class Workspace:
         try:
             got = await self.app.mint_scoped(repo.slug, perms)
         except GitHubAppError as e:
-            raise RunnerError(f"the GitHub App can't reach {repo.slug}: {e}") from None
+            raise RunnerError(
+                f"the GitHub App can't reach {repo.slug} or lacks a permission there: {e}"
+            ) from None
         try:
             yield got.token
         finally:
@@ -1650,12 +1652,15 @@ class Workspace:
         and the App is set up, asked again through the App."""
         repo = self._repo(repo_name)
         argv = ["pr", "checks", str(pr_number), "--repo", repo.slug]
-        state = _ci_word(await self._gh(argv, secrets, app=(repo, APP_CI)))
-        if state == "error" and secrets.github_token is not None and await self.app_ready():
+        checks = await self._gh(argv, secrets, app=(repo, APP_CI))
+        unreadable = checks.returncode not in (0, 1, 8) or (
+            checks.returncode == 1 and _FORBIDDEN.search(checks.stderr) is not None
+        )
+        if unreadable and secrets.github_token is not None and await self.app_ready():
             app_only = replace(secrets, github_token=None)
             with contextlib.suppress(RunnerError):
-                state = _ci_word(await self._gh(argv, app_only, app=(repo, APP_CI)))
-        return state
+                return _ci_word(await self._gh(argv, app_only, app=(repo, APP_CI)))
+        return _ci_word(checks)
 
     async def check_pr(
         self,
@@ -2082,6 +2087,10 @@ class Workspace:
         if merged.returncode != 0:
             raise MergeRefused(f"gh pr merge failed: {merged.stderr[-120:]}")
         return MergeDone(result, no_ci=no_ci)
+
+
+# gh's words for a token GitHub refused (a fine-grained token can't have Checks)
+_FORBIDDEN = re.compile(r"HTTP 403|Resource not accessible", re.IGNORECASE)
 
 
 def _ci_word(checks: Exec) -> CiState:
