@@ -20,9 +20,9 @@ primary_region = "iad"          # any region; the checker only talks to Supabase
   # NTFY_TOKEN, WEBHOOK_URL, SLACK_WEBHOOK_<INSTANCE>) is a `fly secrets` value, never here.
   #
   # Instances (PER-305). Unset watches personal Resonant only, exactly as before. At Cori's
-  # go-live (docs/go-live.md step 15, "A second instance"), once she pushes, uncomment:
-  # RELAY_INSTANCES = "resonant,cori"   # a listed instance that never pushed counts as stale
-  # RELAY_NOTIFY_CORI = "ntfy,slack"    # optional: the default is ntfy (+ slack once the
+  # go-live (docs/go-live.md step 15, "A second instance"), once she pushes (live 2026-11-24):
+  RELAY_INSTANCES = "resonant,cori"     # a listed instance that never pushed counts as stale
+  RELAY_NOTIFY_CORI = "ntfy,slack"      # optional: the default is ntfy (+ slack once the
   #                                     # SLACK_WEBHOOK_CORI secret is set); listing slack
   #                                     # without that secret refuses to start
   # Personal has no RELAY_NOTIFY_RESONANT: it stays on ntfy (and WEBHOOK_URL) only.
