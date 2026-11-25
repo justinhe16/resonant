@@ -6,11 +6,19 @@ order and records each sent ref on the approval with its send time (and the prom
 system text the brains see, PER-268):
 - A ``ChannelRefused`` approver (no identity on the channel) is skipped and audited
   ``approval.unreachable``. The others still get the prompt.
-- Any other ``ChannelError`` is transient: the rest are still tried, and the result carries
-  the first such error so the caller can retry. Re-prompting is idempotent, because the
-  channel dedupes by ``approval_dedupe_key``.
+- Any other ``ChannelError`` is transient: the rest are still tried. PER-319: when at least
+  one copy was delivered, each such failure is audited ``approval.send_failed`` (approver,
+  error) and skipped (``PromptResult.failed``): one approver's bad DM (Slack's Messages tab
+  off) doesn't fail the ask, which waits for an answer from those who got it. Only when no
+  copy was delivered does the result carry the first such error so the caller can retry
+  (and, once the retries are spent, the asking conversation hears ``Couldn't finish that:
+  …``, ``runners.status``). Re-prompting is idempotent, because the channel dedupes by
+  ``approval_dedupe_key`` (a skipped approver is tried again on the next pending step).
 - ``reached`` empty with no transient error means no approver is reachable: the caller
   fails for good.
+- ``PromptResult.here`` (PER-319): the asking conversation got a copy (the shared thread's
+  one copy, or the asker's own prompt). When it didn't, the caller says who it waits on
+  (``runners.status.waiting_line``).
 - PER-292: the prompt to the asking task's own principal goes to that task's thread
   (``thread_of``); every other approver gets it in their own conversation. That stays so
   for a thread nobody else sees (a Slack DM) and with no thread (iMessage, a scheduled job).
@@ -57,6 +65,7 @@ from resonant.gateway.channel import (
     shared_thread,
     thread_of,
 )
+from resonant.redact import redact_secrets
 from resonant.store import approvals as ap
 from resonant.store import system_texts
 from resonant.store.audit import audit
@@ -78,7 +87,10 @@ REMIND_CATCHUP = timedelta(minutes=2)
 class PromptResult:
     reached: tuple[str, ...]
     unreachable: tuple[str, ...]
-    error: ChannelError | None = None  # the first transient failure, if any
+    error: ChannelError | None = None  # the first transient failure, when nobody got a copy
+    # PER-319: approvers whose copy failed (not refused) and was skipped: another got one
+    failed: tuple[str, ...] = ()
+    here: bool = False  # PER-319: the asking conversation got a copy
 
     @property
     def retry(self) -> bool:
@@ -210,6 +222,7 @@ async def _prompt(
             return others[1]
         return prompt
 
+    sent.whose = whose
     if whose is not None and shared_thread(thread):
         assert thread is not None
         if await _prompt_shared(sent, approvers, whose, thread, variant):
@@ -254,6 +267,7 @@ async def _prompt_shared(
         for approver in approvers:
             if approver not in refused:
                 sent.record(approver, ref, theirs, shared=thread)
+        sent.here = True
         return True
     return False
 
@@ -278,9 +292,29 @@ class _Sent:
         self.reached: list[str] = []
         self.unreachable: list[str] = []
         self.error: ChannelError | None = None
+        self.failed: dict[str, ChannelError] = {}  # transient failures, by approver
+        self.whose: str | None = None  # who asked (their conversation is the asking one)
+        self.here = False  # the shared thread's one copy went out
 
     def result(self) -> PromptResult:
-        return PromptResult(tuple(self.reached), tuple(self.unreachable), self.error)
+        """PER-319: with a copy delivered, a transient failure is audited and skipped."""
+        here = self.here or (self.whose is not None and self.whose in self.reached)
+        if not self.reached or not self.failed:
+            return PromptResult(tuple(self.reached), tuple(self.unreachable), self.error,
+                                here=here)  # fmt: skip
+        with transaction(self.conn):
+            for approver, e in self.failed.items():
+                audit(
+                    self.conn,
+                    "approval.send_failed",
+                    task_id=self.task_id,
+                    approval_id=self.prompt.approval_id,
+                    channel=self.channel.name,
+                    approver=approver,
+                    error=_error_text(e),
+                )
+        return PromptResult(tuple(self.reached), tuple(self.unreachable), None,
+                            failed=tuple(self.failed), here=here)  # fmt: skip
 
     async def send(
         self,
@@ -312,6 +346,7 @@ class _Sent:
             return None
         except ChannelError as e:
             self.error = self.error or e
+            self.failed.setdefault(principal, e)
             return None
         if record:
             self.record(principal, ref, prompt)
@@ -342,6 +377,11 @@ class _Sent:
         key = approval_dedupe_key(self.prompt.approval_id, principal)
         system_texts.record(conn, principal, "approval", prompt.text(), ref=key,
                             task_id=self.task_id, now=at, outside=self.outside)  # fmt: skip
+
+
+def _error_text(e: ChannelError) -> str:
+    """A channel error for the audit row: its type and body-free reason, redacted, clipped."""
+    return redact_secrets(f"{type(e).__name__}: {e}")[:200]
 
 
 def reminder_text(code: str, left: timedelta) -> str:

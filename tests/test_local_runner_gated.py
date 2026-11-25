@@ -140,7 +140,13 @@ class Harness:
     loop: Loop
     tool_log: list[str]
 
-    def add_task(self, checkpoint: dict[str, Any], text: str = "hi", kind: str = "chat") -> str:
+    def add_task(
+        self,
+        checkpoint: dict[str, Any],
+        text: str = "hi",
+        kind: str = "chat",
+        channel_ref: dict[str, Any] | None = None,
+    ) -> str:
         event = Event(
             source="imessage",
             type="message",
@@ -159,6 +165,7 @@ class Harness:
                     checkpoint=checkpoint,
                     origin_event_id=event.id,
                     trace_id=event.trace_id,
+                    channel_ref=channel_ref,
                 ),
             )
             repo.attach_event(self.db, event.id, task_id)
@@ -953,20 +960,41 @@ async def test_no_reachable_approver_fails_for_good(make: Any) -> None:
     assert unreachable_audits(h, task_id) == [OWNER, MEMBER]
 
 
-async def test_transient_failure_still_prompts_the_others_then_retries(make: Any) -> None:
+async def test_one_approvers_send_failure_is_audited_and_the_ask_waits(make: Any) -> None:
+    # PER-319: the member got a copy, so the owner's failed send is skipped, not retried
     h = make_team(make)
     h.channel.fail_prompt.append(ChannelSendError("Messages is not running"))  # the owner's
     task_id = h.add_task(rotate_call())
     await h.loop.run_until_idle()
 
     t = h.task(task_id)
-    assert t.status == "queued" and t.error is not None and "approval prompt" in t.error
+    assert t.status == "waiting" and t.error is None
     assert [p for p, _ in h.channel.prompts] == [MEMBER]
+    (approval,) = h.approvals(task_id)
+    assert [r.principal for r in approval.channel_refs] == [MEMBER]
+    rows = h.db.execute(
+        "SELECT detail FROM audit_log WHERE action = 'approval.send_failed' AND task_id = ?",
+        (task_id,),
+    ).fetchall()
+    assert len(rows) == 1
+    details = json.loads(rows[0]["detail"])
+    assert details["approver"] == OWNER and "Messages is not running" in details["error"]
+
+
+async def test_transient_failure_with_no_copy_delivered_retries(make: Any) -> None:
+    h = make_team(make)
+    h.channel.fail_prompt.extend([ChannelSendError("Messages is not running")] * 2)
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+
+    t = h.task(task_id)
+    assert t.status == "queued" and t.error is not None and "approval prompt" in t.error
+    assert h.channel.prompts == []
 
     h.skip_backoff(task_id)
     await h.loop.run_until_idle()
     assert h.task(task_id).status == "waiting"
-    assert [p for p, _ in h.channel.prompts] == [MEMBER, OWNER]  # the member's deduped
+    assert [p for p, _ in h.channel.prompts] == [OWNER, MEMBER]
     assert len(h.approvals(task_id)) == 1
 
 

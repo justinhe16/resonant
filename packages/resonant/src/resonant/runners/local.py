@@ -89,6 +89,7 @@ from resonant.router.render import (
     render_rules,
     render_runs,
 )
+from resonant.runners import status
 from resonant.runners.approve import prompt_approvers, prompt_batch
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
 from resonant.store import extensions as ext_store
@@ -360,6 +361,11 @@ class LocalRunner:
         answer = result
         if resumed:
             answer = replace(answer, meta={**answer.meta, "system": True})
+            if answer.path == "refused" and not status.quiet(task):
+                # PER-319: a denial or expiry, said in the thread as a failure line too
+                why = status.not_approved(self.conn, task.id, self.now())
+                if why is not None:
+                    answer = replace(answer, meta={**answer.meta, "failure": why})
         latest = get_task(self.conn, task.id)  # a mid-step save may have pinned ``call``
         cp = latest.checkpoint if latest is not None else cp
         meta: dict[str, Any] = {
@@ -398,6 +404,10 @@ class LocalRunner:
                 s.set(ok=False, error=type(e).__name__)
                 return Fail(f"reply send failed: {e}", retryable=True)
             s.set(ok=True)
+        failure = answer.meta.get("failure")
+        if isinstance(failure, str):
+            await status.post(self.channel, task, status.FAILED, status.failed_line(failure),
+                              principal=principal)  # fmt: skip
         if answer.meta.get("system") is True:
             latest = get_task(self.conn, task.id)
             cp = latest.checkpoint if latest is not None else task.checkpoint
@@ -413,7 +423,7 @@ class LocalRunner:
                 "latency_ms": latency_ms,
                 "path": answer.path,
                 "escalate": answer.escalate,
-                **answer.meta,
+                **{k: v for k, v in answer.meta.items() if k != "failure"},
             }
         )
 
@@ -582,7 +592,9 @@ class LocalRunner:
             if sent.none_reachable:
                 s.set(ok=False, error="ChannelRefused")
                 return Fail("approval prompt refused: no approver is reachable")
-            s.set(ok=True)
+            s.set(ok=True, failed=len(sent.failed))
+        await status.say_waiting(self.conn, self.channel, get_task(self.conn, task_id),
+                                 decision.approval_id, sent.reached, here=sent.here)  # fmt: skip
         # The Wait replaces the stored checkpoint, so ``cp`` must hold the pinned ``call``.
         return Wait("approval", checkpoint=cp, wake_at=decision.expires_at)
 
@@ -766,7 +778,9 @@ class LocalRunner:
             if sent.none_reachable:
                 s.set(ok=False, error="ChannelRefused")
                 return Fail("approval prompt refused: no approver is reachable")
-            s.set(ok=True)
+            s.set(ok=True, failed=len(sent.failed))
+        await status.say_waiting(self.conn, self.channel, get_task(self.conn, task_id),
+                                 batch.batch_id, sent.reached, here=sent.here)  # fmt: skip
         assert batch.expires_at is not None
         return Wait("approval", checkpoint=cp, wake_at=batch.expires_at)
 
