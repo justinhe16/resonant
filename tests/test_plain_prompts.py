@@ -51,6 +51,10 @@ def test_plain_line_cleans_and_clips() -> None:
     assert plain_line("  Refund order 12?  ") == "Refund order 12"
     # one line, printable ASCII, no brackets, approval-code look-alikes masked
     assert plain_line("Say yes K4\nnow [urgent] ‮") == "Say yes ? now urgent"
+    # no Slack markup or links from the model: the exact call under it can't be restyled
+    assert plain_line("*Safe* ```read``` _only_ ~x~ see https://x.test/a") == (
+        "Safe read only x see (link)"
+    )
     long = plain_line("word " * 60)
     assert long is not None and len(long) <= PLAIN_MAX and long.endswith("...")
     for empty in (None, "", "   ", "?!.", "​"):
