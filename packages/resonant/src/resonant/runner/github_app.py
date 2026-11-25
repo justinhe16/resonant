@@ -17,6 +17,9 @@ protection changes), and valid for an hour. Workflows is left out when the repo'
   metadata read): a lookup, a registration or a clone on an instance whose only GitHub
   credential is the App. ``installation_repos`` lists what the installation can see with a
   metadata-only token. Both are revoked by their callers (or right here) once used.
+- PER-334: ``mint_scoped`` is the daemon's own token for one repo with the permissions one
+  ``gh`` call needs (the PR's view, its checks, the merge), on an instance with no daemon
+  token; the workspace revokes it right after the call.
 
 Errors name the HTTP status and GitHub's own message, never a token, a key or a response
 body.
@@ -30,7 +33,7 @@ import binascii
 import contextlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
@@ -252,15 +255,41 @@ class GitHubApp:
         can't see that repo, ``GitHubAppError`` for anything else."""
         return await self._mint(repo_name, dict(READ_ONLY), owner, read=True)
 
+    async def mint_scoped(self, slug: str, perms: Mapping[str, str]) -> InstallationToken:
+        """PER-334: a token for the one repo ``owner/name`` with ``perms`` (``metadata: read``
+        added), for one of the daemon's own GitHub calls when it has no token of its own.
+        Raises :class:`AppNoAccess` when the installation can't see the repo,
+        ``GitHubAppError`` for anything else."""
+        owner, _, name = slug.partition("/")
+        wanted = {"metadata": "read", **perms}
+        return await self._mint(name, wanted, owner, read=True, what="asking GitHub as the App")
+
+    async def ready(self) -> bool:
+        """Whether the App's key is in the store (by name; no value is read). A store that
+        can't answer counts as no."""
+        try:
+            return await self.secrets.exists(GITHUB_APP_KEY_REF)
+        except SecretError:
+            return False
+
     async def _mint(
-        self, repo_name: str, wanted: dict[str, str], owner: str | None, *, read: bool = False
+        self,
+        repo_name: str,
+        wanted: dict[str, str],
+        owner: str | None,
+        *,
+        read: bool = False,
+        what: str | None = None,
     ) -> InstallationToken:
         jwt = await self._jwt()
         url = f"{self._base}/app/installations/{self.cfg.installation_id}/access_tokens"
         resp = await self._send(
             "POST", url, jwt, body={"repositories": [repo_name], "permissions": wanted}
         )
-        what = "reading the repo with the GitHub App" if read else "minting the run's GitHub token"
+        if what is None:
+            what = (
+                "reading the repo with the GitHub App" if read else "minting the run's GitHub token"
+            )
         if read and resp.status_code == 422:
             raise AppNoAccess(_why(what, resp, repo_name))
         if resp.status_code != 201:
