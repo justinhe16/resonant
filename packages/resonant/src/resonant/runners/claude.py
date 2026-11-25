@@ -3781,10 +3781,11 @@ class ClaudeRunner:
             await self._deprovision(run.code)
             await self._end_cli(run.code)
         try:
-            await self._send_reply(run, watching=watching, note=note)
+            voiced = await self._send_reply(run, watching=watching, note=note)
         except ChannelError as e:
             return Fail(f"reply failed: {e}", retryable=True)
-        if run.status in ("failed", "cancelled"):
+        # PER-328: a voiced end text already explains the failure: no second line under it
+        if run.status in ("failed", "cancelled") and not voiced:
             await self._say_failed(run)
         if run.status == "failed":
             return Fail(run.failure or "failed")
@@ -3804,12 +3805,13 @@ class ClaudeRunner:
 
     async def _send_reply(
         self, run: Run, *, watching: bool = False, note: str | None = None
-    ) -> None:
+    ) -> bool:
         """Report an ended run by urgency (``runners/reports.py``): its digest line is
         written untold, then, when it is ``now``, the full reply is texted and the line
         marked told. A refused text leaves the line for the next digest. A cancel is always
         texted (the owner did it), and so is a token that wasn't revoked. ``watching`` and
-        ``note`` are the auto-merge's; a fork run's reply names its upstream."""
+        ``note`` are the auto-merge's; a fork run's reply names its upstream. True when the
+        voice wrote the text that went out (PER-328: it explains a failure itself)."""
         repo = repo_store.find(self.conn, run.repo) if run.repo else None
         no_ci = repo is not None and repo.mode == "push" and repo.ci is False
         upstream = repo.slug if repo is not None and repo.mode == "fork" else None
@@ -3852,7 +3854,7 @@ class ClaudeRunner:
         if text is None or event is None:
             self.reports.clear_silently(run)
             if text is None:
-                return
+                return False
             item = None
         else:
             level = "now" if warned else self.reports.level(run, event)
@@ -3868,7 +3870,7 @@ class ClaudeRunner:
                 self.bridge.forward(f"run/{run.code}", title)  # PER-301
             if level == "digest":
                 self._unrevoked.pop(run.code, None)  # the line carries the warning
-                return
+                return False
         voiced: VoiceResult | None = None
         if self.voice is not None and parts is not None and self._voiced(run):
             # PER-273: Claude writes the prose; the ⚠ lines, side effects and the closing
@@ -3888,7 +3890,7 @@ class ClaudeRunner:
         except ChannelRefused:  # nobody took it: the digest carries the line (and warning)
             log.warning("run reply refused", extra={"run": run.code})
             self._unrevoked.pop(run.code, None)
-            return
+            return False
         self._unrevoked.pop(run.code, None)  # only now: a retried send says it again
         if item is not None:
             self.reports.told(item)
@@ -3909,6 +3911,7 @@ class ClaudeRunner:
             ref = f"run:{run.code}:{run.status}"
             system_texts.record(self.conn, run.requester, "run", said, ref=ref,
                                 task_id=run.task_id, outside=True)  # fmt: skip
+        return voiced is not None and voiced.used
 
     async def _send_end(self, run: Run, text: str) -> None:
         """The end text: to the run's thread (else the principal), or, for a registered

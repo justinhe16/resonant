@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from resonant.gate.codes import clean_external, mask_codes
@@ -244,6 +244,25 @@ def plain_line(text: str | None) -> str | None:
     if not any(ch.isalnum() for ch in flat):
         return None
     return flat[0].upper() + flat[1:]
+
+
+def without_asker(plain: str | None, names: Iterable[str]) -> str | None:
+    """PER-328: ``plain`` without an ``as <name> asked`` aside when ``<name>`` (or ``you``)
+    is who the prompt asks: ``Redeploy the web app, as Lead asked`` reads ``Redeploy the
+    web app`` to Lead. Also ``as <name> requested`` / ``wanted`` / ``asked for``, and the
+    aside at the start (``As Lead asked, redeploy …``). None stays None; an aside that was
+    all there was leaves None."""
+    if not plain:
+        return plain
+    who = sorted({n.strip() for n in [*names, "you"] if n.strip()}, key=len, reverse=True)
+    alt = "|".join(re.escape(n) for n in who)
+    aside = rf"(?:as|like)\s+(?:{alt})\s+(?:asked(?:\s+for)?|requested|wanted)"
+    out = re.sub(rf"[\s,;:-]*\b{aside}\b", "", plain, flags=re.IGNORECASE)
+    out = re.sub(rf"^\s*{aside}\b[\s,;:-]*", "", out, flags=re.IGNORECASE)
+    out = " ".join(out.split()).strip(" ,;:-")
+    if not any(ch.isalnum() for ch in out):
+        return None
+    return out[0].upper() + out[1:]
 
 
 def summarize(intent: Intent, *, action: str | None = None) -> str:

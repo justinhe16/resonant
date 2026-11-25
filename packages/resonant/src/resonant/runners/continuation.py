@@ -223,7 +223,8 @@ def message(fed: Sequence[Fed], *, request: str | None = None) -> str:
 
 def fallback(reply: str, why: str | None, *, threaded: bool) -> str:
     """The code-built text that goes out when no continuation can (Claude down, paused, at
-    its limit): what the resume would have said, plus PER-319's failure line in a thread."""
+    its limit): what the resume would have said; in a thread PER-319's failure line stands
+    in for its ``Not done`` (PER-328: one failure message)."""
     if why is not None and threaded:
-        return f"{reply}\n{status.failed_line(why)}"
+        return status.one_failure(reply, why)
     return reply

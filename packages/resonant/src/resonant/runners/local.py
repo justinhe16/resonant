@@ -374,10 +374,11 @@ class LocalRunner:
         if resumed:
             answer = replace(answer, meta={**answer.meta, "system": True})
             if answer.path == "refused" and not status.quiet(task):
-                # PER-319: a denial or expiry, said in the thread as a failure line too
+                # PER-319: a denial or expiry, said in the thread as a failure line; PER-328:
+                # in place of the reply's own "Not done" (one failure message, not two)
                 why = status.not_approved(self.conn, task.id, self.now())
                 if why is not None:
-                    answer = replace(answer, meta={**answer.meta, "failure": why})
+                    answer = replace(answer, reply=status.one_failure(answer.reply, why))
         latest = get_task(self.conn, task.id)  # a mid-step save may have pinned ``call``
         cp = latest.checkpoint if latest is not None else cp
         meta: dict[str, Any] = {

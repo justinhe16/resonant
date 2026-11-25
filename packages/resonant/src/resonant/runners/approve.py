@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 from resonant.gate import ApprovalBatch, NeedsApproval
 from resonant.gate.codes import without_offer
+from resonant.gate.summary import without_asker
 from resonant.gateway.channel import (
     ApprovalPrompt,
     Channel,
@@ -226,9 +227,9 @@ async def _prompt(
     sent = _Sent(conn, channel, prompt, approval_ids, task_id=task_id, now=now, asking=asking)
 
     def variant(approver: str) -> ApprovalPrompt:
-        if others is not None and approver != others[0]:
-            return others[1]
-        return prompt
+        base = others[1] if others is not None and approver != others[0] else prompt
+        # PER-328: an approver isn't told "as <them> asked" (a member addressee still is)
+        return addressed(base, approver) if approver in approvers else base
 
     sent.whose = whose
     if whose is not None and shared_thread(thread):
@@ -242,6 +243,19 @@ async def _prompt(
         theirs = variant(approver)
         await sent.send(approver, replace(theirs, thread=thread) if mine else theirs)
     return sent.result()
+
+
+def addressed(prompt: ApprovalPrompt, approver: str) -> ApprovalPrompt:
+    """PER-328: the prompt as ``approver`` reads it: no ``as <them> asked`` in its plain lines
+    (the brain's words, PER-324), since they are the one being asked."""
+    if not prompt.plain and not any(prompt.plains):
+        return prompt
+    names = (approver, approver[:1].upper() + approver[1:])
+    return replace(
+        prompt,
+        plain=without_asker(prompt.plain, names),
+        plains=tuple(without_asker(p, names) for p in prompt.plains),
+    )
 
 
 async def _prompt_shared(

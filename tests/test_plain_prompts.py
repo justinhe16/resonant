@@ -14,11 +14,11 @@ from pathlib import Path
 
 from resonant.gate import NeedsApproval
 from resonant.gate.codes import approval_text, batch_text, exact_line
-from resonant.gate.summary import PLAIN_MAX, plain_line
+from resonant.gate.summary import PLAIN_MAX, plain_line, without_asker
 from resonant.gateway.channel import ApprovalPrompt
 from resonant.gateway.slack import blocks
 from resonant.runner.scope import MAX_INSTRUCTIONS_BYTES, read_instructions
-from resonant.runners.approve import approval_prompt, batch_prompt
+from resonant.runners.approve import addressed, approval_prompt, batch_prompt
 from resonant.runners.ask_tools import APPROVAL_REASON, listing, takes_reason
 from resonant.toolcore import PinnedCall
 from resonant.toolcore.core import with_plain
@@ -174,6 +174,30 @@ def test_listing_offers_the_reason_where_a_call_may_ask() -> None:
     assert listed["odd"]["properties"][APPROVAL_REASON] == {"type": "integer"}
     assert not takes_reason(own) and takes_reason(write) and not takes_reason(read)
     assert APPROVAL_REASON not in write.args_schema["properties"]  # the spec stays as is
+
+
+# --- PER-328: no "as <the approver> asked" -------------------------------------------------
+
+
+def test_without_asker_drops_the_aside_for_whoever_is_asked() -> None:
+    names = ("lead", "Lead")
+    assert without_asker("Redeploy the web app, as Lead asked", names) == "Redeploy the web app"
+    assert without_asker("As lead requested, redeploy it", names) == "Redeploy it"
+    assert without_asker("Redeploy it as you asked for", names) == "Redeploy it"
+    assert without_asker("Redeploy it, as Member asked", names) == "Redeploy it, as Member asked"
+    assert without_asker("Deploy what Lead asked for", names) == "Deploy what Lead asked for"
+    assert without_asker("as Lead asked", names) is None
+    assert without_asker(None, names) is None
+
+
+def test_addressed_strips_the_plain_lines_for_that_approver() -> None:
+    one = _prompt(plain="Redeploy the web app, as Lead asked")
+    assert addressed(one, "lead").plain == "Redeploy the web app"
+    assert addressed(one, "second").plain == "Redeploy the web app, as Lead asked"
+    batch = _prompt(lines=("a", "b"), plains=("Do a, as Lead asked", None))
+    assert addressed(batch, "lead").plains == ("Do a", None)
+    plain = _prompt()
+    assert addressed(plain, "lead") is plain
 
 
 # --- the team instance's rules ----------------------------------------------------------------

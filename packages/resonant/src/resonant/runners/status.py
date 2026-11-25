@@ -13,8 +13,10 @@ Three short, code-built lines, each sent at most once per task and state:
   (``failed_line``): a conversational task's terminal ``Fail`` (the loop's ``on_failed``
   hook: an approval prompt nobody got, a reply that couldn't go out, a step that crashed), a
   denial or an expiry (threaded conversations: iMessage's ``Not done …`` reply already says
-  it), and a run that failed or was cancelled (threaded conversations: the run's end text is
-  iMessage's line).
+  it; PER-328: in that one message, the line replaces a bare ``Not done.`` and a
+  ``Not done: …`` that says why stands alone, ``one_failure``), and a run that failed or was
+  cancelled (threaded conversations: the run's end text is iMessage's line; PER-328: not when
+  that end text was written by the voice, which already explains the failure).
 
 The reason is :func:`plain_reason`: the first line of the error, secrets redacted
 (``redact_secrets``), cleaned (``clean_external``), clipped, with known channel errors said in
@@ -53,6 +55,7 @@ STARTED = "started"
 WAITING = "waiting"
 FAILED = "failed"
 REASON_MAX = 160
+BARE = "Not done."  # PER-328: a denial's reply, which says nothing of why (``toolcore``'s)
 TITLE_MAX = 80
 # The runners whose tasks answer a message: their terminal failure is said in the
 # conversation. Runs (``claude``) say theirs in ``ClaudeRunner``; jobs, reminders and watches
@@ -116,6 +119,17 @@ def failed_line(reason: str) -> str:
     """``Couldn't finish that: <reason>.``"""
     reason = reason.strip().rstrip(".") or "something went wrong"
     return f"Couldn't finish that: {reason}."
+
+
+def one_failure(reply: str, reason: str) -> str:
+    """PER-328: the failure said once, in one message. A code-built reply whose ``Not done…``
+    already says why (``Not done: the approval for … expired.``) stands alone; a bare
+    ``Not done.`` gives way to ``Couldn't finish that: <reason>.`` (what did run stays)."""
+    lines = reply.splitlines()
+    if any(line.startswith("Not done") and line.strip() != BARE for line in lines):
+        return reply
+    kept = [line for line in lines if line.strip() != BARE]
+    return "\n".join([*kept, failed_line(reason)])
 
 
 def plain_reason(error: str | None) -> str:
