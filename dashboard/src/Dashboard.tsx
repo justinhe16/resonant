@@ -10,7 +10,7 @@ import { type Loader, useNow, usePolling } from "@/lib/hooks";
 import { credentialGroups } from "@/lib/credentials";
 import type { DayLoader } from "@/lib/panelDays";
 import { useHashRoute } from "@/lib/route";
-import { staleness, worstHealth } from "@/lib/snapshot";
+import { channelName, staleness, worstHealth } from "@/lib/snapshot";
 import { duration, relative } from "@/lib/time";
 import { useTheme } from "@/lib/theme";
 import { healthTone } from "@/lib/tone";
@@ -211,7 +211,7 @@ export function Dashboard({
               {guard(<Claude snap={snap} now={now} />)}
               {guard(<Jobs snap={snap} now={now} />)}
               {snap.jobs && snap.jobs.length > 0 && guard(<RegisteredJobs snap={snap} now={now} />)}
-              {guard(<Rules rules={snap.trust_rules} repos={snap.repos} />)}
+              {guard(<Rules rules={snap.trust_rules} repos={snap.repos} channel={channelName(snap)} />)}
             </div>
           </div>
         )}

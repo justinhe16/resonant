@@ -149,6 +149,9 @@ def test_a_template_fills_from_args_and_falls_back_when_it_cant() -> None:
     assert long.endswith('..."') and "A7" not in long and "[" not in long
     assert fill_summary(tpl, {"ask": {"a": 1}}) is None  # an object: the arg list says it
     assert fill_summary("bad {", {}) is None
+    # an unnamed arg set to "" is noise (a GET's body): left out of the trailing list
+    assert fill_summary("call {path}", {"path": "/v2/x", "body": ""}) == "call /v2/x"
+    assert fill_summary("call {path}", {"path": "/v2/x", "body": "b"}) == 'call /v2/x (body="b")'
 
 
 def test_a_template_never_hides_an_arg_it_doesnt_name() -> None:

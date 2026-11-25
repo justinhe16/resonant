@@ -269,6 +269,7 @@
             {
               "enum": [
                 "up",
+                "idle",
                 "down"
               ],
               "type": "string"
@@ -398,6 +399,7 @@
         "state": {
           "enum": [
             "up",
+            "idle",
             "down"
           ],
           "title": "State",

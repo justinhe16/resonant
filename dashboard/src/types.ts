@@ -529,7 +529,9 @@ export interface BrainTool {
 }
 
 export interface ClaudeBrain {
-  state: "up" | "down";
+  /** idle: no turn is running, the session is ready (the brain runs per turn); older daemons
+   * said "down" for it */
+  state: "up" | "idle" | "down";
   turns: number;
   /** local tier only; while Remote Control is on */
   remote_url?: string;
@@ -541,7 +543,7 @@ export interface BrainActivity {
   calls_today: number;
   writes_today: number;
   /** null before its first start */
-  state: "up" | "down" | null;
+  state: "up" | "idle" | "down" | null;
   turns: number;
 }
 

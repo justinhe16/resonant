@@ -3,7 +3,7 @@ import { Empty, Group, Row, Rows, StateBadge } from "@/components/bits";
 import { Badge } from "@/components/ui/badge";
 import type { Repo, TrustRule } from "@/types";
 
-export function Rules({ rules, repos }: { rules: TrustRule[]; repos: Repo[] }) {
+export function Rules({ rules, repos, channel = "iMessage" }: { rules: TrustRule[]; repos: Repo[]; channel?: string }) {
   return (
     <CollapsibleSection
       id="rules"
@@ -13,7 +13,7 @@ export function Rules({ rules, repos }: { rules: TrustRule[]; repos: Repo[] }) {
       summary={
         <p className="text-xs text-muted-foreground">
           {rules.length} trust rule{rules.length === 1 ? "" : "s"}, {repos.length} repo{repos.length === 1 ? "" : "s"}.
-          Change rules with /rules on iMessage.
+          Change rules with /rules on {channel}.
         </p>
       }
     >

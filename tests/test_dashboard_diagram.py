@@ -93,9 +93,10 @@ AGENTS = [
 
 
 def _build(db: sqlite3.Connection, now: datetime, **kw: Any) -> Snapshot:
+    imessage = {"channels": {"imessage": {"enabled": True, "self_handle": "a@b.co"}}}
     return build_snapshot(
         db,
-        load_settings(),
+        load_settings(**imessage),
         started_at=now,
         now=now,
         version="deadbeef",

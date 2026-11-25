@@ -175,7 +175,8 @@ def fill_summary(template: str, args: Mapping[str, Any]) -> str | None:
             part.append(value)
         out.extend(part)
     text = " ".join("".join(out).split())
-    rest = {k: v for k, v in args.items() if k not in named and v is not None}
+    # an empty string says nothing (a GET's `body=""`): not worth the approver's eye
+    rest = {k: v for k, v in args.items() if k not in named and v is not None and v != ""}
     if text and rest:
         text += f" ({describe_args(rest)})"
     return text or None

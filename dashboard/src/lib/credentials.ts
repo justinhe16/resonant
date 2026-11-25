@@ -8,7 +8,8 @@ export interface CredentialGroup {
   secrets: SecretExpiry[];
 }
 
-/** How many of each instance's expiries the card shows (the snapshot keeps up to 16). */
+/** How many of each instance's soonest expiries the card shows at first; the rest expand
+ * under "N more" (the snapshot keeps up to 16). */
 export const CREDENTIALS_SHOWN = 3;
 const SOON_DAYS = 7;
 

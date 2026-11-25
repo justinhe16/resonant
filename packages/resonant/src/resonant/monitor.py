@@ -595,7 +595,10 @@ class HealthMonitor:
             )
             failed = int(
                 self.conn.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE status = 'failed' AND updated_at >= ?",
+                    # A failed worker run (kind ``run``) is that run's outcome, shown in Runs: not a
+                    # loop problem.
+                    "SELECT COUNT(*) FROM tasks WHERE status = 'failed' AND updated_at >= ?"
+                    " AND kind != 'run'",
                     (cutoff,),
                 ).fetchone()[0]
             )

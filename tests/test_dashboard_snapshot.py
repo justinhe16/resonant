@@ -407,8 +407,8 @@ def test_empty_db(db: sqlite3.Connection) -> None:
         "approvals_pending": 20, "questions": 20, "pulse": 60, "brain_tools": 20,
     }  # fmt: skip
     assert data["autonomy"] == "on" and data["paused"] is False and data["dry_run"] is True
-    assert [h["name"] for h in data["health"]] == ["model", "imessage", "loop", "store", "backup",
-                                                      "secrets"]  # fmt: skip
+    # the default config has iMessage off: no row for it
+    assert [h["name"] for h in data["health"]] == ["model", "loop", "store", "backup", "secrets"]
     assert {h["state"] for h in data["health"]} == {"unknown"}
     assert all(h["reason"] is None for h in data["health"])
     assert data["tasks"] == {"by_state": {}, "items": []}
@@ -1760,6 +1760,25 @@ def test_registered_jobs(db: sqlite3.Connection) -> None:
     assert jb.outside == ["name"]  # a member's words
     dump = to_remote(s).model_dump(mode="json")
     assert SECRET not in json.dumps(dump) and "prompt" not in dump["jobs"][0]
+
+
+def test_disabled_channel_has_no_health_row(db: sqlite3.Connection) -> None:
+    kv_set(db, "health.imessage", {"state": "degraded", "since": iso(utcnow()), "detail": "x"})
+    off = build_snapshot(db, load_settings(), started_at=utcnow())
+    assert "imessage" not in {h.name for h in off.health}
+    on = load_settings(channels={"imessage": {"enabled": True, "self_handle": "a@b.co"}})
+    s = build_snapshot(db, on, started_at=utcnow())
+    assert {h.name: h.state for h in s.health}["imessage"] == "degraded"
+
+
+def test_idle_brain_is_not_degraded(db: sqlite3.Connection) -> None:
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 15, "written": True})  # no pid
+    s = build_snapshot(db, load_settings(), started_at=utcnow())
+    assert s.claude_brain is not None and s.claude_brain.state == "idle"
+    assert s.brain_activity.state == "idle" and s.brain_activity.turns == 15
+    assert s.diagram is not None
+    brain = next(n for n in s.diagram.nodes if n.id == "core:brain")
+    assert brain.health == "ok" and brain.state == "idle"
 
 
 def test_slack_status(db: sqlite3.Connection) -> None:
