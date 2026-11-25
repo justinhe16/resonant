@@ -2,9 +2,10 @@
 
 The lines themselves, the plain reason (no stack traces, no secrets, Slack's codes in words),
 and the local runner's paths with a recording channel: a denial or expiry in a thread is one
-``Couldn't finish that: …`` line (none on iMessage, whose ``Not done …`` reply already says
-it), and an approval prompt nobody got, once the retries are spent, is one line wherever it
-was asked (iMessage too: that failure used to be silent).
+failure message (PER-328: ``Couldn't finish that: …`` in place of a bare ``Not done.``, or the
+``Not done: …`` that already says why; iMessage keeps its ``Not done …`` reply alone), and
+an approval prompt nobody got, once the retries are spent, is one line wherever it was asked
+(iMessage too: that failure used to be silent).
 """
 
 from __future__ import annotations
@@ -44,6 +45,17 @@ def test_lines() -> None:
     assert status.status_key("t1", status.FAILED) == "status:t1:failed"
 
 
+def test_one_failure_says_it_once() -> None:
+    """PER-328: a bare "Not done." gives way to the line; a "Not done: …" that says why stands
+    alone; what did run stays."""
+    assert status.one_failure("Not done.", "Lead said no") == "Couldn't finish that: Lead said no."
+    why = "Not done: the approval for restart Resonant expired."
+    assert status.one_failure(why, "the approval expired") == why
+    assert status.one_failure("Done: add note\nNot done.", "Lead said no") == (
+        "Done: add note\nCouldn't finish that: Lead said no."
+    )
+
+
 def test_plain_reason_is_short_clean_and_in_words() -> None:
     tab = "approval prompt failed: slack: chat.postMessage failed: messages_tab_disabled"
     assert status.plain_reason(tab) == "I couldn't send the approval (Slack: Messages tab off)"
@@ -71,10 +83,9 @@ async def test_expiry_in_a_thread_is_one_failure_line(make: Any) -> None:
     assert h.task(task_id).status == "waiting"
     h.clock.advance(TTL_S)
     await h.loop.run_until_idle()
+    # PER-328: the reply already says why: no second failure line under it
     assert h.channel.replies() == ["Not done: the approval for restart Resonant expired."]
-    assert status_sends(h, task_id) == [
-        "Couldn't finish that: the approval expired before anyone answered."
-    ]
+    assert status_sends(h, task_id) == []
 
 
 async def test_a_denial_in_a_thread_names_who_said_no(make: Any) -> None:
@@ -83,8 +94,9 @@ async def test_a_denial_in_a_thread_names_who_said_no(make: Any) -> None:
     await h.loop.run_until_idle()
     h.resolve(task_id, approved=False)
     await h.loop.run_until_idle()
-    assert h.channel.replies() == ["Not done."]
-    assert status_sends(h, task_id) == [f"Couldn't finish that: {status.display(OWNER)} said no."]
+    # PER-328: one message: the failure line in place of the bare "Not done."
+    assert h.channel.replies() == [f"Couldn't finish that: {status.display(OWNER)} said no."]
+    assert status_sends(h, task_id) == []
 
 
 async def test_imessage_keeps_its_not_done_reply_alone(make: Any) -> None:

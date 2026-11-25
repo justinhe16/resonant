@@ -78,6 +78,17 @@ Claude's answer is noted with that turn's hops, so the next turns' history taint
 same rule and lifts after the window. A member's ask, an image, email or calendar ask, a
 media or watch ask keep the one-shot path. ``enabled: false``: every ask is one-shot.
 
+**One voice in a thread** (PER-328, threaded conversations only; the owner's iMessage reads
+exactly as before). A shared thread's ack is plain ``On it.`` (``SHARED_ACK``), never the
+queue label. A continuation (PER-321) waits ``FOLD_SETTLE_S`` after it was queued, and goes
+ahead of a newer turn in its thread (a turn whose thread has an approval being decided waits
+for its continuation, up to ``FOLD_WAIT_S``): it then takes every newer turn queued in that
+thread into its own message (``folded_into`` on theirs), so a decline or a result and the
+message that came with it get one answer. A folded turn ends ``folded`` without a reply once
+that answer is out; if the continuation didn't answer, they run as before. A turn that ends
+in an approval whose prompt carries a plain line (PER-324) in a shared thread posts only the
+prompt (and the report lines of what ran): Claude's text is kept for history, not sent.
+
 **Caps** (BR-11): ``daily_cap`` (0, the default: none) and ``claude_session.max_per_hour``
 (60; the runaway guard) count every ask task (brain turns, one-shot asks, media, watch
 checks). Past either, ``enqueue`` refuses (the brain answers locally) and the owner is
@@ -131,7 +142,13 @@ from resonant.brain.text import drop_pending_asks, flat
 from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, ClaudeSessionConfig, Settings
 from resonant.gate.codes import mask_codes
 from resonant.gate.shell import ASK_RULES, READ_RULES, TOOL_WRITE
-from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, thread_of
+from resonant.gateway.channel import (
+    Channel,
+    ChannelError,
+    ChannelRefused,
+    shared_thread,
+    thread_of,
+)
 from resonant.loop.types import (
     PRIORITY_MEMBER,
     PRIORITY_OWNER,
@@ -413,6 +430,14 @@ SESSION_KINDS: frozenset[str] = frozenset({"general", "research", "link"})
 # looked while the one ahead was between its turn and the end of its step.
 SESSION_POLL_S = 30.0
 SESSION_SETTLE_S = 0.2
+# PER-328: in a thread, a decided approval's continuation waits this long after it is queued
+# for a message that came with the decision, and a newer turn waits at most this long for a
+# continuation its thread is about to get (an approval being decided there).
+FOLD_SETTLE_S = 3.0
+FOLD_WAIT_S = 10.0
+FOLD_POLL_S = 0.5
+SHARED_ACK = "On it."  # PER-328: a shared thread's ack (no queue label: that's the owner's)
+FOLDED_HEAD = "Meanwhile, new in the thread (one short reply covers it and the result above):"
 AFTER_WORDS = 6
 HISTORY_EXCHANGES = 4  # earlier exchanges in a tools ask's prompt
 HISTORY_LINE_CHARS = 300
@@ -1192,8 +1217,11 @@ class AskRunner:
                   session=cp.get("session") is True,
                   continuation=continues is not None)  # fmt: skip
         if ack:
-            text = f"{ack} ({after})" if after else ack
-            self._ack_later(task_id, principal, text, 0.0 if after else self._ack_after_s())
+            if shared_thread(thread_of(channel_ref)):  # PER-328: the queue is the owner's
+                self._ack_later(task_id, principal, SHARED_ACK, self._ack_after_s())
+            else:
+                text = f"{ack} ({after})" if after else ack
+                self._ack_later(task_id, principal, text, 0.0 if after else self._ack_after_s())
         return Queued(task_id, session=cp.get("session") is True, after=after)
 
     def _ack_after_s(self) -> float:
@@ -1288,10 +1316,129 @@ class AskRunner:
                  AND json_extract(checkpoint, '$.session') = 1
                  AND json_extract(checkpoint, '$.phase') IS NULL
                  AND json_extract(checkpoint, '$.reply') IS NULL
+                 AND json_extract(checkpoint, '$.folded_into') IS NULL
                ORDER BY rowid""",
             (NAME, TASK_KIND),
         ).fetchall()
         return [(str(r[0]), str(r[1] or "")) for r in rows]
+
+    # -- one voice in a thread (PER-328) --
+
+    def _next_turn(self) -> str | None:
+        """The turn that runs next: the oldest, except that a continuation (a decided
+        approval fed back) goes ahead of the newer turns in its own thread, so it can take
+        them in (``_fold``). None: no turn waits."""
+        rows = self.conn.execute(
+            """SELECT id, conversation,
+                      json_extract(checkpoint, '$.continuation') IS NOT NULL FROM tasks
+               WHERE runner = ? AND kind = ? AND status IN ('queued', 'running', 'waiting')
+                 AND json_extract(checkpoint, '$.session') = 1
+                 AND json_extract(checkpoint, '$.phase') IS NULL
+                 AND json_extract(checkpoint, '$.reply') IS NULL
+                 AND json_extract(checkpoint, '$.folded_into') IS NULL
+               ORDER BY rowid""",
+            (NAME, TASK_KIND),
+        ).fetchall()
+        if not rows:
+            return None
+        head_id, convo, continued = str(rows[0][0]), rows[0][1], bool(rows[0][2])
+        if convo is not None and not continued:
+            for r in rows[1:]:
+                if r[2] and r[1] == convo:
+                    return str(r[0])
+        return head_id
+
+    def _hold(self, task: Task, cp: dict[str, Any]) -> datetime | None:
+        """When a thread's turn should wait before it runs (None: run now): a continuation
+        until ``FOLD_SETTLE_S`` after it was queued (a message sent with the decision lands
+        first); a newer turn while its thread has an approval being decided (its
+        continuation is on the way), at most ``FOLD_WAIT_S`` after it was queued. The
+        owner's own conversation (no thread) never waits."""
+        if task.conversation is None:
+            return None
+        now = self.clock()
+        if self._continuation(cp) is not None:
+            until = task.created_at + timedelta(seconds=FOLD_SETTLE_S)
+            return until if until > now else None
+        if task.created_at + timedelta(seconds=FOLD_WAIT_S) <= now:
+            return None
+        row = self.conn.execute(
+            """SELECT 1 FROM tasks WHERE runner = ? AND kind = ? AND conversation = ?
+                 AND id != ? AND status IN ('queued', 'running')
+                 AND json_extract(checkpoint, '$.phase') = 'approval' LIMIT 1""",
+            (NAME, TASK_KIND, task.conversation, task.id),
+        ).fetchone()
+        return None if row is None else now + timedelta(seconds=FOLD_POLL_S)
+
+    def _fold(self, task: Task) -> list[Task]:
+        """PER-328: the newer Claude brain turns queued in this continuation's thread, taken
+        into its turn (``folded_into`` on each, only while it isn't running), oldest first;
+        again the ones it took before a retry of its turn. Their acks are dropped: this
+        turn's answer is theirs."""
+        if task.conversation is None:
+            return []
+        rows = self.conn.execute(
+            """SELECT id FROM tasks WHERE runner = ? AND kind = ? AND conversation = ?
+                 AND id != ? AND status IN ('queued', 'waiting')
+                 AND json_extract(checkpoint, '$.session') = 1
+                 AND json_extract(checkpoint, '$.continuation') IS NULL
+                 AND json_extract(checkpoint, '$.approved') IS NULL
+                 AND json_extract(checkpoint, '$.session_turn') IS NULL
+                 AND json_extract(checkpoint, '$.phase') IS NULL
+                 AND json_extract(checkpoint, '$.reply') IS NULL
+                 AND COALESCE(json_extract(checkpoint, '$.folded_into'), ?) = ?
+               ORDER BY rowid""",
+            (NAME, TASK_KIND, task.conversation, task.id, task.id, task.id),
+        ).fetchall()
+        folded: list[Task] = []
+        with atomic(self.conn):
+            for r in rows:
+                took = self.conn.execute(
+                    "UPDATE tasks SET checkpoint = json_set(checkpoint, '$.folded_into', ?) "
+                    "WHERE id = ? AND status IN ('queued', 'waiting')",
+                    (task.id, r[0]),
+                ).rowcount
+                rider = get_task(self.conn, str(r[0])) if took == 1 else None
+                if rider is not None:
+                    folded.append(rider)
+                    self._answered.add(rider.id)  # no ack: this turn answers it
+            if folded:
+                audit(self.conn, "ask.folded", task_id=task.id, trace_id=task.trace_id,
+                      folded=[f.id for f in folded])  # fmt: skip
+        return folded
+
+    def _folded(self, task: Task, cp: dict[str, Any], into: str) -> StepOutcome:
+        """A turn another one took in (``_fold``): done, with no reply of its own, once that
+        one answered; back in the queue as an ordinary turn if it ended without an answer;
+        else it waits (that turn wakes it when its step ends)."""
+        head = get_task(self.conn, into)
+        hcp = head.checkpoint if head is not None else {}
+        if isinstance(hcp.get("reply"), str) and hcp.get("status") == "answered":
+            return Done({"status": "folded", "kind": cp.get("kind"), "folded_into": into,
+                         "untrusted": True, "proposed": False})  # fmt: skip
+        if (
+            head is None
+            or head.status in ("done", "failed", "cancelled")
+            or (isinstance(hcp.get("reply"), str))
+        ):
+            self._answered.discard(task.id)
+            rest = {k: v for k, v in cp.items() if k != "folded_into"}
+            return Wait("resource", rest, self.clock())
+        return Wait("resource", cp, self.clock() + timedelta(seconds=SESSION_POLL_S))
+
+    def _settle_folded(self, head: str) -> None:
+        """After a continuation's step: the turns it took in hear it now (``_folded``)."""
+        try:
+            rows = self.conn.execute(
+                "SELECT id FROM tasks WHERE runner = ? AND status = 'waiting' "
+                "AND json_extract(checkpoint, '$.folded_into') = ?",
+                (NAME, head),
+            ).fetchall()
+            with atomic(self.conn):
+                for r in rows:
+                    task_store.set_status(self.conn, str(r[0]), "queued", expect=("waiting",))
+        except sqlite3.Error:
+            log.warning("ask: couldn't wake the turns a continuation took in", exc_info=True)
 
     async def _refuse_queued(
         self, task: Task, ctx: StepContext, cp: dict[str, Any], principal: str
@@ -1324,7 +1471,9 @@ class AskRunner:
         waiting, is queued now (the loop dispatches it on the wakeup every finished step
         sets), instead of polling for the session."""
         try:
-            nxt = next((tid for tid, _ in self._session_queue() if tid != done), None)
+            nxt = self._next_turn()
+            if nxt is None or nxt == done:
+                nxt = next((tid for tid, _ in self._session_queue() if tid != done), None)
             if nxt is None:
                 return
             with atomic(self.conn):
@@ -1393,6 +1542,8 @@ class AskRunner:
             return await self._resume(task, events, ctx)
         if isinstance(cp.get("reply"), str):  # answered before a crash or a send failure
             return await self._deliver(task, cp, ctx)
+        if isinstance(into := cp.get("folded_into"), str):  # PER-328: another turn answers it
+            return self._folded(task, cp, into)
         left = await self._reap_left(task, cp)
         if cp.get("session_turn") is True:  # BR-11: a Claude brain turn a crash cut short
             left = True
@@ -1409,13 +1560,16 @@ class AskRunner:
         if self._is_turn(cp):  # BR-11: one turn at a time, oldest first
             assert self.brain is not None
             queue = self._session_queue()
-            if self.brain.busy or not queue or queue[0][0] != task.id:
+            if self.brain.busy or not queue or self._next_turn() != task.id:
                 wait = SESSION_POLL_S if self.brain.busy else self._settle_s(queue)
                 return Wait("resource", cp, self.clock() + timedelta(seconds=wait))
+            if (hold := self._hold(task, cp)) is not None:  # PER-328
+                return Wait("resource", cp, hold)
             try:
                 return await self._ask(task, ctx, cp, question, kind)
             finally:
                 self._wake_next_turn(task.id)
+                self._settle_folded(task.id)
         if len(self._working) >= self.cfg.concurrency:
             wake = self.clock() + timedelta(seconds=self.defer_s)
             return Wait("resource", cp, wake)  # a busy slot, not a usage limit
@@ -1562,6 +1716,11 @@ class AskRunner:
                 log.info("ask: dropped %d sentence(s) asking for a yes with none pending", asks)
         reply = with_reports(text if status != "answered" else None, text, reports, redactor,
                              self.cfg.reply_max_chars)  # fmt: skip
+        held: str | None = None
+        if pending and bridge is not None and self._prompt_says_it(task, bridge):
+            # PER-328: the prompt's plain line says what the yes is for; Claude's text about
+            # it is kept for history, and only what ran goes out with the prompt
+            held, reply = reply, "\n".join(r for r in reports if r)
         extra: dict[str, Any] = {}
         if result is not None:
             cost = result.get("total_cost_usd")
@@ -1573,7 +1732,18 @@ class AskRunner:
             extra.update(tool_calls=bridge.calls, changes=len(reports), waiting=pending,
                          tainted=bridge.tainted)  # fmt: skip
         return await self._finish(task, ctx, cp, status, reply, proposed=status == "answered"
-                                  and has_proposal(text), pending=pending, **extra)  # fmt: skip
+                                  and has_proposal(text), pending=pending, held=held,
+                                  **extra)  # fmt: skip
+
+    @staticmethod
+    def _prompt_says_it(task: Task, bridge: ClaudeTools) -> bool:
+        """PER-328: a turn ending in an approval in a shared thread whose every change has a
+        plain line (PER-324): the one prompt there says it all."""
+        return (
+            bool(bridge.asked)
+            and all(i.call.reason for i in bridge.asked)
+            and shared_thread(thread_of(task, to=task.principal))
+        )
 
     def _approval_pending(self, principal: str | None) -> bool:
         """Whether a yes would mean something now: an approval is open for ``principal``, or
@@ -1655,7 +1825,10 @@ class AskRunner:
             if bridge.read_outside:
                 return 0
             if out.fresh:  # a new session holds no earlier turn's text: only this one counts
-                return self._asking_hops(cp) if asking else None
+                own = [self._asking_hops(cp)] if asking else []
+                own += [self._asking_hops(r.checkpoint) for r in riders
+                        if r.checkpoint.get("tainted") is True]  # fmt: skip
+                return min(own) if own else None
             return start
 
         primed: list[str] = []  # the primer a fresh session was told (a source for the guard)
@@ -1683,9 +1856,39 @@ class AskRunner:
             who=None if convo.plain(self.owner) else self._who(convo.principal),
             continued=continued is not None,
         )  # fmt: skip
+        # PER-328: a continuation in a thread takes in the newer turns queued there: one
+        # answer for the decision and what was said with it
+        riders = self._fold(task) if continued is not None else []
+        rider_before: list[str] = []
+        owner_text = str(cp.get("owner_text") or question)
+        asked = question
+        if riders:
+            parts = [FOLDED_HEAD]
+            for r in riders:
+                rcp = r.checkpoint
+                rq = str(rcp.get("question") or "")
+                rk: Any = rcp.get("kind")
+                parts.append(self._turn_message(
+                    rq, rk if rk in KINDS else "general", now=self.clock(), tz=self.tz,
+                    who=self._who(r.principal or convo.principal),
+                ))  # fmt: skip
+                asking_id = rcp.get("requested_by")
+                src = get_task(self.conn, asking_id) if isinstance(asking_id, str) else None
+                if src is not None and src.origin_event_id is not None:
+                    rider_before.append(src.origin_event_id)
+                owner_text = str(rcp.get("owner_text") or rq)
+                asked = f"{asked}\n{rq}"
+                if rcp.get("tainted") is True:  # what it was asked with taints this turn
+                    hops = self._asking_hops(rcp)
+                    bridge.taint("folded", hops=hops)
+                    start = hops if start is None else min(start, hops)
+            message = f"{message}\n\n" + "\n\n".join(parts)
         # an approved change's turn (or a continuation) is Resonant's own: the texts wait for
-        # the owner's next one
-        delta = None if approved or continued is not None else self._since(convo, before)
+        # the owner's next one (PER-328: unless it took in a newer turn, which reads them)
+        if riders:
+            delta = self._since(convo, rider_before[0]) if rider_before else None
+        else:
+            delta = None if approved or continued is not None else self._since(convo, before)
         if delta is not None:  # PER-270: the thread since the session's last turn
             message = f"{delta.text}\n\n{message}"
         if not convo.plain(self.owner):  # PER-294: which thread, and who wrote
@@ -1715,16 +1918,19 @@ class AskRunner:
             out = await run(message)
             if not approved:  # PER-256: the guards on Claude's answer, one redo
                 out, flagged = await self._guarded(
-                    task, out, run, bridge, message, primed, question=question,
-                    owner_text=str(cp.get("owner_text") or question), before=before,
+                    task, out, run, bridge, message, primed, question=asked,
+                    owner_text=owner_text, before=rider_before[0] if rider_before else before,
                     convo=convo, fed=continued is not None and continued.get("changed") is True,
                 )  # fmt: skip
         finally:
             await bridge.aclose()
-        own = approved or continued is not None  # Resonant's own turn: the cursor stays
-        if before is not None and not own and out.status == "answered":  # it read them
+        # Resonant's own turn: the cursor stays (PER-328: one that took in a newer turn read
+        # the thread up to that turn's message)
+        own = (approved or continued is not None) and not riders
+        cursor = rider_before[-1] if rider_before else before
+        if cursor is not None and not own and out.status == "answered":  # it read them
             with contextlib.suppress(sqlite3.Error), atomic(self.conn):
-                kv_set(self.conn, convo.since_kv(self.owner), before)
+                kv_set(self.conn, convo.since_kv(self.owner), cursor)
         hops = hops_of(out)  # recorded by the session, under its lock
         seen = {"status": out.status, "fresh": out.fresh, "retried": out.retried}
         log.info("claude brain turn", extra={"task": task.id, **seen, "tainted": hops is not None})
@@ -2208,12 +2414,17 @@ class AskRunner:
         proposed: bool = False,
         pending: bool = False,
         dedupe_key: str | None = None,
+        held: str | None = None,
         **extra: Any,
     ) -> StepOutcome:
         """Save the reply (a retry only re-sends it), audit, then deliver it. ``pending``: a
-        change the gate asked about waits for the owner after the reply (BR-10)."""
+        change the gate asked about waits for the owner after the reply (BR-10). ``held``
+        (PER-328): Claude's text that the approval prompt stands in for: noted for history,
+        never sent (``reply`` is then only what ran, maybe nothing)."""
         cp = {k: v for k, v in cp.items() if k not in ("pid", "created", "marker")}
         cp.update(reply=reply, status=status, proposed=proposed, pending=pending)
+        if held is not None:
+            cp["held"] = held
         if dedupe_key is not None:
             cp["dedupe_key"] = dedupe_key
         if len(self._answered) > ANSWERED_KEEP:
@@ -2238,18 +2449,20 @@ class AskRunner:
             return Done({"status": status, "kind": cp.get("kind"), "watch": watch,
                          "untrusted": True, "proposed": False})  # fmt: skip
         key = cp.get("dedupe_key")
+        held = cp.get("held")
         try:
-            await self.channel.send(
-                task.principal,
-                reply,
-                thread=thread_of(task, to=task.principal),
-                dedupe_key=key if isinstance(key, str) else f"ask:{task.id}",
-            )
+            if reply.strip() or not isinstance(held, str):  # PER-328: a held text, nothing ran
+                await self.channel.send(
+                    task.principal,
+                    reply,
+                    thread=thread_of(task, to=task.principal),
+                    dedupe_key=key if isinstance(key, str) else f"ask:{task.id}",
+                )
         except ChannelRefused as e:
             return Fail(f"ask reply refused: {e}")
         except ChannelError as e:
             return Fail(f"ask reply failed: {e}", retryable=True, checkpoint=cp)
-        self._note_answer(cp, reply, status, task)
+        self._note_answer(cp, held if isinstance(held, str) else reply, status, task)
         if (
             cp.get("pending") is True
             and self.resumer is not None

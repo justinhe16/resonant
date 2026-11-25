@@ -205,7 +205,8 @@ async def test_a_denial_in_the_thread_is_one_failure_line(
         assert in_thread(fake, CHANNEL_THREAD, "Couldn't") == [
             "Couldn't finish that: Second said no."
         ]
-        assert in_thread(fake, CHANNEL_THREAD, "Not done")  # the reply still says it
+        # PER-328: the line is the reply: no "Not done." saying it a second time
+        assert not in_thread(fake, CHANNEL_THREAD, "Not done")
 
 
 async def test_a_members_ask_from_a_dm_says_who_it_waits_on(
