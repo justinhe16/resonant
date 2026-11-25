@@ -239,7 +239,7 @@ async def _prompt_shared(
     copy went to the addressee's own conversation): the rest then get their own, as before."""
     refused: set[str] = set()
     for addressee in dict.fromkeys([whose, *approvers]):
-        mention = () if whose in approvers else tuple(a for a in approvers if a != addressee)
+        mention = () if whose in approvers else tuple(approvers)  # incl. a fallback addressee
         theirs = replace(variant(addressee), thread=thread, mention=mention)
         ref = await sent.send(addressee, theirs, record=False, approver=addressee in approvers)
         if ref is None:
