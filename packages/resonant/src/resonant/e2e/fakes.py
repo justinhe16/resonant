@@ -176,6 +176,7 @@ class FakeSent:
     thread: str | None  # the thread it went to (``MessageRef.thread``), None unthreaded
     dedupe_key: str | None
     ref: str
+    mention: tuple[str, ...] = ()  # PER-320: the principals an approval prompt tagged
 
 
 class FakeChannel:
@@ -287,6 +288,17 @@ class FakeChannel:
         thread: MessageRef | None = None,
         dedupe_key: str | None = None,
     ) -> MessageRef:
+        return self._send(principal, text, thread=thread, dedupe_key=dedupe_key)
+
+    def _send(
+        self,
+        principal: str,
+        text: str,
+        *,
+        thread: MessageRef | None,
+        dedupe_key: str | None,
+        mention: tuple[str, ...] = (),
+    ) -> MessageRef:
         p = self.principals.get(principal)
         if p is None or not any(i.startswith(f"{self._name}:") for i in p.identities):
             raise ChannelRefused(f"no {self._name} identity")
@@ -295,7 +307,8 @@ class FakeChannel:
         self._n += 1
         where = thread.thread if self.threaded and thread is not None else None
         ref = MessageRef(self._name, f"{self._name}-out:{self._n}", where)
-        self.sent.append(FakeSent(principal, text, where, dedupe_key, ref.ref))
+        tags = mention if where is not None else ()
+        self.sent.append(FakeSent(principal, text, where, dedupe_key, ref.ref, tags))
         if dedupe_key is not None:
             self._keys[dedupe_key] = ref
         self._changed.set()
@@ -305,7 +318,8 @@ class FakeChannel:
         key = approval_dedupe_key(prompt.approval_id, principal)
         if key not in self._keys:
             self.prompts.append(prompt)
-        return await self.send(principal, prompt.text(), thread=prompt.thread, dedupe_key=key)
+        return self._send(principal, prompt.text(), thread=prompt.thread, dedupe_key=key,
+                          mention=prompt.mention)  # fmt: skip
 
     async def wait_for(self, count: int, timeout_s: float) -> FakeSent:
         """Wait until at least ``count`` sends were recorded; return the ``count``-th."""

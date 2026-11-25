@@ -88,6 +88,8 @@ class Channel:
     name = "slack"
 
     def __init__(self) -> None:
+        # threaded: a prompt with a thread lands there (PER-320); else in a DM (no thread)
+        self.threaded = False
         self.prompts: list[tuple[str, ApprovalPrompt]] = []
         self.sent: list[tuple[str, str]] = []
         self._keys: set[str] = set()
@@ -108,7 +110,8 @@ class Channel:
         if key not in self._keys:
             self._keys.add(key)
             self.prompts.append((principal, prompt))
-        return MessageRef("slack", f"p:{len(self.prompts)}")
+        where = prompt.thread.thread if self.threaded and prompt.thread is not None else None
+        return MessageRef("slack", f"p:{len(self.prompts)}", where)
 
 
 class Executor:
@@ -169,12 +172,13 @@ class Harness:
             requests=self.requests,
         )
 
-    def run(self, requested_by: str | None = "brian") -> str:
+    def run(self, requested_by: str | None = "brian", *, thread: bool = True) -> str:
         tid = task_store.insert_task(self.db, NewTask(kind="run", runner="claude", priority=1))
         task_store.set_status(self.db, tid, "running")
         run = runs_store.create(
             self.db, repo="voyager-service", ask="ship it", principal="justin", session_id="s",
-            max_seconds=600, channel_ref=ref(requested_by or "justin"), requested_by=requested_by,
+            max_seconds=600, requested_by=requested_by,
+            channel_ref=ref(requested_by or "justin") if thread else None,
         )  # fmt: skip
         runs_store.update(self.db, run.code, task_id=tid, status="running")
         return run.code
@@ -303,14 +307,24 @@ async def test_the_fourth_open_request_is_refused(h: Harness) -> None:
 
 
 async def test_a_member_requested_run_still_needs_an_approvers_click(h: Harness) -> None:
+    h.channel.threaded = True
     code = h.run("miu")
     call = h.request(code, ("commit", "abc"))
-    prompts = await h.prompted(2)
+    prompts = await h.prompted(1)
     approval_id = prompts[0][1].approval_id
     a = ap.get_approval(h.db, approval_id)
     assert a is not None and a.approvers == ("justin", "brian") and a.requested_by == "miu"
-    # Miu isn't an approver: the copy in the thread goes to the first approver
-    assert [(p, pr.thread is not None) for p, pr in prompts] == [("justin", True), ("brian", False)]
+    # PER-320: Miu isn't an approver: one copy in the run's thread, addressed to Miu and
+    # tagging both approvers (no DMs); it counts as sent to each approver
+    await asyncio.sleep(0.05)
+    assert [(p, pr.thread is not None, pr.mention) for p, pr in h.channel.prompts] == [
+        ("miu", True, ("justin", "brian"))
+    ]
+    a = ap.get_approval(h.db, approval_id)
+    assert a is not None and {(c.principal, c.thread) for c in a.channel_refs} == {
+        ("justin", THREAD),
+        ("brian", THREAD),
+    }
     assert prompts[0][1].summary.startswith(f"{code} (for Miu) asks for ")
     assert not h.click(approval_id, "miu")
     await asyncio.sleep(0.05)
@@ -318,6 +332,25 @@ async def test_a_member_requested_run_still_needs_an_approvers_click(h: Harness)
     assert h.click(approval_id, "brian")
     reply = await asyncio.wait_for(call, 5)
     assert reply is not None and reply.exit == EXIT_OK and h.executor.ran == [{"commit": "abc"}]
+
+
+async def test_a_scheduled_runs_request_dms_each_approver(h: Harness) -> None:
+    # PER-320: a scheduled job's run has no thread to post in: each approver gets their own
+    h.channel.threaded = True
+    code = h.run("justin", thread=False)
+    call = h.request(code, ("commit", "abc"))
+    prompts = await h.prompted(2)
+    assert [(p, pr.thread, pr.mention) for p, pr in prompts] == [
+        ("justin", None, ()),
+        ("brian", None, ()),
+    ]
+    a = ap.get_approval(h.db, prompts[0][1].approval_id)
+    assert a is not None and {(c.principal, c.thread) for c in a.channel_refs} == {
+        ("justin", None),
+        ("brian", None),
+    }
+    call.cancel()
+    await h.desk.aclose()
 
 
 async def test_two_runs_asking_the_same_deploy_share_one_approval(h: Harness) -> None:

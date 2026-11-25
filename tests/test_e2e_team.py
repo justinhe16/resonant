@@ -202,8 +202,10 @@ async def test_brian_starts_a_run_and_approves_his_own_gated_builtin(
             "SELECT approvers, requested_by FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
         assert '"brian"' in row["approvers"] and '"justin"' in row["approvers"]
-        justin_texts = [m.text for m in fake.sent if m.principal == "justin"]
-        assert any(t.startswith(f"[{code.group(1)}]") for t in justin_texts)  # asked too
+        # PER-320: one prompt, in brian's thread (every approver answers it there); no DMs
+        prompts = [m for m in fake.sent if m.text.startswith(f"[{code.group(1)}]")]
+        assert [(m.principal, m.mention) for m in prompts] == [("brian", ())]
+        assert prompts[0].thread is not None
         fake.inject(BRIAN, f"yes {code.group(1)}")
         await until(
             lambda: (
@@ -220,6 +222,42 @@ async def test_brian_starts_a_run_and_approves_his_own_gated_builtin(
             "SELECT decided_by FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
         assert decided["decided_by"] == "brian"
+
+
+async def test_another_approver_answers_the_prompt_in_the_askers_thread(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PER-320: brian asks in a thread; the one prompt is there, and justin's typed
+    # "yes <code>" in that thread approves it (he got no copy of his own)
+    async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
+        brian = Slack(fake, BRIAN, "brian")
+        thread = "C0TEAM:1700000000.000100"
+        assert await brian.say("/note buy milk", thread=thread) == 'Saved note 1: "buy milk"'
+        fake.inject(BRIAN, "/notes clear", thread=thread)
+        prompt = ""
+        while not prompt.startswith("["):
+            prompt = await brian.next("the prompt in the thread")
+        code = re.match(r"^\[([A-Z0-9]+)\]", prompt)
+        assert code is not None
+        sent = [m for m in fake.sent if m.text.startswith(f"[{code.group(1)}]")]
+        assert [(m.principal, m.thread) for m in sent] == [("brian", thread)]
+        assert fake.inject(JUSTIN, f"yes {code.group(1)}", thread=thread)
+        await until(
+            lambda: (
+                d.conn.execute(
+                    "SELECT decided_by FROM approvals WHERE code = ? AND status = 'approved'",
+                    (code.group(1),),
+                ).fetchone()
+                is not None
+            ),
+            20,
+            "justin's approval in brian's thread",
+        )
+        (decided,) = d.conn.execute(
+            "SELECT decided_by FROM approvals WHERE code = ?", (code.group(1),)
+        ).fetchall()
+        assert decided["decided_by"] == "justin"
+        assert not [m for m in fake.sent if m.principal == "justin" and m.thread != thread]
 
 
 async def test_brian_has_no_admin_and_pauses_this_instance_only(

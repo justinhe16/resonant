@@ -69,7 +69,12 @@ class ApprovalPrompt:
     phrased: bool = False  # PER-268: the summary is the tool's own phrase: asked as a question
     # PER-292: the asking task's thread (``thread_of``), set only on the prompt to that task's
     # own principal; the hub sends there, an unthreaded adapter ignores it. Not in the text.
+    # PER-320: in a shared thread (``shared_thread``) it is the one copy every approver answers.
     thread: MessageRef | None = None
+    # PER-320: principals the threaded copy tags so they're notified (Slack: ``<@U…>`` for
+    # each one's Slack identity; one without is left out). Set only when the requester isn't
+    # an approver. Not in ``text()``; an unthreaded adapter ignores it.
+    mention: tuple[str, ...] = ()
     # PER-300: one arg in full (a code fence built by ``gate.summary.detail_text``), under
     # the question. Never on a batch prompt.
     detail: str | None = None
@@ -164,6 +169,20 @@ class Channel(Protocol):
 
 
 # --- identities and threads (PER-292) -------------------------------------------------------
+
+
+# A 1:1 conversation's id on a threaded channel: Slack DMs are ``D…`` channels.
+_ONE_TO_ONE: dict[str, tuple[str, ...]] = {"slack": ("D",)}
+
+
+def shared_thread(thread: MessageRef | None) -> bool:
+    """PER-320: whether ``thread`` is a conversation other people see (a thread in a team
+    channel), where one approval prompt serves every approver. False for None, an unthreaded
+    channel (iMessage) and a 1:1 conversation (a Slack DM: its prompt goes to each approver in
+    their own conversation, as before)."""
+    if thread is None or not thread.thread:
+        return False
+    return not thread.thread.startswith(_ONE_TO_ONE.get(thread.channel, ()))
 
 
 def event_identity(event: Event) -> str | None:

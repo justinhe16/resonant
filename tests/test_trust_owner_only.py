@@ -22,6 +22,7 @@ from resonant.gate import (
     PolicyGate,
 )
 from resonant.gate.codes import without_offer
+from resonant.gateway.channel import ApprovalPrompt, MessageRef
 from resonant.loop import NewTask
 from resonant.principals import TRUST_TOOLS, Principals
 from resonant.router import Router
@@ -344,3 +345,56 @@ async def test_an_approvers_rules_change_is_refused_and_audited(
         "SELECT requested_by, detail FROM audit_log WHERE action = 'router.command_refused'"
     ).fetchall()
     assert row["requested_by"] == APPROVER and "/rules" in row["detail"]
+
+
+# --- PER-320: a check from a run in a team channel's thread: one prompt there ----------------
+
+
+class ThreadedChannel(Channel):
+    """Posts a prompt with a thread in that thread (a team channel's, as Slack does)."""
+
+    name = "slack"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.to: list[tuple[str, ApprovalPrompt]] = []
+
+    async def request_approval(self, principal: str, prompt: ApprovalPrompt) -> MessageRef:
+        self.to.append((principal, prompt))
+        ref = await super().request_approval(principal, prompt)
+        where = None if prompt.thread is None else prompt.thread.thread
+        return MessageRef("slack", ref.ref, where)
+
+
+async def test_a_members_run_check_is_one_prompt_in_the_thread_tagging_the_approvers(
+    db: sqlite3.Connection, team: Principals
+) -> None:
+    thread = "C0TEAM:1700000000.000100"
+    channel = ThreadedChannel()
+    checks = TrustChecks(db, channel, team, approval_ttl_s=TTL_S, clock=Clock(),  # pyright: ignore[reportArgumentType]
+                         poll_s=0.001)  # fmt: skip
+    tid = repo.insert_task(db, NewTask(kind="run", runner="claude", priority=1))
+    repo.set_status(db, tid, "running")
+    run = runs_store.create(
+        db, repo="site", ask="x", principal=OWNER, session_id="s", max_seconds=60,
+        channel_ref={"channel": "slack", "principal": MEMBER, "identity": "slack:U3",
+                     "thread": thread, "ref": thread},
+        requested_by=MEMBER,
+    )  # fmt: skip
+    runs_store.update(db, run.code, task_id=tid, status="running")
+    task = asyncio.ensure_future(checks.request_check(run.code, "prod-api", "deploy"))
+    for _ in range(500):
+        if channel.to:
+            break
+        await asyncio.sleep(0.001)
+    await asyncio.sleep(0.01)
+    sent = [(who, p.thread and p.thread.thread, p.mention) for who, p in channel.to]
+    assert sent == [(MEMBER, thread, (OWNER, APPROVER))]  # no DMs
+    (row,) = db.execute("SELECT id FROM approvals").fetchall()
+    stored = ap.get_approval(db, row["id"])
+    assert stored is not None
+    assert {(c.principal, c.thread) for c in stored.channel_refs} == {
+        (OWNER, thread),
+        (APPROVER, thread),
+    }
+    task.cancel()

@@ -228,7 +228,9 @@ async def test_mention_thread_reply_and_approval_buttons(
             "SELECT id, code FROM approvals WHERE status = 'pending'"
         ).fetchall()
         approval_id, code = row["id"], row["code"]
-        assert any(p.buttons and p.channel == "D1" for p in web.posts)  # Justin asked too
+        # PER-320: an approver asked in a team thread: one prompt, there; no DM copies
+        assert [p.ts for p in web.posts if p.buttons] == [prompt.ts]
+        assert not any(p.channel.startswith("D") for p in web.posts)
 
         # Miu's click: an ephemeral refusal, nothing changes
         await socket.deliver(
@@ -277,16 +279,16 @@ async def test_mention_thread_reply_and_approval_buttons(
             30,
             "the notes to clear",
         )
-        # Justin's late click on his own copy: already decided
-        jprompt = next(p for p in web.posts if p.buttons and p.channel == "D1")
+        # the other approver's late click on the same prompt: already decided
         await socket.deliver(
             click(
                 JUSTIN,
                 approval_id,
                 code,
                 team=TEAM_ID,
-                channel="D1",
-                ts=jprompt.ts,
+                channel="C0GENERAL",
+                ts=prompt.ts,
+                thread_ts=ROOT,
                 action_ts="1800000003.000001",
             )
         )

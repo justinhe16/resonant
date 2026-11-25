@@ -12,16 +12,24 @@ system text the brains see, PER-268):
 - ``reached`` empty with no transient error means no approver is reachable: the caller
   fails for good.
 - PER-292: the prompt to the asking task's own principal goes to that task's thread
-  (``thread_of``); every other approver gets it in their own conversation.
+  (``thread_of``); every other approver gets it in their own conversation. That stays so
+  for a thread nobody else sees (a Slack DM) and with no thread (iMessage, a scheduled job).
+- PER-320: in a shared thread (``shared_thread``: a team channel's), **one** copy goes
+  there, addressed to the requester, tagging the approvers (``ApprovalPrompt.mention``) when
+  the requester isn't one, and it is recorded for every approver (with the thread): each
+  may answer it there (a button or ``yes <code>``), and none gets a DM. A requester the
+  channel refuses is skipped (the first approver it reaches gets it, in the thread); if the
+  adapter can't post in the thread any more, the rest get their own, as before.
 - PER-318: a prompt that offers ``yes always`` offers it to ``NeedsApproval.offer_to`` (the
   owner) alone: every other approver gets it as a plain yes / no, the summary's code-built
   ``yes always`` note cut (``gate.codes.without_offer``). Only the owner widens trust.
-- PER-294: ``in_thread`` overrides that pair: a worker's trust check goes to the run's thread,
-  addressed to the run's requester (``trust.checks``); a worker's ``resonant request`` too
-  (PER-296, ``runners.worker_requests``), addressed to an approver.
+- PER-294: ``in_thread`` overrides that pair, ``(requester, thread)``: a worker's trust
+  check goes to the run's thread, addressed to the run's requester (``trust.checks``); a
+  worker's ``resonant request`` too (PER-296, ``runners.worker_requests``).
 
 ``remind_due`` (PER-261, the ``core/remind`` job, every minute) sends each prompt one
-reminder at half its TTL, to whoever got it: ``[A7] still waiting, expires in 15 min``. A
+reminder at half its TTL, to whoever got it: ``[A7] still waiting, expires in 15 min``
+(PER-320: the approvers who got the one copy in a shared thread get one reminder there). A
 batch is one prompt (its code, timed from when it was opened). Deduped per approval and
 approver (``approval:<id>:remind:<principal>``), recorded on the approvals (``reminded_at``,
 once the send is settled: sent, or refused for good) and as a system text the brains see. It
@@ -46,6 +54,7 @@ from resonant.gateway.channel import (
     ChannelRefused,
     MessageRef,
     approval_dedupe_key,
+    shared_thread,
     thread_of,
 )
 from resonant.store import approvals as ap
@@ -58,6 +67,7 @@ from resonant.store.tasks import get_task
 if TYPE_CHECKING:
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
+    from resonant.loop.types import Task
 
 REMIND_JOB_ID = "remind"
 REMIND_SCHEDULE = "* * * * *"
@@ -121,9 +131,10 @@ async def prompt_approvers(
     summary: str | None = None,
 ) -> PromptResult:
     """Prompt every approver; see the module docstring for the failure rules. ``in_thread``
-    (PER-294): ``(approver, thread)``, the one approver whose prompt goes in that thread
-    (default: the asking task's principal, in its thread). ``summary`` (PER-296, code-built)
-    replaces the gate's in the prompt text (a worker's request says which run asks)."""
+    (PER-294): ``(requester, thread)``, who asked and where (default: the asking task's
+    principal, in its thread); PER-320: a shared thread gets the one copy, addressed to
+    them. ``summary`` (PER-296, code-built) replaces the gate's in the prompt text (a
+    worker's request says which run asks)."""
     prompt = approval_prompt(decision)
     if summary is not None:
         prompt = replace(prompt, summary=summary, phrased=False)
@@ -184,52 +195,153 @@ async def _prompt(
     in_thread: tuple[str, MessageRef] | None = None,
     others: tuple[str | None, ApprovalPrompt] | None = None,
 ) -> PromptResult:
-    """``others`` (PER-318): ``(offer_to, plain)``: everyone but ``offer_to`` gets ``plain``."""
-    reached: list[str] = []
-    unreachable: list[str] = []
-    error: ChannelError | None = None
+    """``others`` (PER-318): ``(offer_to, plain)``: everyone but ``offer_to`` gets ``plain``.
+    PER-320: a shared thread gets the one copy (``_prompt_shared``); else, or when that copy
+    couldn't stay in the thread, each approver gets their own."""
     asking = get_task(conn, task_id) if task_id else None
     thread = thread_of(asking, to=None if asking is None else asking.principal)
     whose = None if asking is None else asking.principal
     if in_thread is not None:
         whose, thread = in_thread
-    for approver in approvers:
-        theirs = prompt
+    sent = _Sent(conn, channel, prompt, approval_ids, task_id=task_id, now=now, asking=asking)
+
+    def variant(approver: str) -> ApprovalPrompt:
         if others is not None and approver != others[0]:
-            theirs = others[1]
+            return others[1]
+        return prompt
+
+    if whose is not None and shared_thread(thread):
+        assert thread is not None
+        if await _prompt_shared(sent, approvers, whose, thread, variant):
+            return sent.result()
+    for approver in approvers:
+        if approver in sent.reached or approver in sent.unreachable:
+            continue  # the shared copy went to them, or the channel refused them
+        mine = thread is not None and approver == whose
+        theirs = variant(approver)
+        await sent.send(approver, replace(theirs, thread=thread) if mine else theirs)
+    return sent.result()
+
+
+async def _prompt_shared(
+    sent: _Sent,
+    approvers: Sequence[str],
+    whose: str,
+    thread: MessageRef,
+    variant: Callable[[str], ApprovalPrompt],
+) -> bool:
+    """PER-320: one copy in the shared ``thread``, addressed to ``whose`` (who asked), else
+    to the first approver the channel can reach. It tags the approvers when ``whose`` isn't
+    one, and is recorded for every approver the channel didn't refuse: each sees it in the
+    thread and may answer it there (a button, or ``yes <code>``). True when that settled the
+    prompt (or a transient error: the caller retries, deduped); False when nobody could be
+    addressed, or the channel couldn't post in the thread (no longer one it posts in: the
+    copy went to the addressee's own conversation): the rest then get their own, as before."""
+    refused: set[str] = set()
+    for addressee in dict.fromkeys([whose, *approvers]):
+        mention = () if whose in approvers else tuple(approvers)  # incl. a fallback addressee
+        theirs = replace(variant(addressee), thread=thread, mention=mention)
+        ref = await sent.send(addressee, theirs, record=False, approver=addressee in approvers)
+        if ref is None:
+            if sent.error is not None:
+                return True
+            refused.add(addressee)
+            continue
+        if ref.thread is None:
+            if addressee in approvers:
+                sent.record(addressee, ref, theirs)
+            return False
+        for approver in approvers:
+            if approver not in refused:
+                sent.record(approver, ref, theirs, shared=thread)
+        return True
+    return False
+
+
+class _Sent:
+    """One prompt's sends and records (the failure rules in the module docstring)."""
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        channel: Channel,
+        prompt: ApprovalPrompt,
+        approval_ids: Sequence[str],
+        *,
+        task_id: str | None,
+        now: Callable[[], datetime],
+        asking: Task | None,
+    ) -> None:
+        self.conn, self.channel, self.prompt = conn, channel, prompt
+        self.approval_ids, self.task_id, self.now = approval_ids, task_id, now
+        self.outside = asking is not None and system_texts.tainted(asking.checkpoint)
+        self.reached: list[str] = []
+        self.unreachable: list[str] = []
+        self.error: ChannelError | None = None
+
+    def result(self) -> PromptResult:
+        return PromptResult(tuple(self.reached), tuple(self.unreachable), self.error)
+
+    async def send(
+        self,
+        principal: str,
+        prompt: ApprovalPrompt,
+        *,
+        record: bool = True,
+        approver: bool = True,
+    ) -> MessageRef | None:
+        """``request_approval`` to ``principal``; the ref, or None (refused: audited, and
+        ``unreachable`` when ``approver``; or transient: ``error``). ``record``: record it
+        for ``principal`` (:meth:`record`) at once."""
+        conn = self.conn
         try:
-            mine = thread is not None and approver == whose
-            ref = await channel.request_approval(
-                approver, replace(theirs, thread=thread) if mine else theirs
-            )
+            ref = await self.channel.request_approval(principal, prompt)
         except ChannelRefused as e:
-            unreachable.append(approver)
+            if approver:
+                self.unreachable.append(principal)
             with transaction(conn):
                 audit(
                     conn,
                     "approval.unreachable",
-                    task_id=task_id,
-                    requested_by=approver,
-                    approval_id=prompt.approval_id,
-                    channel=channel.name,
+                    task_id=self.task_id,
+                    requested_by=principal,
+                    approval_id=self.prompt.approval_id,
+                    channel=self.channel.name,
                     error=type(e).__name__,
                 )
-            continue
+            return None
         except ChannelError as e:
-            error = error or e
-            continue
-        reached.append(approver)
-        at = now()
+            self.error = self.error or e
+            return None
+        if record:
+            self.record(principal, ref, prompt)
+        return ref
+
+    def record(
+        self,
+        principal: str,
+        ref: MessageRef,
+        prompt: ApprovalPrompt,
+        *,
+        shared: MessageRef | None = None,
+    ) -> None:
+        """The sent ref on every approval (the sent-before rule reads it), and the prompt as
+        a system text the brains see (PER-268)."""
+        conn = self.conn
+        self.reached.append(principal)
+        at = self.now()
         with transaction(conn):
-            for approval_id in approval_ids:
-                ap.add_channel_ref(conn, approval_id, ref=ref.ref, at=at, principal=approver)
+            for approval_id in self.approval_ids:
+                ap.add_channel_ref(
+                    conn, approval_id, ref=ref.ref, at=at, principal=principal,
+                    channel=None if shared is None else shared.channel,
+                    thread=None if shared is None else shared.thread,
+                )  # fmt: skip
         # PER-268: the brains see what was asked ("approve it?" is the prompt's job); a
         # tainted task's args were chosen after outside content, so only a fixed line
-        key = approval_dedupe_key(prompt.approval_id, approver)
-        outside = asking is not None and system_texts.tainted(asking.checkpoint)
-        system_texts.record(conn, approver, "approval", theirs.text(), ref=key, task_id=task_id,
-                            now=at, outside=outside)  # fmt: skip
-    return PromptResult(tuple(reached), tuple(unreachable), error)
+        key = approval_dedupe_key(self.prompt.approval_id, principal)
+        system_texts.record(conn, principal, "approval", prompt.text(), ref=key,
+                            task_id=self.task_id, now=at, outside=self.outside)  # fmt: skip
 
 
 def reminder_text(code: str, left: timedelta) -> str:
@@ -253,18 +365,28 @@ async def remind_due(conn: sqlite3.Connection, channel: Channel, now: datetime) 
         head = ap.get_approval(conn, r.approval_ids[0])
         if head is None or head.status != "pending":
             continue  # answered while the earlier reminders went out: nothing waits
-        for principal in r.to:
-            key = reminder_key(r.approval_ids[0], principal)
-            try:
-                await channel.send(principal, text, dedupe_key=key)
-            except ChannelRefused:
-                continue
-            except ChannelError:
-                settled = False
-                continue
-            sent += 1
-            system_texts.record(conn, principal, "approval", text, ref=key, task_id=r.task_id,
-                                now=now)  # fmt: skip
+        for thread, group in _reminder_groups(head, r.to):
+            for principal in group:
+                key = reminder_key(r.approval_ids[0], principal)
+                try:
+                    if thread is None:
+                        await channel.send(principal, text, dedupe_key=key)
+                    else:
+                        await channel.send(principal, text, thread=thread, dedupe_key=key)
+                except ChannelRefused:
+                    continue
+                except ChannelError:
+                    settled = False
+                    if thread is not None:
+                        break  # the next run tries the same one again (deduped)
+                    continue
+                sent += 1
+                seen = group if thread is not None else (principal,)
+                for who in seen:
+                    system_texts.record(conn, who, "approval", text, ref=key,
+                                        task_id=r.task_id, now=now)  # fmt: skip
+                if thread is not None:
+                    break  # one reminder in the shared thread, which they all see
         if settled:
             with atomic(conn):
                 ap.mark_reminded(conn, r.approval_ids, now)
@@ -272,6 +394,26 @@ async def remind_due(conn: sqlite3.Connection, channel: Channel, now: datetime) 
                       approval_ids=list(r.approval_ids), to=list(r.to),
                       expires_at=r.expires_at.isoformat())  # fmt: skip
     return sent
+
+
+def _reminder_groups(
+    head: ap.Approval, to: Sequence[str]
+) -> list[tuple[MessageRef | None, tuple[str, ...]]]:
+    """PER-320: who gets an approval's reminder, and where. The approvers who got the one
+    copy in a shared thread get one reminder there (sent to the first of them the channel
+    reaches); everyone else gets their own, as before."""
+    shared: dict[MessageRef, list[str]] = {}
+    own: list[tuple[MessageRef | None, tuple[str, ...]]] = []
+    for principal in to:
+        ref = next(
+            (c for c in head.channel_refs if c.principal == principal and c.thread is not None),
+            None,
+        )
+        if ref is None or ref.channel is None or ref.thread is None:
+            own.append((None, (principal,)))
+            continue
+        shared.setdefault(MessageRef(ref.channel, ref.ref, ref.thread), []).append(principal)
+    return [(t, tuple(g)) for t, g in shared.items()] + own
 
 
 def remind_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> CoreJob | None:
