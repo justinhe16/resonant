@@ -31,6 +31,17 @@ rule: ``(yes always = don't ask before running <tool> in <scope>)``; the scope a
 stored on the approval, and ``resolve_reply`` saves exactly that rule in the same
 transaction as the approval when the owner answers ``yes always``.
 
+Tainted writes (PER-335, ``tainted_writes``, config ``gate.tainted_writes``): ``ask`` (the
+default) changes nothing. With ``allow``, a ``tainted`` call is weighed as ``inferred`` at L3
+when all of these hold: autonomy on; the owner's or an approver's call (never a member's or
+the workspace default's); a registered L2 or L3 ``write`` (never L1, pay or a read), still L2
+or L3 after ``levels``; not an ``OWNER_TOOLS`` builtin (admin, the brain shell, trust); and
+``Standing.tainted_allows`` (the call can be scoped, its tool's ``stands`` hook passes:
+``merge_run`` only for a ``merge_standable`` run; and no ``ask`` trust rule decides it). It
+runs unattended (``Allow.unattended``) and the ``gate.evaluate`` row carries
+``tainted_allowed: true``. Its prompt, when it still asks (capped, rejected before), offers
+no ``yes always``.
+
 Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (missing or
 garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
 
@@ -89,7 +100,7 @@ import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external, new_code
@@ -145,6 +156,8 @@ ALWAYS_NOTE = " (yes always = "  # how a standing allow's offer starts in a summ
 BATCH_SUMMARY_CHARS = 200  # a batch as one line (``pending_for``: /approvals, re-asks)
 
 Rule = Literal["allow", "ask", "ask_code"]
+# PER-335: whether a tainted L2/L3 write asks (the default) or runs as an untainted L3 would.
+TaintedWrites = Literal["ask", "allow"]
 
 # A code-built heading for a tool's approval summary (e.g. "delete all 4 notes"). It must
 # never come from a model; ``summarize`` cleans it anyway.
@@ -201,6 +214,11 @@ class Standing(Protocol):
         """The rule a ``yes always`` on this call's prompt would save, or None."""
         ...
 
+    def tainted_allows(self, intent: Intent) -> bool:
+        """PER-335: whether ``tainted_writes: allow`` may lift this call: it can be scoped
+        for the trust rules, its ``stands`` hook passes, and no ``ask`` rule decides it."""
+        ...
+
 
 def no_manifest_approvers(_extension: str) -> Sequence[str]:
     """The default until the extension host supplies manifests: nobody but the owner."""
@@ -248,10 +266,11 @@ class PolicyGate:
         refusals: Mapping[ToolKey, RefusalFor] | None = None,
         summaries: Mapping[ToolKey, SummaryAction] | None = None,
         owner_asks: OwnerAskCheck | None = None,
+        tainted_writes: TaintedWrites = "ask",
     ) -> None:
         """``refusals``: per-call never-lists; ``summaries``: a tool's whole approval line,
         code-built (the shell family's ``run `<command>` in <dir>``), cleaned like any
-        other."""
+        other. ``tainted_writes``: PER-335 (module doc); anything but ``"allow"`` asks."""
         self.conn = conn
         self.principals = principals
         self.registry = registry
@@ -266,6 +285,7 @@ class PolicyGate:
         self.refusals = dict(refusals or {})
         self.summaries = dict(summaries or {})
         self.owner_asks = owner_asks
+        self.tainted_writes: TaintedWrites = "allow" if tainted_writes == "allow" else "ask"
         self._tokens: dict[str, str] = {}
 
     @property
@@ -282,7 +302,12 @@ class PolicyGate:
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             autonomy = autonomy_on(self.conn)
-            decision, standing, asked = self._decide(intent, now, autonomy, capped=capped)
+            lifted: list[bool] = []
+            decision, standing, asked = self._decide(
+                intent, now, autonomy, capped=capped, lifted=lifted
+            )
+            # PER-335: only when the setting lifted the call, so the default's rows are as before
+            extra: dict[str, Any] = {"tainted_allowed": True} if lifted else {}
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -306,22 +331,38 @@ class PolicyGate:
                 capped=capped or None,
                 owner_asked=asked,
                 args=intent.args,
+                **extra,
             )
         return decision
 
     def _decide(
-        self, intent: Intent, now: datetime, autonomy: bool, *, capped: bool = False
+        self,
+        intent: Intent,
+        now: datetime,
+        autonomy: bool,
+        *,
+        capped: bool = False,
+        lifted: list[bool] | None = None,
     ) -> tuple[Decision, bool | None, str | None]:
         """The decision, whether a standing allow made the call L3 (None: not asked), and
         for a call marked as the owner's ask (PER-272): ``owner_asked`` when it ran as one,
-        else why not (None: not marked, or never got that far)."""
-        decision, standing, asked = self._decide_inner(intent, now, autonomy, capped=capped)
+        else why not (None: not marked, or never got that far). ``lifted`` gets ``True``
+        appended when ``tainted_writes: allow`` lifted the call (PER-335)."""
+        decision, standing, asked = self._decide_inner(
+            intent, now, autonomy, capped=capped, lifted=lifted
+        )
         if asked is None and intent.asked is not None:
             asked = "not reached"
         return decision, standing, asked
 
     def _decide_inner(
-        self, intent: Intent, now: datetime, autonomy: bool, *, capped: bool = False
+        self,
+        intent: Intent,
+        now: datetime,
+        autonomy: bool,
+        *,
+        capped: bool = False,
+        lifted: list[bool] | None = None,
     ) -> tuple[Decision, bool | None, str | None]:
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
             # Static reasons: the audit row already names the tool, extension and principal.
@@ -345,7 +386,13 @@ class PolicyGate:
             standing = self.standing.allows(intent) is not None
             if standing:
                 level = Level.L3
-        verdict = rule(level, intent.origin, autonomy)
+        origin: Origin = intent.origin
+        if self._tainted_lifted(intent, level, autonomy):
+            # PER-335: weighed as an untainted L3 (L3 runs, L2 runs as L3); unattended below
+            origin, level = "inferred", Level.L3
+            if lifted is not None:
+                lifted.append(True)
+        verdict = rule(level, origin, autonomy)
         if capped and verdict == "allow" and not l0_read:
             verdict = "ask"  # past the task's unasked changes: this one asks (no yes always)
         if verdict == "allow" and intent.level is Level.L0:
@@ -474,6 +521,25 @@ class PolicyGate:
             (OWNER_ASKED, intent.tool, intent.extension, event_id),
         ).fetchone()
         return row is not None
+
+    def _tainted_lifted(self, intent: Intent, level: Level, autonomy: bool) -> bool:
+        """PER-335: ``tainted_writes: allow`` lifts this call (see the module doc). Every
+        condition is checked here, so ``ask`` (the default) never reaches the hook."""
+        if self.tainted_writes != "allow" or intent.origin != "tainted" or not autonomy:
+            return False
+        if intent.effect is not Effect.WRITE:
+            return False  # never pay (always L1 anyway), never a read
+        if intent.level not in (Level.L2, Level.L3) or level not in (Level.L2, Level.L3):
+            return False  # never L1, whatever a hook says
+        if intent.extension is None and intent.tool in OWNER_TOOLS:
+            return False  # admin, the brain shell and trust stay the owner's word per change
+        if not self._staff(intent.principal):
+            return False  # a member's (or the workspace default's) tainted call still asks
+        return self.standing is not None and self.standing.tainted_allows(intent)
+
+    def _staff(self, principal: str) -> bool:
+        """The owner or a ``role: approver``."""
+        return principal == self.principals.owner or principal in self.principals.approver_names
 
     def _standing_eligible(self, intent: Intent) -> bool:
         """A standing allow may apply: the owner's own model-chosen call of a tool at L2."""
