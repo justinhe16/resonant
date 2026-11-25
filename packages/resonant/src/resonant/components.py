@@ -284,6 +284,7 @@ def build_components(
         refusals=hooks.refusals,
         summaries=hooks.summaries,
         owner_asks=OwnerAsks(conn, host.tool_specs),
+        tainted_writes=settings.gate.tainted_writes,
     )
     merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers, **host.mcp_handlers}
     executor = Executor(

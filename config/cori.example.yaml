@@ -60,6 +60,21 @@ channels:
 # runs:
 #   milestones: thread                  # thread | off
 
+# PER-335: a self-sufficient team instance. With `allow`, a change the brain picks after its turn
+# read outside content (a ticket, a Slack message, an extension's result) runs without a prompt
+# when it is the owner's or an approver's L2/L3 write: any extension's (a staging deploy, a ticket)
+# and, of the built-in tools, only the run tools (start a run, message or cancel it); a run's merge
+# too, when its PR is green and clean and nothing in it is flagged. Jobs, watchers, CI workflows,
+# repos and restarts still ask. L1 (prod deploys,
+# prod data, payments, releases) and pay still ask, with the code, whatever this says; so does
+# anything an `ask` trust rule covers, a member's ask, and everything while paused (/kill).
+# The trade-off: text the instance reads could steer it into an extension's L2/L3 write (one that
+# posts what it read, too) or a run (starting one, or steering one already going), never an L1 one.
+# Every such write still posts its line in the thread and is audited (tainted_allowed: true).
+# Personal Resonant keeps the default, ask.
+gate:
+  tainted_writes: allow                 # ask (default) | allow
+
 # PER-290 (two daemons, one checkout): Ollama and keep-awake stay personal Resonant's (Cori
 # reads these as false and refuses them true; she uses the owner's Ollama at 127.0.0.1:11434),
 # and code deploys come from personal Resonant (Cori's /update, update_resonant and her workers'

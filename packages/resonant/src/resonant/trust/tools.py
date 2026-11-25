@@ -40,6 +40,9 @@ The gate (``PolicyGate``) applies it only to the owner's own ``inferred`` calls 
 L2, never at L1, never under the kill switch (autonomy off asks for everything) and never
 in dry run (which comes first). The slash-only control commands (``/kill``, ``/resume``,
 ``/approvals``, ``/ext``) aren't tools the model can call, so a rule can't touch them.
+PER-335: on an instance with ``gate.tainted_writes: allow`` the gate also asks
+``tainted_allows`` for an owner's or approver's tainted L2/L3 write: the same scope and
+``ask`` rules decide, so an ``ask`` rule (or a ``stands`` hook) still makes it ask.
 A rule is made only by the owner's own ``yes always`` reply or ``/rules allow`` (or an
 approved ``allow_trust_rule``), never by extension output.
 """
@@ -227,6 +230,18 @@ class StandingAllows:
             return None
         s, rule = found
         return s if rule is None or rule.effect != "ask" else None
+
+    def tainted_allows(self, intent: Intent) -> bool:
+        """PER-335: whether ``gate.tainted_writes: allow`` may run this tainted call without
+        asking: it can have a rule at all (``scope``: never a trust-loosening tool, its
+        ``stands`` hook passes, so ``merge_run`` only for a ``merge_standable`` run; a
+        scope that can be named) and no ``ask`` rule decides it. The gate checks the rest
+        (who, level, effect, autonomy)."""
+        found = self.decider(intent)
+        if found is None:
+            return False
+        rule = found[1]
+        return rule is None or rule.effect != "ask"
 
     def _repo(self, value: str) -> str | None:
         found = repos_store.find(self.conn, value)
