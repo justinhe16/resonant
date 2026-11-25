@@ -69,7 +69,7 @@ channels:
 # prod data, payments, releases) and pay still ask, with the code, whatever this says; so does
 # anything an `ask` trust rule covers, a member's ask, and everything while paused (/kill).
 # The trade-off: text the instance reads could steer it into an extension's L2/L3 write (one that
-# posts what it read, too) or a run, never an L1 one.
+# posts what it read, too) or a run (starting one, or steering one already going), never an L1 one.
 # Every such write still posts its line in the thread and is audited (tainted_allowed: true).
 # Personal Resonant keeps the default, ask.
 gate:
