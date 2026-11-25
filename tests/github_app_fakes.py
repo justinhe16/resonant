@@ -64,6 +64,29 @@ class FakeGitHubApi:
         self.account = "own"  # the installation's account: mint replies carry owner/name
         self.requests: list[tuple[str, str]] = []  # (method, path)
         self.issued = 0
+        # PER-327: the repos the installation can see, ``owner/name`` (lowercased) -> the REST
+        # ``repos/{owner}/{name}`` reply; ``workflows`` -> {file name: text}. A mint asking for
+        # a name not here is GitHub's 422. None: every name mints (the runner tests' default).
+        self.repos: dict[str, dict[str, Any]] | None = None
+        self.workflows: dict[str, dict[str, str]] = {}
+        self.protected: dict[str, bool] = {}  # owner/name -> its base's protection
+
+    def add_repo(
+        self,
+        slug: str,
+        *,
+        private: bool = True,
+        base: str = "main",
+        size: int = 12,
+        workflows: dict[str, str] | None = None,
+    ) -> None:
+        """The installation can see ``slug`` (PER-327's lookups)."""
+        if self.repos is None:
+            self.repos = {}
+        self.repos[slug.lower()] = {
+            "full_name": slug, "default_branch": base, "private": private, "size": size,
+        }  # fmt: skip
+        self.workflows[slug.lower()] = dict(workflows or {})
 
     @property
     def tokens(self) -> list[str]:
@@ -123,6 +146,18 @@ class FakeGitHubApi:
                 status, message = self.fail_mint
                 return httpx.Response(status, json={"message": message})
             body = json.loads(request.content)
+            asked: list[object] = body.get("repositories") or []
+            names = [str(n) for n in asked]
+            # PER-327's read-only lookups see only ``repos`` (none until add_repo is called);
+            # a run's own token mints for any name unless ``repos`` is set
+            reading = body.get("permissions") == {"contents": "read", "metadata": "read"}
+            visible = self.repos or {}
+            if (reading or self.repos is not None) and any(
+                f"{self.account}/{n}".lower() not in visible for n in names
+            ):
+                return httpx.Response(
+                    422, json={"message": "There is at least one repository that does not exist"}
+                )
             self.issued += 1
             token = f"ghs_{self.issued:04d}" + "Tk" * 17
             self.mints.append(
@@ -155,4 +190,37 @@ class FakeGitHubApi:
             self.live.discard(bearer)
             self.revoked.append(bearer)
             return httpx.Response(204)
+        if request.method == "GET":
+            if bearer not in self.live:
+                return httpx.Response(401, json={"message": "Bad credentials"})
+            return self._read(path, dict(request.url.params))
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    def _read(self, path: str, params: dict[str, str]) -> httpx.Response:
+        """PER-327: the REST reads an installation token makes (repo, workflows, branch,
+        the installation's repo list)."""
+        repos = self.repos or {}
+        if path == "/installation/repositories":
+            names = [{"full_name": r["full_name"]} for r in repos.values()]
+            page = int(params.get("page", "1"))
+            return httpx.Response(200, json={"repositories": names if page == 1 else []})
+        parts = path.strip("/").split("/")
+        if len(parts) < 3 or parts[0] != "repos":
+            return httpx.Response(404, json={"message": "Not Found"})
+        slug = f"{parts[1]}/{parts[2]}".lower()
+        if slug not in repos:
+            return httpx.Response(404, json={"message": "Not Found"})
+        rest = parts[3:]
+        if not rest:
+            return httpx.Response(200, json=repos[slug])
+        if rest[:1] == ["branches"]:
+            return httpx.Response(
+                200, json={"name": "/".join(rest[1:]), "protected": self.protected.get(slug, True)}
+            )
+        flows = self.workflows.get(slug, {})
+        if rest == ["contents", ".github", "workflows"]:
+            return httpx.Response(200, json=[{"name": n, "type": "file"} for n in flows])
+        if rest[:3] == ["contents", ".github", "workflows"] and len(rest) == 4 and rest[3] in flows:
+            text = base64.b64encode(flows[rest[3]].encode()).decode()
+            return httpx.Response(200, json={"encoding": "base64", "content": text})
         return httpx.Response(404, json={"message": "Not Found"})

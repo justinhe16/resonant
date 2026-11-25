@@ -72,9 +72,13 @@ def env_config(env: dict[str, str]) -> list[tuple[str, str]]:
     ]
 
 
-def assert_no_github_in_session(h: Harness, code: str = "R1") -> dict[str, Any]:
+def assert_no_github_in_session(
+    h: Harness, code: str = "R1", *, app_reads: bool = False
+) -> dict[str, Any]:
     """The session had no GitHub credentials at all: no gh config dir, no credential helper
-    (only the reset), nothing minted, no daemon token anywhere in its env."""
+    (only the reset), nothing minted, no daemon token anywhere in its env. ``app_reads``
+    (PER-327): the daemon's own clone and mirror used read-only App tokens, all revoked and
+    none in the session's env."""
     [call] = h.argv_log(code)
     env = call["env"]
     assert env["GH_CONFIG_DIR"].endswith("/gh-none")  # empty: no GitHub login at all
@@ -83,7 +87,13 @@ def assert_no_github_in_session(h: Harness, code: str = "R1") -> dict[str, Any]:
     assert ("core.excludesFile", f"{h.code_dir(code)}/git-exclude") in env_config(env)
     assert all(GH_TOKEN not in v for v in env.values())
     assert not any(k.startswith("RESONANT_SECRET") for k in env)
-    assert h.api.issued == 0
+    if not app_reads:
+        assert h.api.issued == 0
+        return call
+    assert h.api.issued >= 1
+    assert all(m["permissions"] == {"contents": "read", "metadata": "read"} for m in h.api.mints)
+    assert sorted(h.api.revoked) == sorted(h.api.tokens)  # every read token revoked
+    assert all(t not in v for t in h.api.tokens for v in env.values())
     return call
 
 
@@ -291,6 +301,7 @@ async def test_app_without_the_token_cant_push_either(
     and checking the PR (and the base-push watch)."""
     h = build(tmp_path, db, scenario="happy", extra=["--no-push"])
     del h.keychain.items[GITHUB_TOKEN_REF]
+    h.api.add_repo("own/proj")  # PER-327: the installation can read it
     owner_checkout(h)
     res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now")
     assert isinstance(res, Started)
@@ -299,7 +310,9 @@ async def test_app_without_the_token_cant_push_either(
     )
     await h.drain()
     assert h.run().failure == "can't push yet: runner/github_token isn't set"
-    assert_no_github_in_session(h)
+    # PER-327: the mirror is fetched with the App's read token; the session still gets none
+    assert (h.cfg.mirror_dir / "proj.git" / "HEAD").exists()
+    assert_no_github_in_session(h, app_reads=True)
 
 
 # --- everything -----------------------------------------------------------------------------

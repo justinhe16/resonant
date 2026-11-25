@@ -68,6 +68,11 @@ GOLDEN_CHECK = [
     OPENED,
 ]
 GOLDEN_RELAY = [STARTED, f"R1 asks: {QUESTION}", "→ R1", OPENED]
+# PER-327: on Slack the start line says where the end goes (and never "text"); the rest is
+# the same as iMessage's
+SLACK_STARTED = f"{STARTED} I'll post here when it's done."
+SLACK_CHECK = [SLACK_STARTED, *GOLDEN_CHECK[1:]]
+SLACK_RELAY = [SLACK_STARTED, *GOLDEN_RELAY[1:]]
 
 
 def mask(text: str) -> str:
@@ -256,7 +261,7 @@ async def test_slack_only_routes_replies_in_thread_approves_with_a_code(
         assert d.state.monitor.states is not None
         assert d.state.monitor.states["slack"].state == "ok"
     assert texts[0] == GOLDEN_REPLY[0] and fake.sent[0].thread == "slack-in:1"
-    assert texts[1:] == GOLDEN_CHECK, texts
+    assert texts[1:] == SLACK_CHECK, texts
     assert threads == {"slack-in:2"}  # every run text in the thread of the /run message
     assert w.osa.sent == []  # iMessage is off: nothing went out there
 
@@ -268,7 +273,7 @@ async def test_slack_only_worker_question_answered_r1_in_thread(
     async with running(w, resonant_home, f"slack:{SLACK_UID}", imessage=False) as (_, fake):
         assert fake is not None
         texts, threads = await script_relay(Slack(fake), w)
-    assert texts == GOLDEN_RELAY, texts
+    assert texts == SLACK_RELAY, texts
     assert threads == {"slack-in:1"}
     assert w.osa.sent == []
 
