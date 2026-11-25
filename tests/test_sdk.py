@@ -521,7 +521,7 @@ def test_report_without_the_events_fd_is_a_noop(monkeypatch: pytest.MonkeyPatch)
         ({"ttl": "30s"}, "ttl"),
         ({"ttl": "7d"}, "ttl"),
         ({"state": {"x": object()}}, "state"),
-        ({"state": {"x": "y" * 3000}}, "state"),
+        ({"state": {"x": "y" * 17000}}, "state"),
         ({"ttl": "169h"}, "ttl"),
         ({"ttl": "0h"}, "ttl"),
         ({"ttl": "soon"}, "ttl"),

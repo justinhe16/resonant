@@ -167,7 +167,7 @@ def item(db: sqlite3.Connection, key: str = "dori/inc-1") -> items.Item:
         ({"key": "Bad Key", "urgency": "urgent"}, "key"),
         ({"key": "a", "urgency": "critical"}, "urgency"),
         ({"key": "a", "urgency": "urgent", "state": {"x": float("nan")}}, "state"),
-        ({"key": "a", "urgency": "urgent", "state": {"x": "y" * 3000}}, "state"),
+        ({"key": "a", "urgency": "urgent", "state": {"x": "y" * 17000}}, "state"),
         ({"key": "a", "urgency": "urgent", "ttl": "forever"}, "ttl"),
         ({"key": "a", "urgency": "urgent", "ttl": "99999h"}, "ttl"),
         ({"key": "a", "urgency": "urgent", "clear": "yes"}, "clear"),
