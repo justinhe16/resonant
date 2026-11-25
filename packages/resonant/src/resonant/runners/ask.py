@@ -979,6 +979,17 @@ def after_label(questions: Sequence[str]) -> str:
 # --- the runner ----------------------------------------------------------------------------
 
 
+HELD_MAX_CHARS = 280  # PER-328: longer text may answer something besides the approval
+
+
+def short_note(text: str) -> bool:
+    """PER-328: Claude's text is only a note about the approval (one short line), so the
+    prompt can stand alone. Anything longer may answer another part of the message and is
+    posted with the prompt."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return len(lines) <= 1 and len(text.strip()) <= HELD_MAX_CHARS
+
+
 class AskRunner:
     """``runner="ask"``. Public API: :meth:`enqueue` (the ``ask_claude`` tool),
     :meth:`limited_until`, :meth:`asked_today`."""
@@ -1722,7 +1733,8 @@ class AskRunner:
         reply = with_reports(text if status != "answered" else None, text, reports, redactor,
                              self.cfg.reply_max_chars)  # fmt: skip
         held: str | None = None
-        if pending and bridge is not None and self._prompt_says_it(task, bridge):
+        says_it = bridge is not None and short_note(reply) and self._prompt_says_it(task, bridge)
+        if pending and says_it:
             # PER-328: the prompt's plain line says what the yes is for; Claude's text about
             # it is kept for history, and only what ran goes out with the prompt
             held, reply = reply, "\n".join(r for r in reports if r)
