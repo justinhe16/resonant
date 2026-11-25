@@ -96,12 +96,39 @@ FORK_NEEDS_PUBLIC_REPO = (
 GITHUB_TOKEN_HOW = "resonant secret set runner/github_token"  # noqa: S105  # a command
 
 
+OWNER_SETUP = "The owner needs to finish setup"
+
+
+@dataclass(frozen=True)
+class SetupGap:
+    """Something only the owner can set up (PER-327), said two ways: ``owner_text`` names the
+    exact command (owner-only: ``resonant secret set`` and the like), ``plain`` names what's
+    missing in plain words, with no command, for a shared thread or a member. ``key`` names
+    the missing piece (a dedupe key for telling the owner)."""
+
+    owner_text: str
+    plain: str
+    key: str
+
+    def member_text(self, *, told: bool) -> str:
+        """``plain`` and who fixes it; ``told``: the owner was just sent the details."""
+        tail = "; I've sent them the details." if told else "."
+        return f"{self.plain} {OWNER_SETUP}{tail}"
+
+
 def needs_github_token(what: str) -> str:
     """The sentence for something only the daemon's own GitHub token can do, when it isn't
     set: workers still run without it (docs/employee-plan.md, RX-1)."""
-    return (
+    return github_token_gap(what).owner_text
+
+
+def github_token_gap(what: str) -> SetupGap:
+    """:func:`needs_github_token` as a :class:`SetupGap`."""
+    return SetupGap(
         f"{what} needs the daemon's GitHub token (runner/github_token), which isn't set yet. "
-        f"On the Mini: {GITHUB_TOKEN_HOW}."
+        f"On the Mini: {GITHUB_TOKEN_HOW}.",
+        f"{what} needs GitHub access that isn't set up here yet.",
+        "runner/github_token",
     )
 
 
@@ -179,6 +206,15 @@ _CHECKOUT_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, 
 
 class RunnerError(Exception):
     """A failure with a reason fit for ``R3 failed: <reason>``. Never carries a token."""
+
+
+class SetupFailed(RunnerError):
+    """A run that can't go on until the owner sets something up. ``str()`` is the owner's
+    text; a run asked for in a shared thread says ``gap.plain`` there instead."""
+
+    def __init__(self, gap: SetupGap) -> None:
+        super().__init__(gap.owner_text)
+        self.gap = gap
 
 
 class NoChanges(RunnerError):
@@ -1117,7 +1153,7 @@ class Workspace:
                 if not _ANON_REFUSED.search(e.message):  # the network, not a private repo
                     raise fetch_failed from None
                 if not await asyncio.to_thread(os.path.lexists, self.checkout_path(repo)):
-                    raise RunnerError(self.no_clone_text(repo)) from None
+                    raise SetupFailed(self.no_clone_gap(repo)) from None
                 from_mirror = False
             if from_mirror:
                 try:
@@ -1206,11 +1242,18 @@ class Workspace:
     def no_clone_text(self, repo: Repo) -> str:
         """Why a run on ``repo`` can't start without the daemon's token: there is no checkout
         and the repo can't be cloned anonymously (it is private, or not reachable)."""
+        return self.no_clone_gap(repo).owner_text
+
+    def no_clone_gap(self, repo: Repo) -> SetupGap:
+        """:meth:`no_clone_text` as a :class:`SetupGap` (PER-327)."""
         path = self.checkout_path(repo)
-        return (
+        return SetupGap(
             f"I can't work on {repo.slug} yet: there's no checkout at {path}, and cloning it "
             f"needs the daemon's GitHub token (runner/github_token). On the Mini: "
-            f"{GITHUB_TOKEN_HOW}, or clone it to {path} yourself."
+            f"{GITHUB_TOKEN_HOW}, or clone it to {path} yourself.",
+            f"I can't work on {repo.slug} yet: there's no copy of it here, and getting one "
+            "needs GitHub access that isn't set up here yet.",
+            "runner/github_token",
         )
 
     async def can_start_tokenless(self, repo_name: str) -> bool:

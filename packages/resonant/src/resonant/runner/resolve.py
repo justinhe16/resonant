@@ -24,16 +24,23 @@ default branch. Push access can't be seen that way, so such a repo is registered
 ``mode=push`` with its CI unknown (``ci`` NULL: the first run's mirror check decides); a
 private or missing repo is invisible to it (None, so :class:`NoAccess`). Anonymous calls are
 rate-limited by GitHub (60 an hour per IP); a 403/429 says so.
+
+PER-327: an instance whose GitHub credential is the App (``runner.github_app``, no daemon
+token) looks repos up with :class:`AppGitHub`: a read-only installation token per lookup,
+revoked right after. A repo the installation can see is one runs can push to (the App is
+what pushes), so it registers ``mode=push``; one it can't see is ``None`` (:class:`NoAccess`).
 """
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import difflib
 import json
 import re
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 from urllib.parse import quote
@@ -42,6 +49,7 @@ import httpx
 
 from resonant.config import RunnerRepo
 from resonant.runner.checks import MAX_WORKFLOW_BYTES, runs_on_pull_request
+from resonant.runner.github_app import AppNoAccess, GitHubApp, GitHubAppError
 from resonant.runner.workspace import Workspace
 from resonant.secrets import RunnerSecrets
 from resonant.store import repos
@@ -461,6 +469,137 @@ class PublicGitHub:
         except (ValueError, KeyError, TypeError):
             return None
         return protected if isinstance(protected, bool) else None
+
+
+class AppGitHub:
+    """The :class:`GitHub` as the GitHub App's installation sees it (PER-327): each call
+    mints a read-only token for the one repo (``GitHubApp.mint_read``) and revokes it when
+    done; listing is ``GitHubApp.installation_repos``. Push access is the installation's: a
+    repo it can see is one a run's App token can push to."""
+
+    def __init__(self, app: GitHubApp) -> None:
+        self._app = app
+        self._sizes: dict[str, int | None] = {}  # by lowercased slug, from repo_info
+
+    @contextlib.asynccontextmanager
+    async def _token(self, slug: str) -> AsyncGenerator[str | None]:
+        """A read token for ``slug``; None when the installation can't see it."""
+        owner, _, name = slug.partition("/")
+        try:
+            got = await self._app.mint_read(name, owner=owner)
+        except AppNoAccess:
+            yield None
+            return
+        except GitHubAppError as e:
+            raise GitHubError(str(e)) from None
+        try:
+            yield got.token
+        finally:
+            with contextlib.suppress(GitHubAppError):
+                await self._app.revoke(got.token)
+
+    async def _get(self, token: str, path: str) -> httpx.Response:
+        try:
+            return await self._app.get(token, path)
+        except GitHubAppError as e:
+            raise GitHubError(str(e)) from None
+
+    async def repo_info(self, slug: str) -> RepoInfo | None:
+        async with self._token(slug) as token:
+            if token is None:
+                return None
+            resp = await self._get(token, f"repos/{slug}")
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                raise GitHubError(f"couldn't read {slug} from GitHub (HTTP {resp.status_code})")
+            try:
+                data: Any = resp.json()
+                private = bool(data["private"])
+                name, base = _readable(slug, data["full_name"], data["default_branch"])
+            except (ValueError, KeyError, TypeError):
+                raise GitHubError(f"GitHub's answer about {slug} wasn't readable") from None
+            self._sizes[slug.lower()] = _size(data.get("size"))
+            has_ci = await self._has_ci(token, name, base)
+        return RepoInfo(name, base, private, True, has_ci)
+
+    async def _has_ci(self, token: str, slug: str, base: str) -> bool:
+        """As :meth:`GhGitHub._has_ci`: a failure to read is "no"."""
+        ref = f"ref={quote(base, safe='')}"
+        try:
+            resp = await self._get(token, f"repos/{slug}/contents/.github/workflows?{ref}")
+            listing: Any = resp.json() if resp.status_code == 200 else []
+            names = [str(e["name"]) for e in listing if e.get("type") == "file"]
+        except (GitHubError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+        for name in [n for n in names if _WORKFLOW_FILE.fullmatch(n)][:MAX_WORKFLOWS]:
+            try:
+                resp = await self._get(
+                    token, f"repos/{slug}/contents/.github/workflows/{name}?{ref}"
+                )
+                if resp.status_code != 200:
+                    continue
+                text = _workflow_text(resp.json())
+            except (GitHubError, ValueError):
+                continue
+            if text is not None and len(text) <= MAX_WORKFLOW_BYTES and runs_on_pull_request(text):
+                return True
+        return False
+
+    async def my_repos(self) -> list[str]:
+        try:
+            found = await self._app.installation_repos()
+        except GitHubAppError as e:
+            raise GitHubError(f"couldn't list the GitHub App's repos: {e}") from None
+        return [s for s in found if parse_slug(s) == s]
+
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        try:
+            async with self._token(slug) as token:
+                if token is None:
+                    return None
+                resp = await self._get(token, f"repos/{slug}/branches/{quote(branch, safe='/')}")
+                if resp.status_code != 200:
+                    return None
+                protected: Any = resp.json()["protected"]
+        except (GitHubError, ValueError, KeyError, TypeError):
+            return None
+        return protected if isinstance(protected, bool) else None
+
+    async def size_kb(self, slug: str) -> int | None:
+        if slug.lower() in self._sizes:
+            return self._sizes[slug.lower()]
+        try:
+            async with self._token(slug) as token:
+                if token is None:
+                    return None
+                resp = await self._get(token, f"repos/{slug}")
+                return _size(resp.json()["size"]) if resp.status_code == 200 else None
+        except Exception:  # never raises (the Protocol)
+            return None
+
+
+def _workflow_text(data: Any) -> str | None:
+    """A contents-API file reply's text (base64 ``content``), or None."""
+    if not isinstance(data, dict):
+        return None
+    item = cast(dict[str, Any], data)
+    content = item.get("content")
+    if item.get("encoding") != "base64" or not isinstance(content, str):
+        return None
+    try:
+        return base64.b64decode("".join(content.split()), validate=True).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def app_no_access_text(slug: str) -> str:
+    """PER-327: a repo the GitHub App's installation can't see (no command: the fix is
+    installing the app on it, in GitHub)."""
+    return (
+        f"The GitHub App can't see {slug}: it isn't installed on that repo, or the repo "
+        "doesn't exist."
+    )
 
 
 class OfflineGitHub:

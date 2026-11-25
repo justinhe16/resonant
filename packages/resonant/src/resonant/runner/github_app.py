@@ -12,8 +12,14 @@ protection changes), and valid for an hour. Workflows is left out when the repo'
 - The JWT (RS256, 9 minutes) is built here with ``cryptography`` and sent as a bearer header
   over HTTPS. Nothing here runs a subprocess.
 - ``mint`` asks for ``repositories=[name]`` and the permissions below; ``revoke`` is
-  ``DELETE /installation/token`` with the token itself. Errors name the HTTP status and
-  GitHub's own message, never a token, a key or a response body.
+  ``DELETE /installation/token`` with the token itself.
+- PER-327: ``mint_read`` is the daemon's own read-only token for one repo (contents and
+  metadata read): a lookup, a registration or a clone on an instance whose only GitHub
+  credential is the App. ``installation_repos`` lists what the installation can see with a
+  metadata-only token. Both are revoked by their callers (or right here) once used.
+
+Errors name the HTTP status and GitHub's own message, never a token, a key or a response
+body.
 """
 
 from __future__ import annotations
@@ -52,11 +58,20 @@ MAX_MESSAGE = 200
 # the repo's Actions secrets, so Workflows can be turned off per repo (allow_github_changes).
 WRITE = ("contents", "pull_requests", "issues", "workflows", "actions")
 READ = ("checks", "statuses", "metadata")
+# PER-327: the daemon's own lookups and clones read, nothing more.
+READ_ONLY = {"contents": "read", "metadata": "read"}
+LIST_ONLY = {"metadata": "read"}
+MAX_PAGES = 10  # installation repos listed, 100 a page
 
 
 class GitHubAppError(Exception):
     """A token that couldn't be minted or revoked. The message is fit for ``R3 failed: …``
     and carries no secret."""
+
+
+class AppNoAccess(GitHubAppError):
+    """The installation can't see the repo (GitHub's 422 on a mint for it, or a token for a
+    same-named repo of another account): to a lookup, the repo isn't there."""
 
 
 def permissions(*, workflows: bool) -> dict[str, str]:
@@ -151,6 +166,8 @@ def check_grant(
         if perm not in requested or _LEVEL.get(level, 99) > _LEVEL[requested[perm]]:
             return f"it grants {perm}: {level}, which was not asked for"
     for perm in _ESSENTIAL:
+        if perm not in requested:  # a read-only lookup token (PER-327)
+            continue
         if _LEVEL.get(granted.get(perm, "none"), 0) < _LEVEL[requested[perm]]:
             return f"the app lacks {perm}: {requested[perm]} on this repository"
     return None
@@ -227,14 +244,27 @@ class GitHubApp:
         that isn't exactly that (see ``check_grant``) is revoked and refused. ``owner`` is
         checked against the reply when given (a fork run: the owner's fork, which the app's
         "all repositories" installation covers)."""
+        return await self._mint(repo_name, permissions(workflows=workflows), owner)
+
+    async def mint_read(self, repo_name: str, *, owner: str) -> InstallationToken:
+        """PER-327: a read-only token (``READ_ONLY``) for ``owner/repo_name``, for the
+        daemon's own lookup or clone. Raises :class:`AppNoAccess` when the installation
+        can't see that repo, ``GitHubAppError`` for anything else."""
+        return await self._mint(repo_name, dict(READ_ONLY), owner, read=True)
+
+    async def _mint(
+        self, repo_name: str, wanted: dict[str, str], owner: str | None, *, read: bool = False
+    ) -> InstallationToken:
         jwt = await self._jwt()
         url = f"{self._base}/app/installations/{self.cfg.installation_id}/access_tokens"
-        wanted = permissions(workflows=workflows)
         resp = await self._send(
             "POST", url, jwt, body={"repositories": [repo_name], "permissions": wanted}
         )
+        what = "reading the repo with the GitHub App" if read else "minting the run's GitHub token"
+        if read and resp.status_code == 422:
+            raise AppNoAccess(_why(what, resp, repo_name))
         if resp.status_code != 201:
-            raise GitHubAppError(_why("minting the run's GitHub token", resp, repo_name))
+            raise GitHubAppError(_why(what, resp, repo_name))
         data = _json(resp)
         token, expires = data.get("token"), data.get("expires_at")
         if not isinstance(token, str) or not token:
@@ -242,8 +272,50 @@ class GitHubApp:
         if (problem := check_grant(data, repo_name, wanted, owner)) is not None:
             with contextlib.suppress(GitHubAppError):
                 await self.revoke(token)
+            if read and problem.startswith("it is for "):
+                raise AppNoAccess(f"the GitHub App can't see {owner}/{repo_name}")
             raise GitHubAppError(f"GitHub's token for {repo_name} was refused: {problem}")
         return InstallationToken(token, expires if isinstance(expires, str) else "")
+
+    async def get(self, token: str, path: str) -> httpx.Response:
+        """``GET <api>/<path>`` as an installation token (retried like every call here)."""
+        return await self._send("GET", f"{self._base}/{path.lstrip('/')}", token)
+
+    async def installation_repos(self) -> list[str]:
+        """``owner/name`` of every repo the installation can see, with a metadata-only token
+        (no ``repositories`` asked for), revoked once listed. At most ``MAX_PAGES`` pages."""
+        jwt = await self._jwt()
+        url = f"{self._base}/app/installations/{self.cfg.installation_id}/access_tokens"
+        resp = await self._send("POST", url, jwt, body={"permissions": dict(LIST_ONLY)})
+        if resp.status_code != 201:
+            raise GitHubAppError(_why("listing the GitHub App's repos", resp, ""))
+        data = _json(resp)
+        token = data.get("token")
+        if not isinstance(token, str) or not token:
+            raise GitHubAppError("GitHub's token reply had no token")
+        try:
+            granted = data.get("permissions")
+            perms = cast(dict[object, object], granted) if isinstance(granted, dict) else {}
+            if any(str(k) not in LIST_ONLY or str(v) != "read" for k, v in perms.items()):
+                raise GitHubAppError("GitHub's listing token grants more than was asked for")
+            slugs: list[str] = []
+            for page in range(1, MAX_PAGES + 1):
+                got = await self.get(token, f"installation/repositories?per_page=100&page={page}")
+                if got.status_code != 200:
+                    raise GitHubAppError(_why("listing the GitHub App's repos", got, ""))
+                raw = _json(got).get("repositories")
+                items = cast(list[object], raw) if isinstance(raw, list) else []
+                for item in items:
+                    if isinstance(item, dict):
+                        name = cast(dict[str, object], item).get("full_name")
+                        if isinstance(name, str):
+                            slugs.append(name)
+                if len(items) < 100:
+                    break
+            return slugs
+        finally:
+            with contextlib.suppress(GitHubAppError):
+                await self.revoke(token)
 
     async def revoke(self, token: str) -> None:
         """``DELETE /installation/token`` as the token itself. A token already dead (401) is

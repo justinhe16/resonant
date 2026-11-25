@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import re
 import shutil
 import sqlite3
 import subprocess
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,8 +24,9 @@ from resonant.loop import Loop, SlotPool
 from resonant.runner import create
 from resonant.runner.checks import runs_on_pull_request
 from resonant.runner.create import CreateError, Creator, valid_repo_name
-from resonant.runner.resolve import FakeGitHub, RepoInfo, Resolved, Resolver
-from resonant.runner.workspace import Exec, Workspace
+from resonant.runner.resolve import FakeGitHub, GitHub, RepoInfo, Resolved, Resolver
+from resonant.runner.workspace import Exec, SetupGap, Workspace
+from resonant.runners.claude import is_shared
 from resonant.secrets import RunnerSecrets
 from resonant.store import repos
 from resonant.store import runs as runs_store
@@ -329,12 +331,34 @@ class FakeClaude:
         self.resolver = resolver
         self.secrets_value = SECRETS
         self.public = FakePublicApi()  # GitHub without a token (GT-1); never the network
+        # PER-327: the GitHub App's view and its read token when the daemon has no token
+        self.app_github: GitHub | None = None
+        self.app_token: str | None = None
+        self.owner = "owner"
+        self.dms: list[str] = []  # setup commands sent to the owner alone
 
     async def setup_missing(self) -> str | None:
         return None
 
     def github_for(self, secrets: RunnerSecrets) -> FakeGitHub:
         return self.github
+
+    async def lookup_github(self, secrets: RunnerSecrets) -> GitHub | None:
+        return self.github if secrets.github_token is not None else self.app_github
+
+    @contextlib.asynccontextmanager
+    async def clone_token(
+        self, repo: repos.Repo, secrets: RunnerSecrets
+    ) -> AsyncGenerator[str | None]:
+        yield secrets.github_token or self.app_token
+
+    async def setup_text(
+        self, gap: SetupGap, *, channel_ref: Mapping[str, Any] | None, requester: str | None
+    ) -> str:
+        if not is_shared(channel_ref, requester, self.owner):
+            return gap.owner_text
+        self.dms.append(gap.owner_text)
+        return gap.member_text(told=True)
 
 
 @pytest.fixture
@@ -831,3 +855,49 @@ async def test_create_repo_clones_the_new_repo(
     assert not any(c.startswith("size_kb") for c in claude.github.calls)  # new: tiny
     repo = repos.get(db, "me/scratch")
     assert repo is not None and repo.path == where
+
+
+# --- PER-327: the GitHub App when the daemon has no token; setup said plainly in a thread ---
+
+
+async def test_add_repo_with_only_the_app_registers_a_private_repo_and_clones_it(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection, settings: Settings
+) -> None:
+    claude.secrets_value = RunnerSecrets(None, None, None)
+    claude.app_github = FakeGitHub([RepoInfo("me/secret", "main", True, True, True)])
+    claude.app_token = "ghs_" + "r" * 36
+    claude.workspace.remote("me/secret")
+    out = await call(components, "add_repo", {"repo": "me/secret"})
+    assert out["added"] is True and out["new"] is True, out
+    repo = repos.get(db, "me/secret")
+    assert repo is not None and (repo.mode, repo.ci) == ("push", True)
+    assert (settings.runner.code_dir / "secret" / ".git").is_dir()
+    assert "without the daemon's GitHub token" not in out["text"]  # the App checked it
+    assert claude.public.requests == []  # never the anonymous API
+
+
+async def test_repo_tools_in_a_shared_thread_never_say_the_command(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    from resonant.executor import CallContext
+    from resonant.loop import NewTask
+    from resonant.store import tasks as task_store
+
+    claude.secrets_value = RunnerSecrets(None, None, None)
+    claude.public.repos["me/secret"] = public("me/secret", private=True)
+    thread = {"channel": "slack", "principal": "member", "thread": "C1:1.2", "ref": "C1:1.2"}
+    task_id = task_store.insert_task(
+        db,
+        NewTask(kind="chat", runner="local", priority=1, principal="member", channel_ref=thread),
+    )
+    for tool, args, key in (
+        ("add_repo", {"repo": "me/secret"}, "added"),
+        ("add_repo", {"repo": "secret"}, "added"),
+        ("create_repo", {"name": "scratch"}, "created"),
+    ):
+        ctx = CallContext(secrets={}, idempotency_key=f"k-{tool}-{args}", task_id=task_id)
+        out = await cast(Any, components.handlers[(None, tool)])(args, ctx)
+        assert out[key] is False
+        assert "secret set" not in out["text"] and "The owner needs to finish setup" in out["text"]
+    assert len(claude.dms) == 3
+    assert all("resonant secret set runner/github_token" in dm for dm in claude.dms)

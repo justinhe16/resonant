@@ -32,6 +32,12 @@ plain yes when the model chose it.
   the owner's fork, made by the first run), nor one GitHub says is over about 2 GB; a clone
   that fails or takes over 2 minutes leaves the repo registered, and the first run tries again.
   The reply says which, with the path.
+- PER-327: with no daemon token but the GitHub App set up (``runner.github_app`` and its
+  key), the lookup, the registration and the clone use the App's installation (a read-only
+  token per call, revoked after): a private repo the installation can see registers as a
+  push repo and is cloned. Setup the owner must finish (a missing token) is said in plain
+  words, with no command, in a shared thread or to a member; the owner gets the command in a
+  DM (``ClaudeRunner.setup_text``).
 - ``forget_repo{repo}``: drop the registry entry. Nothing on GitHub changes; refused while the
   repo has an active run.
 """
@@ -40,10 +46,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from resonant.executor import ToolFailed, ToolHandler
+from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
 from resonant.gate.types import Intent
 from resonant.redact import Redactor
 from resonant.runner.checks import GitError
@@ -56,6 +64,7 @@ from resonant.runner.create import (
 )
 from resonant.runner.resolve import (
     Ambiguous,
+    AppGitHub,
     GitHub,
     GitHubError,
     NeedsToken,
@@ -65,6 +74,7 @@ from resonant.runner.resolve import (
     PublicGitHub,
     Resolved,
     Resolver,
+    app_no_access_text,
     parse_slug,
 )
 from resonant.runner.workspace import (
@@ -73,12 +83,14 @@ from resonant.runner.workspace import (
     MergeRefused,
     OwnerCheckout,
     RunnerError,
+    SetupGap,
     Workspace,
-    needs_github_token,
+    github_token_gap,
     remote_slug,
 )
 from resonant.secrets import RunnerSecrets, SecretError, SecretStore, load_runner_secrets
 from resonant.store import repos as repos_store
+from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.store.repos import Repo, RepoConflict
@@ -104,13 +116,31 @@ class RunnerApi(Protocol):
 
     def github_for(self, secrets: RunnerSecrets) -> GitHub: ...
 
+    async def lookup_github(self, secrets: RunnerSecrets) -> GitHub | None: ...
+
+    def clone_token(
+        self, repo: Repo, secrets: RunnerSecrets
+    ) -> AbstractAsyncContextManager[str | None]: ...
+
+    async def setup_text(
+        self, gap: SetupGap, *, channel_ref: Mapping[str, Any] | None, requester: str | None
+    ) -> str: ...
+
 
 def not_public_text(slug: str) -> str:
     """An explicit repo GitHub doesn't show without a token, when the daemon has none."""
-    return (
+    return not_public_gap(slug).owner_text
+
+
+def not_public_gap(slug: str) -> SetupGap:
+    """:func:`not_public_text` as a :class:`SetupGap` (PER-327)."""
+    return SetupGap(
         f"{slug} isn't public (or doesn't exist). Registering a private repo needs the "
         f"daemon's GitHub token (runner/github_token), which isn't set yet. "
-        f"On the Mini: {GITHUB_TOKEN_HOW}."
+        f"On the Mini: {GITHUB_TOKEN_HOW}.",
+        f"I can't see {slug} on GitHub: it's private (or doesn't exist), and GitHub access "
+        "for private repos isn't set up here yet.",
+        "runner/github_token",
     )
 
 
@@ -285,7 +315,9 @@ async def owner_checkout(
             size = await asyncio.wait_for(github.size_kb(repo.slug), SIZE_LOOKUP_S)
         except Exception:  # never stops an add (a timeout included)
             size = None
-    return await claude.workspace.owner_checkout(repo, secrets.github_token, size_kb=size)
+    # PER-327: the daemon's token, else the GitHub App's read token for this one repo
+    async with claude.clone_token(repo, secrets) as token:
+        return await claude.workspace.owner_checkout(repo, token, size_kb=size)
 
 
 def _checkout_fields(got: OwnerCheckout) -> dict[str, Any]:
@@ -327,7 +359,17 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         found = components.runners.get(RUNNER) if components is not None else None
         return cast("RunnerApi | None", found)
 
-    async def ready(what: str, *, token: bool = True) -> tuple[RunnerApi, RunnerSecrets] | str:
+    async def said(claude: RunnerApi, gap: SetupGap, call: CallContext | None) -> str:
+        """PER-327: ``gap`` as the caller's reply should say it: the command for the owner
+        alone; plain words in a shared thread or to a member (the owner gets a DM)."""
+        task = task_store.get_task(ctx.conn, call.task_id) if call is not None else None
+        if task is None:
+            return gap.owner_text
+        return await claude.setup_text(gap, channel_ref=task.channel_ref, requester=task.principal)
+
+    async def ready(
+        what: str, call: CallContext | None, *, token: bool = True
+    ) -> tuple[RunnerApi, RunnerSecrets] | str:
         """The runner and its secrets, or the sentence for why not. These tools never start a
         session, so they need the daemon's GitHub token (unless ``token`` is False: the caller
         copes without it) and not the Claude credential."""
@@ -344,10 +386,10 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         except SecretError:
             return "The runner's secrets can't be read."
         if token and secrets.github_token is None:
-            return needs_github_token(what)
+            return await said(claude, github_token_gap(what), call)
         return claude, secrets
 
-    async def _create_repo(args: dict[str, Any]) -> dict[str, Any]:
+    async def _create_repo(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         _unknown("create_repo", args, {"name", "description", "private"})
         name = _need_str("create_repo", args, "name", NAME_MAX)
         description = args.get("description")
@@ -358,7 +400,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             raise ToolFailed("create_repo: private must be true or false")
         if (why := valid_repo_name(name)) is not None:
             return {"created": False, "text": why[0].upper() + why[1:] + "."}
-        got = await ready("Creating a repo")
+        got = await ready("Creating a repo", call)
         if isinstance(got, str):
             return {"created": False, "text": got}
         claude, secrets = got
@@ -379,10 +421,10 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "text": f"{made.text} {clause[0].upper()}{clause[1:]}.",
         }
 
-    async def _add_ci(args: dict[str, Any]) -> dict[str, Any]:
+    async def _add_ci(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         _unknown("add_ci", args, {"repo"})
         repo = _need_str("add_ci", args, "repo", REPO_MAX)
-        got = await ready("Adding CI")
+        got = await ready("Adding CI", call)
         if isinstance(got, str):
             return {"opened": False, "text": got}
         claude, secrets = got
@@ -394,10 +436,10 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"opened": False, "text": str(e)}
         return {"opened": not pr.already, "pr_url": pr.url, "text": pr.text}
 
-    async def _merge_ci_pr(args: dict[str, Any]) -> dict[str, Any]:
+    async def _merge_ci_pr(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         _unknown("merge_ci_pr", args, {"repo"})
         key = _need_str("merge_ci_pr", args, "repo", REPO_MAX)
-        got = await ready("Merging the add-CI PR")
+        got = await ready("Merging the add-CI PR", call)
         if isinstance(got, str):
             return {"merged": False, "text": got}
         claude, secrets = got
@@ -449,7 +491,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "truncated": len(found) > REPOS_MAX,
         }
 
-    async def _add_repo(args: dict[str, Any]) -> dict[str, Any]:
+    async def _add_repo(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         _unknown("add_repo", args, {"repo", "name"})
         text = _need_str("add_repo", args, "repo", REPO_MAX)
         alias = args.get("name")
@@ -463,15 +505,17 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
                     "text": f"{alias[:40]!r} isn't a usable name (start with a letter; "
                     "letters, digits, '_' and '-', at most 32).",
                 }
-        got = await ready("Adding a repo", token=False)
+        got = await ready("Adding a repo", call, token=False)
         if isinstance(got, str):
             return {"added": False, "text": got}
         claude, secrets = got
         slug = parse_slug(text)
-        anonymous = secrets.github_token is None
+        # PER-327: the daemon's token, else the GitHub App's installation, else anonymous
+        found = await claude.lookup_github(secrets)
+        anonymous = found is None
         github: GitHub
-        if not anonymous:
-            github = claude.github_for(secrets)
+        if found is not None:
+            github = found
         elif slug is not None:
             github = PublicGitHub()  # GT-1: an explicit public repo needs no token
         else:
@@ -479,11 +523,17 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         try:
             resolution = await claude.resolver.resolve(text, github)
         except NeedsToken:
-            return {"added": False, "text": needs_github_token("Adding a repo by name")}
+            gap = github_token_gap("Adding a repo by name")
+            return {"added": False, "text": await said(claude, gap, call)}
         except GitHubError as e:
             return {"added": False, "text": f"Couldn't reach GitHub: {e}"}
         if anonymous and isinstance(resolution, NoAccess):
-            return {"added": False, "text": not_public_text(resolution.slug)}
+            return {
+                "added": False,
+                "text": await said(claude, not_public_gap(resolution.slug), call),
+            }
+        if isinstance(github, AppGitHub) and isinstance(resolution, NoAccess):
+            return {"added": False, "text": app_no_access_text(resolution.slug)}
         if isinstance(resolution, (Ambiguous, NoAccess)):
             return {"added": False, "text": resolution.text}
         if isinstance(resolution, NotFound):
@@ -545,10 +595,25 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         }
 
     return {
-        CREATE_REPO.name: _create_repo,
-        ADD_CI.name: _add_ci,
-        MERGE_CI_PR.name: _merge_ci_pr,
+        CREATE_REPO.name: cast(ToolHandler, _WithContext(_create_repo)),
+        ADD_CI.name: cast(ToolHandler, _WithContext(_add_ci)),
+        MERGE_CI_PR.name: cast(ToolHandler, _WithContext(_merge_ci_pr)),
         LIST_REPOS.name: _list_repos,
-        ADD_REPO.name: _add_repo,
+        ADD_REPO.name: cast(ToolHandler, _WithContext(_add_repo)),
         FORGET_REPO.name: _forget_repo,
     }
+
+
+class _WithContext(ContextHandler):
+    """A handler that reads the executor's ``CallContext`` (whose task asked: PER-327's
+    shared-thread wording); called with args alone (a test, a direct call) it gets None."""
+
+    def __init__(
+        self, fn: Callable[[dict[str, Any], CallContext | None], Awaitable[dict[str, Any]]]
+    ) -> None:
+        self.fn = fn
+
+    async def __call__(
+        self, args: dict[str, Any], ctx: CallContext | None = None
+    ) -> dict[str, Any]:
+        return await self.fn(args, ctx)

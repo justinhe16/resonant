@@ -78,7 +78,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -95,7 +95,13 @@ from resonant.config import resonant_home as default_resonant_home
 from resonant.extensions.notify import clean_text
 from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external
-from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, MessageRef
+from resonant.gateway.channel import (
+    Channel,
+    ChannelError,
+    ChannelRefused,
+    MessageRef,
+    thread_of,
+)
 from resonant.loop.types import (
     PRIORITY_OWNER,
     Done,
@@ -125,6 +131,7 @@ from resonant.runner.cleanup import (
 from resonant.runner.github_app import GitHubApp, GitHubAppError
 from resonant.runner.resolve import (
     Ambiguous,
+    AppGitHub,
     GhGitHub,
     GitHub,
     GitHubError,
@@ -134,6 +141,7 @@ from resonant.runner.resolve import (
     OfflineGitHub,
     Resolved,
     Resolver,
+    app_no_access_text,
 )
 from resonant.runner.scope import (
     Instructions,
@@ -151,7 +159,10 @@ from resonant.runner.workspace import (
     NoChanges,
     Prepared,
     RunnerError,
+    SetupFailed,
+    SetupGap,
     Workspace,
+    github_token_gap,
     needs_github_token,
     read_session_token,
     session_git_env,
@@ -190,7 +201,7 @@ from resonant.runners.reports import (
     setup_notes,
     shown_did,
 )
-from resonant.runners.run_thread import run_thread, send_run
+from resonant.runners.run_thread import run_ref, run_thread, send_run
 from resonant.runners.side_effects import RunContext, SideEffect, detect
 from resonant.runners.worker_cli import Check, WorkerServer
 from resonant.runners.worker_desk import (
@@ -435,6 +446,7 @@ class Started:
     note: str | None = None  # how it ends: merged once CI is green, or a PR upstream after a yes
     via: str | None = None  # the extension whose link named the new repo
     limits: str | None = None  # RX-1: what this run can't do, said up front
+    done: str | None = None  # PER-327: where the end is said (``done_line``)
 
     @property
     def text(self) -> str:
@@ -445,6 +457,8 @@ class Started:
             f"On it: {self.code} · {where}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
+        if self.done:
+            text += f" {self.done}"
         for extra in (self.limits, self.note, self.warning):
             if extra:
                 text += f"\n{extra}"
@@ -453,9 +467,41 @@ class Started:
 
 @dataclass(frozen=True)
 class Refused:
-    """A request the runner won't take. ``reason`` is a code-built sentence."""
+    """A request the runner won't take. ``reason`` is a code-built sentence. ``gap``
+    (PER-327): the refusal is setup only the owner can finish; ``start_run`` then says it
+    in plain words in a shared thread and sends the owner the command."""
 
     reason: str
+    gap: SetupGap | None = field(default=None, compare=False)
+
+
+SLACK_DONE = "I'll post here when it's done."
+TEXT_DONE = "You'll get a text when it finishes."
+
+
+def done_line(channel_ref: Mapping[str, Any] | None, report: str) -> str | None:
+    """PER-327: where a run's end will be said, for its start reply. Only iMessage texts
+    ("You'll get a text" only when the end is texted right away, ``report=now``); a Slack
+    thread gets the end posted in it. None for anything else (unchanged wording)."""
+    channel = None if channel_ref is None else channel_ref.get("channel")
+    if channel == "slack":
+        return SLACK_DONE
+    if channel == "imessage" and report == "now":
+        return TEXT_DONE
+    return None
+
+
+def is_shared(
+    channel_ref: Mapping[str, Any] | None, requester: str | None, owner: str | None
+) -> bool:
+    """PER-327: whether a reply may be read by someone other than the owner: it goes to a
+    thread (Slack: everyone in the channel sees it), or a member asked."""
+    if requester is not None and owner is not None and requester != owner:
+        return True
+    return channel_ref is not None and thread_of(dict(channel_ref)) is not None
+
+
+RUNNER_SETUP_PLAIN = "I can't start work here yet: the worker setup isn't finished."
 
 
 @dataclass(frozen=True)
@@ -1427,6 +1473,107 @@ class ClaudeRunner:
         job: jobs_store.RunLink | None = None,
         announce: bool = False,
     ) -> Started | Refused:
+        """:meth:`_start_run`; PER-327: a refusal that is setup only the owner can finish
+        (``Refused.gap``) is said in plain words when the reply is shared (a thread, or a
+        member asked), and the owner is sent the exact command."""
+        res = await self._start_run(repo, ask, principal, merge=merge, report=report,
+                                    channel_ref=channel_ref, requested_by=requested_by, job=job,
+                                    announce=announce)  # fmt: skip
+        if isinstance(res, Refused) and res.gap is not None:
+            text = await self.setup_text(
+                res.gap, channel_ref=channel_ref, requester=requested_by or principal
+            )
+            return Refused(text, res.gap)
+        return res
+
+    async def setup_text(
+        self, gap: SetupGap, *, channel_ref: Mapping[str, Any] | None, requester: str | None
+    ) -> str:
+        """PER-327: ``gap`` as the requester should read it. The owner alone (no thread, the
+        owner asked) gets the command; a shared reply gets ``gap.plain`` and "the owner needs
+        to finish setup", and the owner gets the command in a DM (once a day per gap)."""
+        if not is_shared(channel_ref, requester, self.owner):
+            return gap.owner_text
+        return gap.member_text(told=await self.tell_owner_setup(gap))
+
+    async def tell_owner_setup(self, gap: SetupGap) -> bool:
+        """Send the owner ``gap.owner_text`` on this instance's channel, to them alone (a DM
+        on Slack); deduped per gap and day. True when it went (or went earlier today)."""
+        if self.owner is None:
+            return False
+        day = self.clock().astimezone(self.tz).date().isoformat()
+        try:
+            await self.channel.send(self.owner, gap.owner_text, dedupe_key=f"setup:{gap.key}:{day}")
+        except ChannelError:
+            log.warning("setup gap: owner DM failed", extra={"gap": gap.key})
+            return False
+        return True
+
+    async def lookup_github(self, secrets: RunnerSecrets) -> GitHub | None:
+        """PER-327: the GitHub client for a lookup or registration: the daemon's token when
+        set, else the GitHub App's installation (``runner.github_app`` and its key), else
+        None (the caller goes public or offline)."""
+        if secrets.github_token is not None:
+            return self._github(secrets)
+        if await self._app_ready():
+            assert self.app is not None
+            return AppGitHub(self.app)
+        return None
+
+    async def _app_ready(self) -> bool:
+        if self.app is None:
+            return False
+        try:
+            return await self.secrets.exists(GITHUB_APP_KEY_REF)
+        except SecretError:
+            return False
+
+    @contextlib.asynccontextmanager
+    async def clone_token(
+        self, repo: repo_store.Repo, secrets: RunnerSecrets
+    ) -> AsyncGenerator[str | None]:
+        """PER-327: the token the daemon's own git fetches ``repo`` with (a first clone, the
+        mirror): the daemon's token when set, else a read-only GitHub App token for the one
+        repo (revoked on exit), else None (anonymous). An App that can't mint is None too:
+        the fetch then goes anonymous and says what it needs."""
+        if secrets.github_token is not None:
+            yield secrets.github_token
+            return
+        if not await self._app_ready():
+            yield None
+            return
+        assert self.app is not None
+        owner, _, name = repo.slug.partition("/")
+        try:
+            got = await self.app.mint_read(name, owner=owner)
+        except GitHubAppError as e:
+            log.warning("app read token not minted", extra={"repo": repo.name, "why": str(e)})
+            yield None
+            return
+        try:
+            yield got.token
+        finally:
+            with contextlib.suppress(GitHubAppError):
+                await self.app.revoke(got.token)
+
+    async def _app_reads(self, repo: repo_store.Repo) -> bool:
+        """Whether the GitHub App can read ``repo`` (a token minted for it, then revoked)."""
+        async with self.clone_token(repo, RunnerSecrets(None, None, None)) as token:
+            return token is not None
+
+    async def _start_run(
+        self,
+        repo: str | None,
+        ask: str,
+        principal: str,
+        *,
+        merge: bool = False,
+        report: Report = "digest",
+        channel_ref: dict[str, Any] | None = None,
+        requested_by: str | None = None,
+        job: jobs_store.RunLink | None = None,
+        announce: bool = False,
+    ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
         the resolver turns it into a registered repo, registering one it hasn't seen. No repo
         (None or blank) is a run in a scratch dir, with no GitHub token and no PR. Refuses
@@ -1463,7 +1610,7 @@ class ClaudeRunner:
         started it, not ``/run``): its first step says ``On it: starting R5 (…).`` in the
         run's thread, once (``runners.status``; checkpoint ``announce``)."""
         if (text := await self.setup_missing()) is not None:
-            return Refused(text)
+            return Refused(text, SetupGap(text, RUNNER_SETUP_PLAIN, "runner-setup"))
         ask = ask.strip()
         if not ask:
             return Refused("What should I do? Give the run something to work on.")
@@ -1487,8 +1634,10 @@ class ClaudeRunner:
             found is not None
             and not caps.github_token
             and not await self.workspace.can_start_tokenless(found.name)
+            and not await self._app_reads(found)
         ):
-            return Refused(self.workspace.no_clone_text(found))
+            gap = self.workspace.no_clone_gap(found)
+            return Refused(gap.owner_text, gap)
         auto_merge = merge and found is not None and found.mode == "push" and local is None
         repo = "" if found is None else found.name
         run = runs.create(
@@ -1529,8 +1678,9 @@ class ClaudeRunner:
         with atomic(self.conn):
             audit(self.conn, "run.start", task_id=task_id, requested_by=principal, run=run.code,
                   repo=repo)  # fmt: skip
+        done = done_line(channel_ref, report)
         if found is None:
-            return Started(run.code, "", max(1, self.max_session_s // 60))
+            return Started(run.code, "", max(1, self.max_session_s // 60), done=done)
         with atomic(self.conn):
             repo_store.touch(self.conn, found.slug)
         note = limits = None
@@ -1560,6 +1710,7 @@ class ClaudeRunner:
             note,
             resolution.via if resolution.new else None,
             limits,
+            done,
         )
 
     async def _fork_refusal(self, caps: Capabilities) -> Refused | None:
@@ -1567,19 +1718,28 @@ class ClaudeRunner:
         optional for the runner as a whole, so it is only asked for here; a fork run also
         needs the daemon's token (the fork's checks) and the App (pushing to the fork)."""
         if not caps.github_token:
-            return Refused(needs_github_token("A fork run"))
+            gap = github_token_gap("A fork run")
+            return Refused(gap.owner_text, gap)
         if not caps.app:
-            return Refused(
+            text = (
                 "A fork run pushes to your fork with the GitHub App, which isn't set up yet. "
                 f"On the Mini: {APP_KEY_HOW if not caps.app_key else APP_CONFIG_HOW}."
             )
+            plain = "A fork run needs the GitHub App, which isn't set up here yet."
+            return Refused(text, SetupGap(text, plain, "runner/github_app"))
         if self.desk.trust is None:
             return Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
         try:
             have = await self.secrets.exists(GITHUB_PUBLIC_TOKEN_REF)
         except SecretError:
             have = False
-        return None if have else Refused(FORK_NEEDS_PUBLIC_REPO)
+        if have:
+            return None
+        plain = "A fork run needs a GitHub token for public repos, which isn't set up here yet."
+        return Refused(
+            FORK_NEEDS_PUBLIC_REPO,
+            SetupGap(FORK_NEEDS_PUBLIC_REPO, plain, GITHUB_PUBLIC_TOKEN_REF),
+        )
 
     async def _base_warning(self, repo: repo_store.Repo) -> str | None:
         """A sentence for the start reply when the base branch is not protected: the session's
@@ -1599,18 +1759,23 @@ class ClaudeRunner:
         it, ``via`` the extension whose link named it, ``warning`` about its base)."""
         try:
             secrets = await load_runner_secrets(self.secrets, claude=False)
-            # No daemon token: only the registry answers (RX-1); a lookup says what it needs.
-            github = OfflineGitHub() if secrets.github_token is None else self._github(secrets)
+            # PER-327: the daemon's token, else the GitHub App; with neither only the
+            # registry answers (RX-1) and a lookup says what it needs.
+            found = await self.lookup_github(secrets)
+            github = OfflineGitHub() if found is None else found
             resolution = await self.resolver.resolve(text, github)
         except SecretError:
             return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
         except NeedsToken:
-            return Refused(needs_github_token(f"Looking up {text[:60]!r} on GitHub"))
+            gap = github_token_gap(f"Looking up {text[:60]!r} on GitHub")
+            return Refused(gap.owner_text, gap)
         except GitHubError as e:
             return Refused(f"Couldn't reach GitHub: {e}")
         if isinstance(resolution, Ambiguous):
             return Refused(resolution.text)
         if isinstance(resolution, NoAccess):
+            if isinstance(github, AppGitHub):
+                return Refused(app_no_access_text(resolution.slug))
             return Refused(resolution.text)
         if isinstance(resolution, NotFound):
             recent = ", ".join(r.name for r in repo_store.list_all(self.conn)[:3])
@@ -2224,6 +2389,11 @@ class ClaudeRunner:
             return await self._conclude(self._must_get(run.code))
         except NoChanges:
             return await self._end(run, "no_changes")
+        except SetupFailed as e:  # PER-327: a shared thread hears it plainly, the owner the how
+            reason = await self.setup_text(
+                e.gap, channel_ref=run_ref(self.conn, run), requester=run.requester
+            )
+            return await self._fail(run, reason, w.redactor)
         except (RunnerError, CheckFailed) as e:
             return await self._fail(run, str(e), w.redactor)
         except GitError as e:
@@ -2250,9 +2420,11 @@ class ClaudeRunner:
             fork = None
             if self._repo_of(run).mode == "fork":
                 fork = await self._fork_of(run, w.secrets)
-            p = await self.workspace.prepare(
-                run.code, run.repo, run.ask, github_token=w.secrets.github_token, fork=fork
-            )
+            # PER-327: no daemon token, the GitHub App's read token for the clone and mirror
+            async with self.clone_token(self._repo_of(run), w.secrets) as token:
+                p = await self.workspace.prepare(
+                    run.code, run.repo, run.ask, github_token=token, fork=fork
+                )
         runs.update(
             self.conn,
             run.code,
