@@ -549,14 +549,16 @@ class ClaudeTools:
     def _owner_text(self) -> tuple[str, str] | None:
         """The text and event id of the owner's message this turn answers, read by code: the
         ask task was handed over by a brain chat task (``requested_by``) that an ``imessage``
-        message from this principal started. Never for Resonant's own turn (``approved``), a
-        watch's check or anything else. Read once per turn."""
+        message from this principal started. Never for Resonant's own turn (``approved``, a
+        PER-321 continuation), a watch's check or anything else. Read once per turn."""
         if self._owner_message is not False:
             return self._owner_message if isinstance(self._owner_message, tuple) else None
         self._owner_message = None
         cp = self.task.checkpoint
         asker = cp.get("requested_by")
         if cp.get("approved") or cp.get("watch") is not None or not isinstance(asker, str):
+            return None
+        if cp.get("continuation") is not None:  # PER-321: Resonant's own turn too
             return None
         chat = get_task(self.conn, asker)
         if chat is None or chat.runner != BRAIN_RUNNER or chat.principal != self.principal:

@@ -149,7 +149,8 @@ from resonant.redact import Redactor
 from resonant.router.prefixes import time_context
 from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
 from resonant.runner.scope import Instructions, read_instructions, warn_key
-from resonant.runners import reaper
+from resonant.runners import continuation, reaper
+from resonant.runners import status as status_lines
 from resonant.runners.ask_tools import (
     PERMISSION_LISTING,
     PERMISSION_TOOL,
@@ -169,7 +170,7 @@ from resonant.runners.claude_session import (
     TurnOutcome,
 )
 from resonant.runners.convert import SIPS, heic_to_jpeg
-from resonant.runners.local import LocalRunner
+from resonant.runners.local import Answer, LocalRunner
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.sandbox import resolve_tool
 from resonant.secrets import SecretError, SecretStore, load_runner_secrets
@@ -1048,6 +1049,8 @@ class AskRunner:
             if tools is not None
             else None
         )
+        if self.resumer is not None:  # PER-321: a decided approval goes back to Claude
+            self.resumer.hand_back = self._hand_back
         self._notes: set[asyncio.Task[None]] = set()
         self._acks: set[asyncio.Task[None]] = set()  # PER-256: acks waiting for a slow answer
         self._answered: set[str] = set()  # tasks whose answer is being sent (no ack after)
@@ -1102,6 +1105,7 @@ class AskRunner:
         taint_hops: int | None = None,
         approved: bool = False,
         ack: str | None = None,
+        continues: dict[str, Any] | None = None,
     ) -> Queued | AskRefused:
         """Queue an ask for ``principal`` (who gets the answer). Refused, with a code-built
         reason, when ask_claude is off, paused, at its usage limit or daily cap, or an
@@ -1113,14 +1117,18 @@ class AskRunner:
         code only): Resonant's own turn running the shell changes the owner said yes to.
         ``ack`` (PER-256, set by code): the one short text sent while the answer is still
         coming, only when it takes longer than ``claude_session.ack_after_s`` (at once, with
-        what is ahead of it, when the turn is queued behind others)."""
+        what is ahead of it, when the turn is queued behind others). ``continues`` (PER-321,
+        code only): Resonant's own turn feeding a decided approval back to Claude (kept as
+        ``checkpoint.continuation``); its message may be longer and it never waits on
+        ``queue_max``: it carries on a turn that was already counted."""
         if not self.cfg.enabled:
             return AskRefused("ask_claude is off (brain.ask_claude.enabled).", "off")
         question = question.strip()
         if not question:
             return AskRefused("ask_claude needs a question.")
-        if len(question) > QUESTION_MAX:
-            return AskRefused(f"That question is too long (at most {QUESTION_MAX} characters).")
+        limit = continuation.QUESTION_MAX if continues is not None else QUESTION_MAX
+        if len(question) > limit:
+            return AskRefused(f"That question is too long (at most {limit} characters).")
         if kind not in KINDS:
             return AskRefused(f"ask_claude kind must be one of {', '.join(KINDS)}.")
         if len(attachments) > ATTACH_MAX:
@@ -1154,7 +1162,7 @@ class AskRunner:
                     and not checked:  # fmt: skip
                 assert self.session_cfg is not None
                 ahead = self._session_queue()
-                if len(ahead) > self.session_cfg.queue_max:
+                if len(ahead) > self.session_cfg.queue_max and continues is None:
                     return AskRefused(BUSY.format(n=len(ahead)), "busy")
                 cp["session"] = True
                 if approved:
@@ -1164,6 +1172,8 @@ class AskRunner:
                 after = after_label([q for _, q in ahead]) if ahead else None
         if ack:
             cp["ack"] = ack
+        if continues is not None:
+            cp["continuation"] = continues
         task_id = self._create_task(
             NewTask(
                 kind=TASK_KIND,
@@ -1179,7 +1189,8 @@ class AskRunner:
             audit(self.conn, "ask.queued", task_id=task_id, requested_by=principal,
                   trace_id=trace_id, kind=kind, attachments=len(checked),
                   requested_by_task=requested_by, tools=cp.get("tools") is True,
-                  session=cp.get("session") is True)  # fmt: skip
+                  session=cp.get("session") is True,
+                  continuation=continues is not None)  # fmt: skip
         if ack:
             text = f"{ack} ({after})" if after else ack
             self._ack_later(task_id, principal, text, 0.0 if after else self._ack_after_s())
@@ -1285,7 +1296,11 @@ class AskRunner:
     async def _refuse_queued(
         self, task: Task, ctx: StepContext, cp: dict[str, Any], principal: str
     ) -> StepOutcome:
-        """An ask queued before Resonant was paused or Claude hit its usage limit."""
+        """An ask queued before Resonant was paused or Claude hit its usage limit. A
+        continuation (PER-321) says what was decided instead, code-built."""
+        if (said := self._fallback(cp)) is not None:
+            return await self._finish(task, ctx, cp, "paused" if self._paused() else
+                                      "usage_limit", said)  # fmt: skip
         if self._paused() or (until := self.limited_until()) is None:
             return await self._finish(task, ctx, cp, "paused", PAUSED)
         if principal != self.owner:
@@ -1520,6 +1535,18 @@ class AskRunner:
                 if bridge.asked and gate is not None and outcome[0] != "usage_limit":
                     gate.drop([i.approval_id for i in bridge.asked], reason="no_answer")
         status, text, result = outcome
+        continued = self._continuation(cp)
+        if continued is not None:  # PER-321: what the continuation fed back that ran
+            fed = [r for r in cast(list[Any], continued.get("reports") or [])
+                   if isinstance(r, str)]  # fmt: skip
+            said = self._fallback(cp)
+            # Claude didn't carry on: the code-built text of what was decided (it has the
+            # report lines) instead, then what this turn ran
+            if status == "usage_limit" and said is not None:
+                fed = [said]
+            elif status != "answered" and said is not None:
+                fed, text = [], said
+            reports = [*fed, *reports]
         if status == "usage_limit" and result is not None:
             hit = usage_limit(result, tz=self.tz, now=self.clock())
             assert hit is not None
@@ -1650,12 +1677,15 @@ class AskRunner:
             ctx.save(checkpoint={**now, "session_turn": True})
 
         approved = cp.get("approved") is True
+        continued = self._continuation(cp)  # PER-321: Resonant's own turn, a decided approval
         message = self._turn_message(
             question, kind, approved=approved, now=self.clock(), tz=self.tz,
             who=None if convo.plain(self.owner) else self._who(convo.principal),
+            continued=continued is not None,
         )  # fmt: skip
-        # an approved change's turn is Resonant's own: the texts wait for the owner's next one
-        delta = None if approved else self._since(convo, before)
+        # an approved change's turn (or a continuation) is Resonant's own: the texts wait for
+        # the owner's next one
+        delta = None if approved or continued is not None else self._since(convo, before)
         if delta is not None:  # PER-270: the thread since the session's last turn
             message = f"{delta.text}\n\n{message}"
         if not convo.plain(self.owner):  # PER-294: which thread, and who wrote
@@ -1687,11 +1717,12 @@ class AskRunner:
                 out, flagged = await self._guarded(
                     task, out, run, bridge, message, primed, question=question,
                     owner_text=str(cp.get("owner_text") or question), before=before,
-                    convo=convo,
+                    convo=convo, fed=continued is not None and continued.get("changed") is True,
                 )  # fmt: skip
         finally:
             await bridge.aclose()
-        if before is not None and not approved and out.status == "answered":  # it read them
+        own = approved or continued is not None  # Resonant's own turn: the cursor stays
+        if before is not None and not own and out.status == "answered":  # it read them
             with contextlib.suppress(sqlite3.Error), atomic(self.conn):
                 kv_set(self.conn, convo.since_kv(self.owner), before)
         hops = hops_of(out)  # recorded by the session, under its lock
@@ -1726,13 +1757,16 @@ class AskRunner:
         owner_text: str,
         before: str | None,
         convo: _Convo | None = None,
+        fed: bool = False,
     ) -> tuple[TurnOutcome, guard.Problem | None]:
         """PER-256: check Claude's answer (``brain.guard.check``) before anything is sent. A
         problem sends the turn back once with a message that says why (the sources add up
         across it); a second problem is returned for the caller's code-built fallback. A
         turn that ran a change, or has one waiting on the owner, is still checked but never
         redone (a redo could repeat the change): a problem there goes straight to the
-        fallback, with the report lines. Spans carry kinds and counts only."""
+        fallback, with the report lines. ``fed`` (PER-321): a continuation fed back a change
+        that ran (its report line goes out with the answer). Spans carry kinds and counts
+        only."""
         redone = False
         while out.status == "answered":
             outcome = self._turn_outcome(out, bridge)
@@ -1744,7 +1778,7 @@ class AskRunner:
                 sources=self._sources(message, primed, bridge, before, question, convo),
                 tools=set(bridge.specs),
                 called=bridge.called,
-                changed=bool(bridge.reports or bridge.progress),
+                changed=bool(bridge.reports or bridge.progress) or fed,
                 asked=bool(bridge.asked),
             )
             fields = guard.span_fields(problem)
@@ -1804,6 +1838,8 @@ class AskRunner:
         (``cp["retried"]``); the second time it ends with ``UNAVAILABLE_REPLY``. Never a made-up
         answer. None when this isn't such a turn (the caller's own text goes out)."""
         if not self._is_turn(cp) or cp.get("approved") is True or task.principal is None:
+            return None
+        if self._continuation(cp) is not None:  # PER-321: what was decided, code-built
             return None
         if cp.get("retried") is True:
             return await self._finish(task, ctx, cp, status, UNAVAILABLE_REPLY)
@@ -1893,12 +1929,16 @@ class AskRunner:
         now: datetime,
         tz: ZoneInfo,
         who: str | None = None,
+        continued: bool = False,
     ) -> str:
         """One owner text as the session's user message: the time (so a reminder's `at` can be
         worked out), the kind's hint, then the text. An approved run (PER-258) is Resonant's
-        own message, never the owner's words."""
+        own message, never the owner's words; so is a continuation (PER-321: its message is
+        code-built whole, ``continuation.message``)."""
         if approved:
             return f"{APPROVED_HEAD}\n{question}"
+        if continued:
+            return question
         sender = "the owner" if who is None else who  # PER-294: someone else in a thread
         parts = [f"New text from {sender}, through Resonant:", time_context(now, str(tz))]
         if hint := KIND_HINTS.get(kind):
@@ -2209,7 +2249,7 @@ class AskRunner:
             return Fail(f"ask reply refused: {e}")
         except ChannelError as e:
             return Fail(f"ask reply failed: {e}", retryable=True, checkpoint=cp)
-        self._note_answer(cp, reply, status)
+        self._note_answer(cp, reply, status, task)
         if (
             cp.get("pending") is True
             and self.resumer is not None
@@ -2281,12 +2321,137 @@ class AskRunner:
         if isinstance(queued, AskRefused):
             self._notice(APPROVED_NOT_RUN.format(why=queued.text), f"ask:approved:{task.id}")
 
+    # -- continuations (PER-321) --
+
+    async def _hand_back(self, task: Task, answer: Answer, ctx: StepContext) -> StepOutcome | None:
+        """The resume's decided outcome (``answer``: what the code-built reply would say) goes
+        back to Claude as a continuation turn in the same conversation, once per approval
+        (``continuation``). None: no continuation here (the resume replies as before): not an
+        ask with Resonant's tools, a watch, a dry run, paused, the Claude brain's own shell
+        changes (their own approved turn), past ``MAX_CONTINUATIONS``, or refused (off, at
+        a limit or cap)."""
+        caller, tools, principal = self.caller, self.tools, task.principal
+        if caller is None or tools is None or principal is None or answer.path == "dry_run":
+            return None
+        latest = get_task(self.conn, task.id)
+        cp = dict(latest.checkpoint) if latest is not None else dict(task.checkpoint)
+        if cp.get("tools") is not True or cp.get("watch") is not None or self._paused():
+            return None
+        pinned = continuation.pins(cp)
+        if not pinned or any(p.extension is None and p.tool == TOOL_WRITE for p, _ in pinned):
+            return None
+        depth = continuation.depth(cp)
+        if depth >= continuation.MAX_CONTINUATIONS:
+            with atomic(self.conn):
+                audit(self.conn, "ask.continue_capped", task_id=task.id, trace_id=task.trace_id,
+                      depth=depth)  # fmt: skip
+            return None
+        fed = continuation.collect(self.conn, caller, task_id=task.id, principal=principal,
+                                   trace_id=task.trace_id, cp=cp, taints=tools.taints,
+                                   now=self.clock())  # fmt: skip
+        if not fed:
+            return None
+        key = continuation.key_of([f.approval_id for f in fed if f.approval_id], task.id)
+        queued_id = continuation.find(self.conn, key)
+        if queued_id is None:
+            queued = self._continue(task, cp, fed, key, depth, answer)
+            if isinstance(queued, AskRefused):
+                with atomic(self.conn):
+                    audit(self.conn, "ask.continue_refused", task_id=task.id,
+                          trace_id=task.trace_id, why=queued.reason)  # fmt: skip
+                return None
+            queued_id = queued.task_id
+            ran = sum(f.outcome == "ran" for f in fed)
+            with atomic(self.conn):
+                audit(self.conn, "ask.continued", task_id=task.id, trace_id=task.trace_id,
+                      continuation=queued_id, depth=depth + 1, calls=len(fed), ran=ran,
+                      not_run=sum(f.outcome == "not_run" for f in fed))  # fmt: skip
+        if not ctx.save(checkpoint={**cp, "continued": queued_id}):
+            return Fail("task is no longer running")
+        result: dict[str, Any] = {"status": "continued", "kind": cp.get("kind"),
+                                  "continued": queued_id, "path": answer.path,
+                                  "untrusted": True, "proposed": False}  # fmt: skip
+        if isinstance(cp.get("requested_by"), str):
+            result["requested_by"] = cp["requested_by"]
+        return Done(result)
+
+    def _continue(
+        self,
+        task: Task,
+        cp: dict[str, Any],
+        fed: list[continuation.Fed],
+        key: str,
+        depth: int,
+        answer: Answer,
+    ) -> Queued | AskRefused:
+        """Queue the continuation: the same principal, thread and asking brain task (so the
+        same conversation and Claude brain session), tainted when the asking turn was or a
+        result came from outside content (hops 0 then)."""
+        assert task.principal is not None
+        prior: Any = cp.get("continuation")
+        request = cast(dict[str, Any], prior).get("request") if isinstance(prior, dict) else None
+        if not isinstance(request, str):
+            raw = cp.get("owner_text") or cp.get("question")
+            request = raw if isinstance(raw, str) else None
+        outside = any(f.taints and f.outcome != "not_run" for f in fed)
+        tainted = cp.get("tainted") is True or outside
+        hops = 0 if outside else (self._asking_hops(cp) if tainted else None)
+        why = status_lines.not_approved(self.conn, task.id, self.clock()) \
+            if answer.path == "refused" else None  # fmt: skip
+        threaded = not status_lines.quiet(task)
+        reports = [f.report for f in fed if f.outcome == "ran" and f.report]
+        continues: dict[str, Any] = {
+            "key": key,
+            "depth": depth + 1,
+            "of": task.id,
+            "request": flat(request, continuation.REQUEST_MAX_CHARS) if request else None,
+            "reports": reports,
+            "changed": bool(reports),
+            "fallback": continuation.fallback(answer.reply, why, threaded=threaded),
+        }
+        requested_by = cp.get("requested_by")
+        return self.enqueue(
+            continuation.message(fed, request=request),
+            principal=task.principal,
+            requested_by=requested_by if isinstance(requested_by, str) else None,
+            channel_ref=task.channel_ref,
+            trace_id=task.trace_id,
+            tools=True,
+            tainted=tainted,
+            taint_hops=hops,
+            continues=continues,
+        )
+
+    @staticmethod
+    def _continuation(cp: dict[str, Any]) -> dict[str, Any] | None:
+        """PER-321: this ask's ``checkpoint.continuation`` (it feeds a decided approval back)."""
+        raw: Any = cp.get("continuation")
+        return cast(dict[str, Any], raw) if isinstance(raw, dict) else None
+
+    @classmethod
+    def _fallback(cls, cp: dict[str, Any]) -> str | None:
+        """A continuation's code-built text, for when Claude can't carry on."""
+        raw = (cls._continuation(cp) or {}).get("fallback")
+        return raw if isinstance(raw, str) and raw.strip() else None
+
     # -- helpers --
 
-    def _note_answer(self, cp: dict[str, Any], reply: str, status: str) -> None:
+    def _note_answer(
+        self, cp: dict[str, Any], reply: str, status: str, task: Task | None = None
+    ) -> None:
         """BR-10: Claude's answer on the asking brain task, for follow-ups (history). Only a
         real answer (not a ``Not done: …``). The brain task may still be finishing (its
         save would overwrite the note): then try again a few times in the background."""
+        if self._continuation(cp) is not None:
+            # PER-321: a continuation's text isn't the asking turn's answer (that one is
+            # noted already): it is kept as a result text, so the brains see it in the
+            # transcript, as the code-built line was; Claude's words are outside text (BR-10b)
+            if task is not None and task.principal is not None:
+                outside = status == "answered" or system_texts.tainted(cp)
+                system_texts.record(self.conn, task.principal, "result", reply,
+                                    ref=f"ask:{task.id}", task_id=task.id,
+                                    outside=outside)  # fmt: skip
+            return
         asking = cp.get("requested_by")
         if not isinstance(asking, str) or cp.get("tools") is not True or status != "answered":
             return

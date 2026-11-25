@@ -520,8 +520,11 @@ async def test_claudes_gated_write_asks_and_yes_runs_it_once(
         (done,) = await w.say("yes")
         assert done.startswith("Watching W1: notes change")
         assert len(w.executions("create_watch")) == 1
-        (ask,) = w.ask_tasks()
+        # PER-321: the yes fed the result back to Claude in a second ask (a continuation; the
+        # fake ends it without an answer, so the code-built line went out)
+        ask, cont = w.ask_tasks()
         assert ask["status"] == "done"
+        assert json.loads(cont["checkpoint"])["continuation"]["of"] == ask["id"]
         # pinned in the session, prompted after the answer (the same approval), then run
         evaluated = [a for a in w.audits("gate.evaluate") if a["tool"] == "create_watch"]
         assert [a["decision"] for a in evaluated] == ["NeedsApproval", "NeedsApproval", "Allow"]

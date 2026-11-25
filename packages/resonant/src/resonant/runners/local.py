@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -279,6 +279,9 @@ class Answer:
 
 # A step either answers (the reply is saved, then sent) or ends early (Wait or Fail).
 StepResult = Answer | Wait | Fail
+# PER-321: a resumed task's decided outcome handed elsewhere (the ask runner's continuation):
+# the step's outcome, or None to send the code-built reply as before.
+HandBack = Callable[[Task, Answer, StepContext], Awaitable[StepOutcome | None]]
 
 
 class LocalRunner:
@@ -312,6 +315,9 @@ class LocalRunner:
         resume is a ``LocalRunner`` named ``ask``. ``taint_hops``: ``brain.taint_hops``."""
         if name is not None:
             self.name = name
+        # PER-321: the ask runner's resume hands a decided approval back to Claude (a
+        # continuation turn) instead of this runner's code-built reply; None: the reply.
+        self.hand_back: HandBack | None = None
         self.conn = conn
         self.model = model
         self.taint_hops = taint_hops
@@ -359,6 +365,12 @@ class LocalRunner:
         if not isinstance(result, Answer):
             return result
         answer = result
+        if resumed and self.hand_back is not None:
+            # PER-321: Claude picks the conversation back up with this outcome; its answer
+            # is the reply (no code-built line, no PER-319 failure line: one or the other).
+            handed = await self.hand_back(task, answer, ctx)
+            if handed is not None:
+                return handed
         if resumed:
             answer = replace(answer, meta={**answer.meta, "system": True})
             if answer.path == "refused" and not status.quiet(task):
