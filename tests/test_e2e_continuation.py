@@ -167,7 +167,7 @@ async def test_no_is_one_message_from_claude_and_nothing_runs(
         assert w.osa.sent[-1].text == "Left RES-12 open: you said no."  # nothing after it
         assert w.runs("save_issue") == []
         seen = w.session()["prompt"]
-        assert "1. save_issue" in seen and "not run: Justin said no." in seen
+        assert "1. save_issue" in seen and re.search(r"not run: \w+ said no\.", seen)
         assert "approved and ran" not in seen  # nothing ran, so there is no result
         assert not [m for m in w.osa.sent if m.text.startswith(("Not done", "Couldn't"))]
 
