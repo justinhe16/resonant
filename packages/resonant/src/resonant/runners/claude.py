@@ -1765,7 +1765,8 @@ class ClaudeRunner:
             github = OfflineGitHub() if found is None else found
             resolution = await self.resolver.resolve(text, github)
         except SecretError:
-            return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
+            text = (await self.setup_missing()) or "The runner's secrets can't be read."
+            return Refused(text, SetupGap(text, RUNNER_SETUP_PLAIN, "runner-setup"))
         except NeedsToken:
             gap = github_token_gap(f"Looking up {text[:60]!r} on GitHub")
             return Refused(gap.owner_text, gap)
