@@ -35,12 +35,13 @@ Tainted writes (PER-335, ``tainted_writes``, config ``gate.tainted_writes``): ``
 default) changes nothing. With ``allow``, a ``tainted`` call is weighed as ``inferred`` at L3
 when all of these hold: autonomy on; the owner's or an approver's call (never a member's or
 the workspace default's); a registered L2 or L3 ``write`` (never L1, pay or a read), still L2
-or L3 after ``levels``; not an ``OWNER_TOOLS`` builtin (admin, the brain shell, trust); and
+or L3 after ``levels``; an extension's tool, or a builtin in ``TAINT_LIFTABLE_BUILTINS`` (the
+run tools; never ``OWNER_TOOLS``, jobs, watches, repos or CI); and
 ``Standing.tainted_allows`` (the call can be scoped, its tool's ``stands`` hook passes:
 ``merge_run`` only for a ``merge_standable`` run; and no ``ask`` trust rule decides it). It
 runs unattended (``Allow.unattended``) and the ``gate.evaluate`` row carries
-``tainted_allowed: true``. Its prompt, when it still asks (capped, rejected before), offers
-no ``yes always``.
+``tainted_allowed: true`` when it ran. Its prompt, when it still asks (capped, rejected
+before), offers no ``yes always``.
 
 Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (missing or
 garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
@@ -158,6 +159,15 @@ BATCH_SUMMARY_CHARS = 200  # a batch as one line (``pending_for``: /approvals, r
 Rule = Literal["allow", "ask", "ask_code"]
 # PER-335: whether a tainted L2/L3 write asks (the default) or runs as an untainted L3 would.
 TaintedWrites = Literal["ask", "allow"]
+# PER-335: the only builtins ``tainted_writes: allow`` may lift (an allowlist, so a new builtin
+# asks until it is named here): the run tools, whose work is bounded by the run and reported in
+# its thread. Never what outlives the turn untainted (``add_job``, ``create_watch``: a stored
+# prompt later fires as ``scheduled``), what bypasses a run's flagged paths (``add_ci``,
+# ``merge_ci_pr``), the repo set the trust scopes name, restarts, or deletions of the owner's
+# notes and reminders. A pinned test lists every builtin L2/L3 write.
+TAINT_LIFTABLE_BUILTINS: frozenset[str] = frozenset(
+    {"start_run", "cancel_run", "merge_run", "answer_worker", "message_worker"}
+)
 
 # A code-built heading for a tool's approval summary (e.g. "delete all 4 notes"). It must
 # never come from a model; ``summarize`` cleans it anyway.
@@ -306,8 +316,9 @@ class PolicyGate:
             decision, standing, asked = self._decide(
                 intent, now, autonomy, capped=capped, lifted=lifted
             )
-            # PER-335: only when the setting lifted the call, so the default's rows are as before
-            extra: dict[str, Any] = {"tainted_allowed": True} if lifted else {}
+            # PER-335: only when the setting made the call run, so the default's rows are as before
+            ran = bool(lifted) and isinstance(decision, Allow)
+            extra: dict[str, Any] = {"tainted_allowed": True} if ran else {}
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -531,8 +542,10 @@ class PolicyGate:
             return False  # never pay (always L1 anyway), never a read
         if intent.level not in (Level.L2, Level.L3) or level not in (Level.L2, Level.L3):
             return False  # never L1, whatever a hook says
-        if intent.extension is None and intent.tool in OWNER_TOOLS:
-            return False  # admin, the brain shell and trust stay the owner's word per change
+        if intent.extension is None and (
+            intent.tool in OWNER_TOOLS or intent.tool not in TAINT_LIFTABLE_BUILTINS
+        ):
+            return False  # admin, shell, trust, and any builtin not named stay asking
         if not self._staff(intent.principal):
             return False  # a member's (or the workspace default's) tainted call still asks
         return self.standing is not None and self.standing.tainted_allows(intent)

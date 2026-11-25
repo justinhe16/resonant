@@ -16,9 +16,10 @@ import pytest
 from resonant.components import level_overrides, standable
 from resonant.config import GateConfig
 from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, PolicyGate
+from resonant.gate.policy import TAINT_LIFTABLE_BUILTINS
 from resonant.gate.types import Origin
 from resonant.loop import NewTask
-from resonant.principals import Principals
+from resonant.principals import OWNER_TOOLS, Principals
 from resonant.store import repos as repos_store
 from resonant.store import runs as runs_store
 from resonant.store import tasks as task_store
@@ -27,6 +28,7 @@ from resonant.store.db import kv_set
 from resonant.tools import ToolRegistry
 from resonant.tools import runs as runs_tools
 from resonant.tools import trust as trust_tools
+from resonant.tools.builtin import BUILTIN_MODULES
 from resonant.trust.tools import StandingAllows
 from resonant_sdk import Effect, Level, ToolSpec
 
@@ -246,3 +248,58 @@ def test_start_run_is_lifted_but_an_ask_rule_on_its_repo_asks(
     assert isinstance(evaluate(db, gate, runs_tools.START_RUN, args), Allow)
     trust_store.add_rule(db, scope="site", action="*", effect="ask", created_from="chat", now=NOW)
     assert asks(evaluate(db, gate, runs_tools.START_RUN, args))
+
+
+# --- which builtins may be lifted (review: nothing that outlives the turn untainted) --------
+
+# Every builtin L2/L3 write outside OWNER_TOOLS, and whether ``allow`` lifts it. A new builtin
+# fails this test until it is placed here on purpose (TAINT_LIFTABLE_BUILTINS is an allowlist).
+BUILTIN_WRITES: dict[str, bool] = {
+    "start_run": True, "cancel_run": True, "merge_run": True,
+    "answer_worker": True, "message_worker": True,
+    # a stored prompt that later fires as ``scheduled`` (untainted): never lifted
+    "add_job": False, "create_watch": False, "pause_job": False, "resume_job": False,
+    "delete_job": False, "run_job_now": False, "cancel_watch": False,
+    # a CI workflow onto the default branch (no flagged-paths check), the repo set the trust
+    # scopes name, restarts, deleting the owner's notes and reminders
+    "add_ci": False, "merge_ci_pr": False, "create_repo": False, "add_repo": False,
+    "forget_repo": False, "restart_resonant": False, "restart_ollama": False,
+    "delete_note": False, "cancel_reminder": False,
+    # taint_exempt: ToolCore sends them as ``inferred`` already (PER-245)
+    "add_note": False, "add_reminder": False, "remember": False, "forget": False,
+}  # fmt: skip
+
+
+def test_the_builtin_allowlist_is_pinned() -> None:
+    found = {
+        s.name
+        for m in BUILTIN_MODULES
+        for s in m.SPECS
+        if s.effect is Effect.WRITE
+        and s.effective_level in (Level.L2, Level.L3)
+        and s.name not in OWNER_TOOLS
+    }
+    assert found == set(BUILTIN_WRITES)
+    assert {n for n, lift in BUILTIN_WRITES.items() if lift} == TAINT_LIFTABLE_BUILTINS
+    assert not TAINT_LIFTABLE_BUILTINS & OWNER_TOOLS
+
+
+@pytest.mark.parametrize("name", sorted(n for n, lift in BUILTIN_WRITES.items() if not lift))
+def test_a_builtin_off_the_list_still_asks_when_tainted(db: sqlite3.Connection, name: str) -> None:
+    (spec,) = [s for m in BUILTIN_MODULES for s in m.SPECS if s.name == name]
+    kv_set(db, "autonomy", "on")
+    reg = ToolRegistry()
+    reg.register(spec)
+    gate = PolicyGate(db, principals(), reg, dry_run=False, approval_ttl_s=1800,
+                      standing=StandingAllows(db), tainted_writes="allow")  # fmt: skip
+    d = evaluate(db, gate, spec, {"x": 1})
+    assert isinstance(d, NeedsApproval), name
+    assert all("tainted_allowed" not in r["detail"] for r in evaluated(db))
+
+
+def test_the_audit_says_tainted_allowed_only_when_it_ran(
+    db: sqlite3.Connection, gate: PolicyGate
+) -> None:
+    assert isinstance(evaluate(db, gate, STAGING, capped=True), NeedsApproval)
+    assert isinstance(evaluate(db, gate, STAGING), Allow)
+    assert [r["detail"].get("tainted_allowed") for r in evaluated(db)] == [None, True]
