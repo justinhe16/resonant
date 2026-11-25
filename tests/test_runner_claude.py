@@ -34,6 +34,7 @@ from github_app_fakes import (
     FakeGitHubApi,
     private_pem_one_line,
 )
+from github_public_fakes import FakePublicApi
 from voice_script import Script, scripted_voice
 
 from resonant import killswitch
@@ -522,6 +523,7 @@ def build(
         **kw,
     }
     runner = ClaudeRunner(conn, **options)
+    runner.public_github = FakePublicApi().github  # PER-327: never the network
     loop.runners[runner.name] = runner
     return Harness(root, conn, cfg, ws, chan, keychain, loop, runner, remotes, gh_dir, api, app)
 

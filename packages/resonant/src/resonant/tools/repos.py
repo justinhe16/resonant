@@ -64,7 +64,7 @@ from resonant.runner.create import (
 )
 from resonant.runner.resolve import (
     Ambiguous,
-    AppGitHub,
+    ChainGitHub,
     GitHub,
     GitHubError,
     NeedsToken,
@@ -510,7 +510,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"added": False, "text": got}
         claude, secrets = got
         slug = parse_slug(text)
-        # PER-327: the daemon's token, else the GitHub App's installation, else anonymous
+        # PER-327: the GitHub App's installation, then the daemon's token, then public
         found = await claude.lookup_github(secrets)
         anonymous = found is None
         github: GitHub
@@ -532,7 +532,8 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
                 "added": False,
                 "text": await said(claude, not_public_gap(resolution.slug), call),
             }
-        if isinstance(github, AppGitHub) and isinstance(resolution, NoAccess):
+        app_only = isinstance(github, ChainGitHub) and secrets.github_token is None
+        if app_only and isinstance(resolution, NoAccess):
             return {"added": False, "text": app_no_access_text(resolution.slug)}
         if isinstance(resolution, (Ambiguous, NoAccess)):
             return {"added": False, "text": resolution.text}
@@ -558,6 +559,8 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             lines.append(f"Couldn't add the name: {alias_error}.")
         if resolution.warning:
             lines.append(f"Heads up: {resolution.warning}.")
+        if isinstance(github, ChainGitHub) and isinstance(github.answered, PublicGitHub):
+            anonymous = True  # the App can't see it; GitHub showed it to anyone
         if anonymous and resolution.new:
             lines.append(
                 "Registered without the daemon's GitHub token, so push access and CI weren't "

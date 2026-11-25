@@ -146,9 +146,14 @@ class FakeGitHubApi:
                 status, message = self.fail_mint
                 return httpx.Response(status, json={"message": message})
             body = json.loads(request.content)
-            if self.repos is not None and any(
-                f"{self.account}/{n}".lower() not in self.repos
-                for n in body.get("repositories", [])
+            asked: list[object] = body.get("repositories") or []
+            names = [str(n) for n in asked]
+            # PER-327's read-only lookups see only ``repos`` (none until add_repo is called);
+            # a run's own token mints for any name unless ``repos`` is set
+            reading = body.get("permissions") == {"contents": "read", "metadata": "read"}
+            visible = self.repos or {}
+            if (reading or self.repos is not None) and any(
+                f"{self.account}/{n}".lower() not in visible for n in names
             ):
                 return httpx.Response(
                     422, json={"message": "There is at least one repository that does not exist"}

@@ -132,6 +132,7 @@ from resonant.runner.github_app import GitHubApp, GitHubAppError
 from resonant.runner.resolve import (
     Ambiguous,
     AppGitHub,
+    ChainGitHub,
     GhGitHub,
     GitHub,
     GitHubError,
@@ -139,6 +140,7 @@ from resonant.runner.resolve import (
     NoAccess,
     NotFound,
     OfflineGitHub,
+    PublicGitHub,
     Resolved,
     Resolver,
     app_no_access_text,
@@ -476,19 +478,15 @@ class Refused:
 
 
 SLACK_DONE = "I'll post here when it's done."
-TEXT_DONE = "You'll get a text when it finishes."
 
 
 def done_line(channel_ref: Mapping[str, Any] | None, report: str) -> str | None:
-    """PER-327: where a run's end will be said, for its start reply. Only iMessage texts
-    ("You'll get a text" only when the end is texted right away, ``report=now``); a Slack
-    thread gets the end posted in it. None for anything else (unchanged wording)."""
+    """PER-327: where a Slack run's end will be said, for its start reply. A ``report=now``
+    run posts its end where it was asked (the thread, or the DM); a digest run's end waits
+    for the owner's digest, so it promises nothing. Only iMessage texts, and its replies stay
+    as they were (golden tests), so anything but Slack is None."""
     channel = None if channel_ref is None else channel_ref.get("channel")
-    if channel == "slack":
-        return SLACK_DONE
-    if channel == "imessage" and report == "now":
-        return TEXT_DONE
-    return None
+    return SLACK_DONE if channel == "slack" and report == "now" else None
 
 
 def is_shared(
@@ -1081,6 +1079,7 @@ class ClaudeRunner:
         self.workspace = workspace or Workspace(runner, conn, api_port=api_port)
         self.resolver = Resolver(conn)
         self._github: Callable[[RunnerSecrets], GitHub] = github or self._gh_github
+        self.public_github: Callable[[], GitHub] = PublicGitHub  # PER-327; tests: a fake
         self.app = github_app or (
             GitHubApp(runner.github_app, secrets) if runner.github_app is not None else None
         )
@@ -1510,15 +1509,18 @@ class ClaudeRunner:
         return True
 
     async def lookup_github(self, secrets: RunnerSecrets) -> GitHub | None:
-        """PER-327: the GitHub client for a lookup or registration: the daemon's token when
-        set, else the GitHub App's installation (``runner.github_app`` and its key), else
-        None (the caller goes public or offline)."""
-        if secrets.github_token is not None:
-            return self._github(secrets)
+        """PER-327: the GitHub client for a lookup or registration. With the GitHub App set
+        up (``runner.github_app`` and its key) the App's installation is asked first, then
+        the daemon's token, then GitHub's public API; name lookups list the token's repos
+        (else the installation's). Without the App: the daemon's token, else None (the
+        caller goes public or offline)."""
+        token = self._github(secrets) if secrets.github_token is not None else None
         if await self._app_ready():
             assert self.app is not None
-            return AppGitHub(self.app)
-        return None
+            app = AppGitHub(self.app)
+            rest: GitHub = token if token is not None else self.public_github()
+            return ChainGitHub([app, rest], lister=token or app)
+        return token
 
     async def _app_ready(self) -> bool:
         if self.app is None:
@@ -1533,28 +1535,24 @@ class ClaudeRunner:
         self, repo: repo_store.Repo, secrets: RunnerSecrets
     ) -> AsyncGenerator[str | None]:
         """PER-327: the token the daemon's own git fetches ``repo`` with (a first clone, the
-        mirror): the daemon's token when set, else a read-only GitHub App token for the one
-        repo (revoked on exit), else None (anonymous). An App that can't mint is None too:
-        the fetch then goes anonymous and says what it needs."""
-        if secrets.github_token is not None:
-            yield secrets.github_token
-            return
-        if not await self._app_ready():
-            yield None
-            return
-        assert self.app is not None
-        owner, _, name = repo.slug.partition("/")
-        try:
-            got = await self.app.mint_read(name, owner=owner)
-        except GitHubAppError as e:
-            log.warning("app read token not minted", extra={"repo": repo.name, "why": str(e)})
-            yield None
-            return
-        try:
-            yield got.token
-        finally:
-            with contextlib.suppress(GitHubAppError):
-                await self.app.revoke(got.token)
+        mirror): with the GitHub App set up, a read-only App token for the one repo (revoked
+        on exit); when the App has none for it (not installed there, or GitHub refused), the
+        daemon's token; else None (anonymous, which a public repo is fine with)."""
+        if await self._app_ready():
+            assert self.app is not None
+            owner, _, name = repo.slug.partition("/")
+            try:
+                got = await self.app.mint_read(name, owner=owner)
+            except GitHubAppError as e:
+                log.info("no app read token", extra={"repo": repo.name, "why": str(e)})
+            else:
+                try:
+                    yield got.token
+                finally:
+                    with contextlib.suppress(GitHubAppError):
+                        await self.app.revoke(got.token)
+                return
+        yield secrets.github_token
 
     async def _app_reads(self, repo: repo_store.Repo) -> bool:
         """Whether the GitHub App can read ``repo`` (a token minted for it, then revoked)."""
@@ -1775,7 +1773,7 @@ class ClaudeRunner:
         if isinstance(resolution, Ambiguous):
             return Refused(resolution.text)
         if isinstance(resolution, NoAccess):
-            if isinstance(github, AppGitHub):
+            if isinstance(github, ChainGitHub) and secrets.github_token is None:
                 return Refused(app_no_access_text(resolution.slug))
             return Refused(resolution.text)
         if isinstance(resolution, NotFound):
@@ -2412,8 +2410,12 @@ class ClaudeRunner:
         self._check_stop(run.code)
         if not run.scratch and w.local is None and w.secrets.github_token is None:
             # started to push, and the token went since: never prepare a push run tokenless
-            raise RunnerError(
-                needs_github_token("Pushing") + " Start it again to have it commit locally."
+            gap = github_token_gap("Pushing")
+            raise SetupFailed(
+                replace(
+                    gap,
+                    owner_text=gap.owner_text + " Start it again to have it commit locally.",
+                )
             )
         if run.scratch:
             p = await self.workspace.prepare_scratch(run.code)

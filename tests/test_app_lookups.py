@@ -23,16 +23,23 @@ from typing import Any
 
 import pytest
 from github_app_fakes import FakeGitHubApi, private_pem_one_line
+from github_public_fakes import FakePublicApi, public
 from test_runner_capabilities import assert_no_github_in_session, claude_only, owner_checkout
 from test_runner_claude import Harness, build
 
 from resonant.config import GitHubAppConfig
-from resonant.runner.github_app import GitHubApp
-from resonant.runner.resolve import AppGitHub, NoAccess, Resolved, Resolver
+from resonant.runner.github_app import GitHubApp, check_grant
+from resonant.runner.resolve import (
+    AppGitHub,
+    ChainGitHub,
+    NoAccess,
+    PublicGitHub,
+    Resolved,
+    Resolver,
+)
 from resonant.runner.workspace import OWNER_SETUP, github_token_gap
 from resonant.runners.claude import (
     SLACK_DONE,
-    TEXT_DONE,
     Refused,
     Started,
     done_line,
@@ -183,24 +190,69 @@ async def test_app_only_add_repo_tool_path_uses_the_app(
     unregistered_private(h, monkeypatch)
     secrets = RunnerSecrets(None, None, None)
     gh = await h.runner.lookup_github(secrets)
-    assert isinstance(gh, AppGitHub)
+    assert isinstance(gh, ChainGitHub)
     got = await h.runner.resolver.resolve("own/proj", gh)
     assert isinstance(got, Resolved) and got.new and got.repo.mode == "push"
+    assert isinstance(gh.answered, AppGitHub)
     async with h.runner.clone_token(got.repo, secrets) as token:
         assert token is not None and token.startswith("ghs_")
         out = await h.ws.owner_checkout(got.repo, token)
     assert out.state == "cloned"
     assert sorted(h.api.revoked) == sorted(h.api.tokens)
-    # with the daemon's token, that wins and the App isn't asked
-    with_token = RunnerSecrets("ghp_" + "x" * 36, None, None)
-    assert not isinstance(await h.runner.lookup_github(with_token), AppGitHub)
-    async with h.runner.clone_token(got.repo, with_token) as token:
-        assert token == with_token.github_token
-    # no App key: neither
+    # no App key: no lookup client and no clone token
     del h.keychain.items[GITHUB_APP_KEY_REF]
     assert await h.runner.lookup_github(secrets) is None
     async with h.runner.clone_token(got.repo, secrets) as token:
         assert token is None
+
+
+async def test_the_app_goes_first_then_the_daemon_token(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """Ticket order: the App whenever it's set up, then ``runner/github_token``."""
+    h = build(tmp_path, db)
+    with_token = RunnerSecrets("ghp_" + "x" * 36, None, None)
+    h.api.add_repo("own/proj")
+    repo = repo_store.get(db, "own/proj")
+    assert repo is not None
+    async with h.runner.clone_token(repo, with_token) as token:
+        assert token is not None and token.startswith("ghs_")  # the App's, not the daemon's
+    assert [m["permissions"] for m in h.api.mints] == [READ]
+    assert h.api.revoked == h.api.tokens
+    # a repo the installation can't see: the daemon's token
+    with atomic(db):
+        other = repo_store.add(db, "own/other", base="main", source="auto", mode="push", ci=True)
+    async with h.runner.clone_token(other, with_token) as token:
+        assert token == with_token.github_token
+    # the App refusing outright (a bad key, GitHub down): the daemon's token, else anonymous
+    h.api.fail_mint = (500, "boom")
+    async with h.runner.clone_token(repo, with_token) as token:
+        assert token == with_token.github_token
+    async with h.runner.clone_token(repo, RunnerSecrets(None, None, None)) as token:
+        assert token is None
+    # lookups: the App, then the daemon's token client (the harness's FakeGitHub)
+    gh = await h.runner.lookup_github(with_token)
+    assert isinstance(gh, ChainGitHub) and isinstance(gh.chain[0], AppGitHub)
+    assert not isinstance(gh.chain[1], (AppGitHub, PublicGitHub))
+    assert gh.lister is gh.chain[1]  # names are matched against the token's repos
+
+
+async def test_app_only_a_public_repo_outside_the_installation_still_registers(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """The chain ends in public: the App can't see it, GitHub shows it to anyone."""
+    h = build(tmp_path, db)
+    app_only(h)
+    h.api.add_repo("own/proj")
+    pub = FakePublicApi({"octo/lib": public("octo/lib", "develop")})
+    h.runner.public_github = pub.github
+    secrets = RunnerSecrets(None, None, None)
+    gh = await h.runner.lookup_github(secrets)
+    assert isinstance(gh, ChainGitHub)
+    got = await h.runner.resolver.resolve("octo/lib", gh)
+    assert isinstance(got, Resolved) and got.new
+    assert (got.repo.mode, got.repo.ci, got.repo.base) == ("push", None, "develop")
+    assert isinstance(gh.answered, PublicGitHub)
 
 
 async def test_a_repo_the_app_cant_see_is_said_without_a_command(
@@ -211,9 +263,21 @@ async def test_a_repo_the_app_cant_see_is_said_without_a_command(
     unregistered_private(h, monkeypatch)
     res = await h.runner.start_run("own/elsewhere", "x", "owner")
     assert isinstance(res, Refused)
-    assert res.reason.startswith("The GitHub App can't see own/elsewhere")
+    assert res.reason.startswith("The GitHub App can't see own/elsewhere and it isn't public")
     assert "secret set" not in res.reason
     assert runs_store.recent(db) == []
+
+
+def test_check_grant_for_a_read_only_token() -> None:
+    reply = {
+        "repository_selection": "selected",
+        "repositories": [{"name": "proj", "full_name": "own/proj"}],
+        "permissions": dict(READ),
+    }
+    assert check_grant(reply, "proj", dict(READ), "own") is None
+    assert check_grant(reply, "proj", dict(READ), "else") is not None  # another account's
+    wider = {**reply, "permissions": {**READ, "pull_requests": "write"}}
+    assert check_grant(wider, "proj", dict(READ), "own") is not None  # never more than asked
 
 
 # --- 2. a missing credential in a Slack thread ---------------------------------------------
@@ -347,10 +411,10 @@ def test_is_shared() -> None:
 
 
 def test_done_line_by_channel() -> None:
-    assert done_line(SLACK_THREAD, "digest") == SLACK_DONE
     assert done_line(SLACK_THREAD, "now") == SLACK_DONE
-    assert done_line({"channel": "imessage"}, "now") == TEXT_DONE
-    assert done_line({"channel": "imessage"}, "digest") is None  # the end goes to the digest
+    assert done_line({"channel": "slack", "thread": None}, "now") == SLACK_DONE  # a DM
+    assert done_line(SLACK_THREAD, "digest") is None  # its end isn't posted there: no promise
+    assert done_line({"channel": "imessage"}, "now") is None  # iMessage replies are unchanged
     assert done_line(None, "now") is None
     assert "text" not in SLACK_DONE.lower()
 
@@ -365,15 +429,20 @@ async def test_a_slack_run_ack_says_it_posts_here(tmp_path: Path, db: sqlite3.Co
     assert SLACK_DONE in res.text
     assert "text" not in res.text.lower()
     await h.drain()
+    assert any(who == "member" for who, _ in h.chan.sent)  # the promise kept: posted there
+    digest = await h.runner.start_run(
+        None, "and the memory?", "owner", channel_ref=SLACK_THREAD, requested_by="member"
+    )
+    assert isinstance(digest, Started) and "text" not in digest.text.lower()
+    assert SLACK_DONE not in digest.text
+    await h.drain()
 
 
-async def test_an_imessage_run_ack_says_a_text_comes(
-    tmp_path: Path, db: sqlite3.Connection
-) -> None:
+async def test_an_imessage_run_ack_is_unchanged(tmp_path: Path, db: sqlite3.Connection) -> None:
     h = build(tmp_path, db, scenario="scratch")
     imessage = {"channel": "imessage", "principal": "owner", "thread": None, "ref": "g1"}
     res = await h.runner.start_run(
         None, "how full is the disk?", "owner", channel_ref=imessage, report="now"
     )
-    assert isinstance(res, Started) and res.text.endswith(f"to stop. {TEXT_DONE}")
+    assert isinstance(res, Started) and res.text.endswith("/cancel R1 to stop.")
     await h.drain()

@@ -40,7 +40,7 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 from urllib.parse import quote
@@ -594,12 +594,60 @@ def _workflow_text(data: Any) -> str | None:
 
 
 def app_no_access_text(slug: str) -> str:
-    """PER-327: a repo the GitHub App's installation can't see (no command: the fix is
-    installing the app on it, in GitHub)."""
+    """PER-327: a repo neither the GitHub App's installation nor anyone can see (no command:
+    the fix is installing the app on it, in GitHub)."""
     return (
-        f"The GitHub App can't see {slug}: it isn't installed on that repo, or the repo "
-        "doesn't exist."
+        f"The GitHub App can't see {slug} and it isn't public: the app isn't installed on "
+        "that repo, or the repo doesn't exist."
     )
+
+
+class ChainGitHub:
+    """PER-327: lookups through several clients in order (the GitHub App's installation,
+    then the daemon's token, then public): the first that sees a repo answers, so a repo
+    outside the installation still resolves through the next. ``lister`` lists the repos a
+    name is matched against. ``answered`` is the client that last answered ``repo_info``."""
+
+    def __init__(self, chain: Sequence[GitHub], lister: GitHub) -> None:
+        self.chain = list(chain)
+        self.lister = lister
+        self.answered: GitHub | None = None
+
+    async def repo_info(self, slug: str) -> RepoInfo | None:
+        failed: GitHubError | None = None
+        for gh in self.chain:
+            try:
+                info = await gh.repo_info(slug)
+            except NeedsToken:
+                continue
+            except GitHubError as e:
+                failed = failed or e
+                continue
+            if info is not None:
+                self.answered = gh
+                return info
+        if failed is not None:
+            raise failed
+        return None
+
+    async def my_repos(self) -> list[str]:
+        return await self.lister.my_repos()
+
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        for gh in self.chain:
+            try:
+                got = await gh.is_protected(slug, branch)
+            except GitHubError:
+                continue
+            if got is not None:
+                return got
+        return None
+
+    async def size_kb(self, slug: str) -> int | None:
+        for gh in self.chain:
+            if (got := await gh.size_kb(slug)) is not None:
+                return got
+        return None
 
 
 class OfflineGitHub:

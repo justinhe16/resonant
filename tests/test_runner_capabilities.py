@@ -301,6 +301,7 @@ async def test_app_without_the_token_cant_push_either(
     and checking the PR (and the base-push watch)."""
     h = build(tmp_path, db, scenario="happy", extra=["--no-push"])
     del h.keychain.items[GITHUB_TOKEN_REF]
+    h.api.add_repo("own/proj")  # PER-327: the installation can read it
     owner_checkout(h)
     res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now")
     assert isinstance(res, Started)
