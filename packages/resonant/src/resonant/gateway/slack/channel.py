@@ -918,8 +918,10 @@ class SlackChannel:
                 return prev
             channel, thread_ts = await self._target(principal, uid, thread, dedupe_key)
             formatted = blocks.format_text(text, self.config.link_base)
-            if prompt is not None and (tags := self._tags(prompt.mention)):
-                formatted = f"{tags}\n{formatted}"  # PER-320: notify the approvers
+            # PER-320: notify the approvers, in the thread only (a copy that fell back to a
+            # DM tags nobody: they get their own)
+            if prompt is not None and thread_ts and (tags := self._tags(prompt.mention)):
+                formatted = f"{tags}\n{formatted}"
             chunks = [formatted] if prompt is not None else split_text(formatted, blocks.MAX_CHUNK)
             claude = outbound.is_claude_send(dedupe_key)
             at = self.clock()

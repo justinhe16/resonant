@@ -620,6 +620,24 @@ async def test_a_thread_no_longer_followed_falls_back_to_each_approvers_dm(
     assert {p.channel for p in w.web.posts if p.buttons} == {"D2BRIAN", "D1JUSTIN"}
 
 
+async def test_a_members_copy_that_fell_back_to_a_dm_tags_nobody(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    w, gate = gw  # not a thread the bot posts in: the member's copy lands in their DM
+    task_id = repo.insert_task(
+        w.slack.conn, NewTask(kind="chat", runner="local", priority=1, principal="brian")
+    )
+    d = gate.evaluate(Intent.for_tool(ADD, task_id=task_id, principal="brian", args={"x": 1}))
+    assert isinstance(d, NeedsApproval)
+    repo.set_status(w.slack.conn, task_id, "waiting", wait_reason="approval")
+    thread = MessageRef("slack", "C0GENERAL:1700000000.000100", "C0GENERAL:1700000000.000100")
+    await prompt_approvers(
+        w.slack.conn, w.slack, d, task_id=task_id, now=utcnow, in_thread=("miu", thread)
+    )
+    assert w.web.posts and not any("<@" in p.text for p in w.web.posts)
+    assert {p.channel for p in w.web.posts if p.buttons} >= {"D2BRIAN", "D1JUSTIN"}
+
+
 async def test_a_thread_prompts_reminder_goes_once_in_the_thread(
     gw: tuple[World, PolicyGate],
 ) -> None:
