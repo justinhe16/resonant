@@ -46,7 +46,7 @@ from resonant.store.db import kv_get, kv_set
 
 Kind = Literal["pr_opened", "ci_failed", "changes_requested", "merged", "deployed"]
 KINDS: tuple[Kind, ...] = ("pr_opened", "ci_failed", "changes_requested", "merged", "deployed")
-Call = Literal["pr_create", "pr_merge", "ci", "review", "deploy"]
+Call = Literal["pr_create", "pr_merge", "ci", "review", "review_api", "deploy"]
 Mode = Literal["thread", "off"]
 
 QUIET_S = 60.0  # session seconds before any milestone is posted
@@ -59,11 +59,14 @@ _PR_URL = re.compile(
 )
 _PR_HASH = re.compile(r"(?<![A-Za-z0-9])#(\d{1,7})(?![0-9])")
 _PR_ARG = re.compile(r"#?(\d{1,7})")
-_FAIL = re.compile(r"\bfail(?:s|ed|ing|ure)?\b", re.IGNORECASE)
+# a check's status column (``build\tfail``) or a word; never ``fail-fast`` or ``failsafe``
+_FAIL = re.compile(r"\tfail\b|\bfail(?:ed|ing|ure)\b", re.IGNORECASE)
 _FAILING = re.compile(r"\b[1-9]\d* failing\b|\bwere not successful\b|\bconclusion\W+failure\b",
                       re.IGNORECASE)  # fmt: skip
-_CHANGES = re.compile(r"CHANGES_REQUESTED|\bchanges requested\b|\brequested changes\b",
-                      re.IGNORECASE)  # fmt: skip
+# The PR's current decision, not a stale review in its history or words in its body.
+_DECISION = re.compile(r'"reviewDecision"\s*:\s*"CHANGES_REQUESTED"|^\s*Review(?:s|ers)?:.*'
+                       r"\bchanges requested\b", re.IGNORECASE | re.MULTILINE)  # fmt: skip
+_CHANGES = re.compile(r'"state"\s*:\s*"CHANGES_REQUESTED"')
 _STAGING = re.compile(r"(?:^|[^a-z0-9])(?:staging|stage|stg)(?:[^a-z0-9]|$)", re.IGNORECASE)
 _PROD = re.compile(r"(?:^|[^a-z0-9])(?:prod|production)(?:[^a-z0-9]|$)", re.IGNORECASE)
 _GH_VALUE = frozenset({"-R", "--repo", "--hostname"})
@@ -115,7 +118,7 @@ def _gh_words(argv: Sequence[str]) -> list[str]:
 
 def _pr_of(words: Iterable[str]) -> int | None:
     for w in words:
-        m = _PR_ARG.fullmatch(w) or re.search(r"/pull/(\d{1,7})", w)
+        m = _PR_ARG.fullmatch(w) or re.search(r"/pulls?/(\d{1,7})", w)
         if m is not None:
             return int(m[1])
     return None
@@ -129,25 +132,35 @@ def _env(text: str) -> str | None:
     return None
 
 
+def _classify_gh(argv: Sequence[str]) -> _Open | None:
+    words = _gh_words(argv)
+    group, sub = [*words, "", ""][:2]
+    if group == "pr" and sub == "create":
+        return _Open("pr_create")
+    if group == "pr" and sub == "merge":
+        if any(x in ("--auto", "--disable-auto") for x in argv):
+            return None  # queues (or unqueues) a merge: nothing merged yet
+        return _Open("pr_merge", _pr_of(words[2:]))
+    if (group == "pr" and sub == "checks") or (group == "run" and sub in ("watch", "view")):
+        return _Open("ci", _pr_of(words[2:]) if group == "pr" else None)
+    if group == "pr" and sub in ("view", "status"):
+        return _Open("review", _pr_of(words[2:]))
+    if group == "api" and "reviews" in sub:
+        return _Open("review_api", _pr_of([sub]))
+    return None
+
+
 def classify_bash(command: str) -> _Open | None:
-    """What a shell command could show, or None. The first command of a compound line that
-    counts wins (``git push && gh pr create`` is a PR create)."""
+    """What a shell command could show, or None. In a compound line the last ``gh`` command
+    that counts wins (``gh pr checks && gh pr merge 4`` is a merge: its result is the line's
+    outcome)."""
+    found: _Open | None = None
     for raw in commands(command):
         argv = unwrap(raw)
-        if not argv or argv[0].rsplit("/", 1)[-1] != "gh":
-            continue
-        words = _gh_words(argv)
-        group, sub = [*words, "", ""][:2]
-        if group == "pr" and sub == "create":
-            return _Open("pr_create")
-        if group == "pr" and sub == "merge":
-            return _Open("pr_merge", _pr_of(words[2:]))
-        if (group == "pr" and sub == "checks") or (group == "run" and sub in ("watch", "view")):
-            return _Open("ci", _pr_of(words[2:]) if group == "pr" else None)
-        if group == "pr" and sub in ("view", "status"):
-            return _Open("review", _pr_of(words[2:]))
-        if group == "api" and "reviews" in sub:
-            return _Open("review", _pr_of([sub]))
+        if argv and argv[0].rsplit("/", 1)[-1] == "gh":
+            found = _classify_gh(argv) or found
+    if found is not None:
+        return found
     for effect in classify_command(command):
         if effect.kind != "deploy" or effect.what.startswith(("ran workflow", "pushed image",
                                                              "built and pushed")):  # fmt: skip
@@ -169,7 +182,7 @@ def classify_mcp(name: str, args: Mapping[str, Any]) -> _Open | None:
     if _MCP_MERGE.search(tool):
         return _Open("pr_merge", pr)
     if _MCP_REVIEW.search(tool) and not tool.lower().startswith(("create", "submit", "add")):
-        return _Open("review", pr)
+        return _Open("review_api", pr)
     if _MCP_CHECKS.search(tool):
         return _Open("ci", pr)
     return None
@@ -225,8 +238,9 @@ def judge(call: _Open, is_error: bool, text: str) -> Milestone | None:
             if (is_error and _FAIL.search(text)) or _FAILING.search(text):
                 return Milestone("ci_failed", call.pr)
             return None
-        case "review":
-            if not is_error and _CHANGES.search(text):
+        case "review" | "review_api":
+            found = _DECISION if call.call == "review" else _CHANGES
+            if not is_error and found.search(text):
                 return Milestone("changes_requested", call.pr)
             return None
         case "deploy":

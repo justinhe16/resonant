@@ -46,8 +46,26 @@ def test_ci_failures_reviews_merges_and_deploys() -> None:
         ms.Milestone("ci_failed")
     ]
     assert seen("gh pr checks --watch", "All checks were successful") == []
-    assert seen("gh pr view 12 --json reviews", '{"state":"CHANGES_REQUESTED"}') == [
+    assert seen(
+        "gh pr view 12 --json reviewDecision", '{"reviewDecision":"CHANGES_REQUESTED"}'
+    ) == [ms.Milestone("changes_requested", 12)]
+    assert seen("gh pr view 12", "title: x\nreviewers: lead (Changes requested)\n") == [
         ms.Milestone("changes_requested", 12)
+    ]
+    # a stale review in the history, or the words in the PR body, isn't the PR's decision
+    stale = '{"reviewDecision":"APPROVED","reviews":[{"state":"CHANGES_REQUESTED"}]}'
+    assert seen("gh pr view 12 --json reviews,reviewDecision", stale) == []
+    assert seen("gh pr view 12", "body: address the changes requested last week") == []
+    assert seen("gh api repos/o/r/pulls/12/reviews", '[{"state": "CHANGES_REQUESTED"}]') == [
+        ms.Milestone("changes_requested", 12)
+    ]
+    # pending checks (exit 8) and a check named fail-fast are not a CI failure
+    assert seen("gh pr checks 12", "fail-fast\tpending\t0\n", error=True) == []
+    # --auto queues the merge: nothing merged yet
+    assert seen("gh pr merge 12 --auto --squash", "Pull request #12 will be merged") == []
+    # the last gh command of a compound line is its outcome
+    assert seen("gh pr checks 12 --watch && gh pr merge 12", "Merged pull request #12") == [
+        ms.Milestone("merged", 12)
     ]
     assert seen("gh pr view 12", "Reviewers: lead (Approved)") == []
     assert seen("gh pr merge 12 --squash", "✓ Squashed and merged pull request #12") == [

@@ -2059,8 +2059,8 @@ class ClaudeRunner:
         channel dedupes ``status:<task>:milestone:<kind>``). Only while the run is running,
         Resonant isn't paused and ``runs.milestones`` is ``thread``; a failed send stays
         pending for the next one. Never raises."""
-        if self.milestones_mode != "thread":
-            return
+        if self.milestones_mode != "thread" or code not in self._loud:
+            return  # off, or the run already ended (``_end_milestones``)
         async with self._milestone_locks.setdefault(code, asyncio.Lock()):
             try:
                 run = runs.get(self.conn, code)
