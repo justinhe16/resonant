@@ -27,6 +27,7 @@ MAX_ARGS = 3  # args shown; the rest become "+N more args"
 MAX_KEY_LEN = 20
 MAX_VALUE_LEN = 40
 DETAIL_MAX = 4096  # PER-300: one arg shown in full under the summary
+PLAIN_MAX = 140  # PER-324: the brain's plain sentence over a prompt's exact call
 
 # Ordinary whitespace controls are readable once whitespace is collapsed for display.
 _ALLOWED_CONTROLS = frozenset("\t\n\r")
@@ -218,6 +219,24 @@ def detail_text(intent: Intent) -> str | None:
         notes.append(f"cut at {DETAIL_MAX} characters")
     block = f"```\n{masked}\n```"
     return block + (f"\n({'; '.join(notes)}; /approvals shows it unchanged)" if notes else "")
+
+
+def plain_line(text: str | None) -> str | None:
+    """PER-324: the brain's stated reason for a gated call as the prompt's plain first line
+    (``Look up the shop's locations (read only)``), or None when there is none.
+    Cleaned like any external string (``clean_external``: one line, printable ASCII, no
+    brackets, approval-code look-alikes masked), trailing ``. ? !`` dropped (the prompt adds
+    its own ``?``), first letter capitalised and at most ``PLAIN_MAX`` characters (a cut ends
+    in ``...``). It is the model's words, so it never replaces the code-built summary: the
+    prompt shows that exact call right under it."""
+    if not isinstance(text, str):
+        return None
+    flat = clean_external(text).rstrip(" .?!;:,")
+    if len(flat) > PLAIN_MAX:
+        flat = flat[: PLAIN_MAX - 3].rstrip(" .?!;:,") + "..."
+    if not any(ch.isalnum() for ch in flat):
+        return None
+    return flat[0].upper() + flat[1:]
 
 
 def summarize(intent: Intent, *, action: str | None = None) -> str:

@@ -736,8 +736,9 @@ class LocalRunner:
                 gate.drop(ids, reason="batch_refused")
                 states = gate.approval_states(ids)
             else:
+                plains = {i.approval_id: i.call.reason for i in items if i.call.reason}
                 return await self._ask_batch(task.id, batch, {**cp, "batch_id": batch.batch_id},
-                                             spans)  # fmt: skip
+                                             spans, plains)  # fmt: skip
         return await self._run_batch(task, principal, cp, items, states, effects, spans)
 
     async def _settle_call(
@@ -772,17 +773,24 @@ class LocalRunner:
         return None
 
     async def _ask_batch(
-        self, task_id: str, batch: ApprovalBatch, cp: dict[str, Any], spans: SpanFactory
+        self,
+        task_id: str,
+        batch: ApprovalBatch,
+        cp: dict[str, Any],
+        spans: SpanFactory,
+        plains: Mapping[str, str | None] | None = None,
     ) -> Wait | Fail:
         """Send the batch's one prompt (idempotent: the channel dedupes by its id), then
-        wait until it is answered or expires."""
+        wait until it is answered or expires. ``plains`` (PER-324): each change's plain
+        sentence by approval id."""
         with spans(
             "runner.local.approval",
             approvers=len(batch.approvers),
             level=batch.level.value,
             batch=len(batch.approval_ids),
         ) as s:
-            sent = await prompt_batch(self.conn, self.channel, batch, now=self.now)
+            sent = await prompt_batch(self.conn, self.channel, batch, now=self.now,
+                                      plains=plains)  # fmt: skip
             s.set(reached=len(sent.reached), unreachable=len(sent.unreachable))
             if sent.retry:
                 s.set(ok=False, error=type(sent.error).__name__)

@@ -49,7 +49,7 @@ import contextlib
 import logging
 import sqlite3
 from collections.abc import Generator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 import jsonschema
@@ -67,6 +67,7 @@ from resonant.gate import (
 )
 from resonant.gate import actions as action_ids
 from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
+from resonant.gate.summary import plain_line
 from resonant.gate.types import Origin, OwnerAsk
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
@@ -155,7 +156,9 @@ class InlineGate(Protocol):
 class PinnedCall:
     """``checkpoint.call``: a task's gated call and its pinned idempotency inputs.
     ``capped`` (PER-261): it came past ``MAX_SIDE_EFFECTS``, so its resume is gated capped
-    too (it runs only on its own approval, never on the rule that would have allowed it)."""
+    too (it runs only on its own approval, never on the rule that would have allowed it).
+    ``reason`` (PER-324): the brain's stated reason, cleaned (``plain_line``), the approval
+    prompt's plain first line; never part of the intent (its hash, the args or the gate)."""
 
     tool: str
     extension: str | None
@@ -163,6 +166,7 @@ class PinnedCall:
     step_no: int
     call_index: int
     capped: bool = False
+    reason: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -174,6 +178,8 @@ class PinnedCall:
         }
         if self.capped:
             out["capped"] = True
+        if self.reason:
+            out["reason"] = self.reason
         return out
 
     @classmethod
@@ -190,7 +196,7 @@ class PinnedCall:
         ):
             return None
         return cls(tool, ext, cast(dict[str, Any], args), step_no, call_index,
-                   d.get("capped") is True)  # fmt: skip
+                   d.get("capped") is True, plain_line(d.get("reason")))  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -265,6 +271,11 @@ def pinned_origin(cp: Mapping[str, Any], pinned: PinnedCall) -> Origin:
     return "tainted" if cp.get("tainted") is True else "inferred"
 
 
+def with_plain(decision: NeedsApproval, pinned: PinnedCall) -> NeedsApproval:
+    """PER-324: the gate's ask with the pinned call's plain reason, for its prompt."""
+    return replace(decision, plain=pinned.reason) if pinned.reason else decision
+
+
 def gated_origin(spec: ToolSpec, origin: Origin) -> Origin:
     """The origin the gate sees for a call to ``spec``: a ``tainted`` call to a
     ``taint_exempt`` spec (a note, a reminder, a fact: PER-245) is gated as ``inferred``, so
@@ -316,6 +327,10 @@ class CallScope:
     # Claude bridge sets it, from the turn's message event); the gate decides
     # (``trust.asked``). Only ``call`` uses it: a resume runs on its approval.
     asked: OwnerAsk | None = None
+    # PER-324: the brain's stated reason for this call (the Claude bridge's
+    # ``approval_reason``, or Claude's own Bash ``description``): pinned with the call
+    # (cleaned), shown as an approval prompt's plain first line. Only ``call`` uses it.
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -529,7 +544,7 @@ class ToolCore:
             if not isinstance(decision, Allow | NeedsApproval):
                 return _refused(intent, decision, gated=True)
             pinned = PinnedCall(spec.name, spec.extension, intent.args, scope.step_no,
-                                scope.call_index, capped)  # fmt: skip
+                                scope.call_index, capped, plain_line(scope.reason))  # fmt: skip
             if batching and isinstance(decision, NeedsApproval):
                 return self._join(intent, decision, pinned, scope)
             cp = dict(scope.checkpoint)
@@ -554,6 +569,7 @@ class ToolCore:
         it is refused and its approval dropped (never prompted, so nothing could bind it)."""
         assert self.batch_gate is not None and scope.batch is not None
         items = list(scope.batch)
+        decision = with_plain(decision, pinned)
         same = next((i for i in items if i.approval_id == decision.approval_id), None)
         if same is not None:
             return Asked(intent, decision, dict(scope.checkpoint), item=same)
@@ -626,7 +642,7 @@ class ToolCore:
     ) -> CallOutcome:
         """Act on the gate's decision for a gated call (``cp`` holds its pin, if any)."""
         if isinstance(decision, NeedsApproval):
-            return Asked(intent, decision, cp)
+            return Asked(intent, with_plain(decision, pinned), cp)
         if not isinstance(decision, Allow):
             return _refused(intent, decision, gated=True)
         try:

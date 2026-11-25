@@ -220,6 +220,26 @@ async def test_no_means_it_never_runs(
         assert kv_get(w.conn, GRANTS_KV) is None
 
 
+async def test_a_commands_own_description_is_the_plain_question(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-324: Claude Code's Bash ``description`` is the prompt's plain first line, the
+    gate's exact call under it."""
+    repo, _ = scratch_repo(tmp_path)
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = CLAUDE
+        step = {
+            "tool": "Bash",
+            "command": f"cd {repo} && git push -q origin main",
+            "description": "Push the latest work to the main branch",
+        }
+        w.claude(shell=[step], answer="{r0}")  # fmt: skip
+        _, prompt = await w.say("push main", replies=2)
+        first, exact = prompt.split("\n")[:2]
+        assert first.startswith("Push the latest work to the main branch? [")
+        assert exact.startswith("`") and exact.endswith("`") and "push" in exact
+
+
 @pytest.mark.parametrize(
     "command",
     [

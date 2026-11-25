@@ -97,6 +97,7 @@ def approval_text(
     destructive: bool = False,
     always: bool = False,
     phrased: bool = False,
+    plain: str | None = None,
 ) -> str:
     """The message sent to approvers. ``summary`` must be built by code from intent fields.
 
@@ -105,9 +106,20 @@ def approval_text(
     never with the other two) offers ``yes always``. ``phrased`` (PER-268): the summary is the
     tool's own phrase (``approval_summary``), asked as a question with the code after it:
     ``OK to merge PR #121 in justinhe16/resonant? [P3] yes / no``.
+
+    ``plain`` (PER-324, ``gate.summary.plain_line``: the brain's stated reason, cleaned) is
+    the question instead, in the phrased form without ``OK to``, and the exact code-built
+    ``summary`` follows on its own line as inline code (``exact_line``):
+    ``Look up the shop's locations? [A7] yes / no`` then ```` `call GET /v2/locations` ````.
     """
+    if plain:
+        head = approval_text(
+            code, plain, require_code=require_code, destructive=destructive, always=always,
+            phrased=True,
+        ).removeprefix(_OK_TO)  # fmt: skip
+        return f"{head}\n{exact_line(summary)}"
     if phrased:
-        summary = f"OK to {summary}"
+        summary = f"{_OK_TO}{summary}"
         if always and not (destructive or require_code):
             return f"{summary}? [{code}] yes / yes always / no"
         if destructive:
@@ -124,6 +136,15 @@ def approval_text(
     return f"[{code}] {summary}? Reply yes / no"
 
 
+_OK_TO = "OK to "
+
+
+def exact_line(summary: str) -> str:
+    """PER-324: a code-built summary as the line under a plain question: inline code (Slack
+    renders it monospace), a backtick inside shown as ``'``."""
+    return "`" + summary.replace("`", "'") + "`"
+
+
 def pick_example(n: int) -> str:
     """The ``yes 1,3`` example a batch of ``n`` changes shows (PER-255): numbers it has."""
     return "1,3" if n >= 3 else "1"
@@ -135,6 +156,7 @@ def batch_text(
     *,
     require_code: bool = False,
     destructive: bool = False,
+    plains: Sequence[str | None] = (),
 ) -> str:
     """One prompt for a batch of changes (BA-1): a numbered line per change, then the answer.
     Lines are never clipped: each is the whole code-built summary a lone prompt would show
@@ -146,8 +168,17 @@ def batch_text(
 
     ``[D7] OK to make these 4 changes?\n1. linear: save issue id="RES-12" …\n…\n``
     ``Reply yes / no, or yes 1,3 D7 for just those.``
+
+    ``plains`` (PER-324, by position; None or missing: none) puts a change's plain sentence
+    first, its exact line under it as inline code (``exact_line``), indented.
     """
-    shown = [f"{i}. {line}" for i, line in enumerate(lines, 1)]
+    shown: list[str] = []
+    for i, line in enumerate(lines, 1):
+        plain = plains[i - 1] if i <= len(plains) else None
+        if plain:
+            shown.append(f"{i}. {plain}\n   {exact_line(line)}")
+        else:
+            shown.append(f"{i}. {line}")
     head = f"[{code}] OK to make these {len(lines)} changes?"
     some = f"or yes {pick_example(len(lines))} {code} for just those."
     if destructive:
