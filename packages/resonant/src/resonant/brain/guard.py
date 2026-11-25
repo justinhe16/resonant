@@ -173,9 +173,32 @@ _ASKS_CHANGE = re.compile(
 )
 
 
+# "I started no runs", "I made nothing new": a denial, not a claim.
+_NEGATED = re.compile(
+    rf"\bI(?:'ve| have| just)?\s+(?:just\s+|already\s+)?(?:set|{_CHANGE_VERBS})\s+"
+    r"(?:no|nothing|none)\b",
+    re.IGNORECASE,
+)
+# "Once that's done, I'll start them", "If you want, I'll file it", "tell me and I'll start
+# them again": a promise that waits on the owner, not one the reply should already have kept.
+_CONDITIONAL = re.compile(
+    r"^\W*(?:once|when|whenever|if|after|as soon as)\b"
+    r"|\b(?:say so|tell me|let me know|give me the word|just say)\s*,?\s*"
+    r"and\s+I(?:'ll| will)\b",
+    re.IGNORECASE,
+)
+_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _claim_text(reply: str) -> str:
+    """``reply`` without its denials and its conditional promises (see above)."""
+    kept = [s for s in _SENTENCE.split(reply) if _CONDITIONAL.search(s) is None]
+    return _NEGATED.sub(" ", "\n".join(kept))
+
+
 def claims_change(reply: str) -> bool:
     """A reply that says it changed something (to check against what actually ran)."""
-    return _CLAIM.search(reply) is not None
+    return _CLAIM.search(_claim_text(reply)) is not None
 
 
 def asks_change(text: str) -> bool:
@@ -188,10 +211,11 @@ def claims_done(reply: str, owner_text: str) -> bool:
     """``reply`` says a change was made. A first-person claim always counts. The other forms
     (a leading "Added …", "Merged …", the passive "has been closed") describe a state when the
     owner only asked about it, so they count only when the owner asked for a change."""
-    if _I_CLAIM.search(reply) is not None:
+    text = _claim_text(reply)
+    if _I_CLAIM.search(text) is not None:
         return True
     return asks_change(owner_text) and (
-        claims_change(reply) or _PASSIVE_CLAIM.search(reply) is not None
+        claims_change(text) or _PASSIVE_CLAIM.search(text) is not None
     )
 
 
