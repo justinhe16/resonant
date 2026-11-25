@@ -254,3 +254,24 @@ def test_the_pending_ask_guard_drops_only_asks_for_a_yes() -> None:
         "Which one, R3 or R5?",
     ):
         assert drop_pending_asks(keep) == (keep, 0)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Nothing changed this turn. I started no runs and changed no settings.",
+        "I made nothing new.",
+        "Once that's done, say so and I'll start all three again.",
+        "When the App is fixed, I'll start them.",
+        "Fix the permissions, then tell me and I'll start the three again.",
+        "If you want, I'll file it.",
+    ],
+)
+def test_denials_and_conditional_promises_dont_claim(reply: str) -> None:
+    # Cori 2026-11-25: an honest "nothing changed" answer was swapped for the fallback.
+    assert not claims_done(reply, "robot surf DORI-1173 please")
+
+
+def test_a_real_claim_next_to_a_conditional_still_counts() -> None:
+    reply = "I started R4. Once it's done, I'll post the PR."
+    assert claims_done(reply, "robot surf DORI-1173 please")

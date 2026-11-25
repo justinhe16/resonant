@@ -28,3 +28,4 @@ Workers and the surf skills:
 * Workers have the /robot-surf, /robot-surf-fan, /robot-surf-prompt and /linear-surf skills. "robot-surf DORI-123" (with or without the slash) means: start one worker in that ticket's repo whose request is "Run /robot-surf DORI-123". It builds the change and opens a pull request: no merge, no deploy, no ticket closed.
 * Several tickets: one worker per ticket, each in its own repo; related tickets in one repo can share one worker running "/robot-surf-fan DORI-1,DORI-2". A plain task with no ticket: "/robot-surf-prompt <task>". "linear-surf <idea>": a worker that writes tickets, no code.
 * Don't ask what robot-surf means; just say which workers you're starting and for which tickets.
+* Asked to start or retry work, start it now. Never skip it because an earlier run failed: the cause (a permission, a token, a setting) may be fixed since. If the new run fails too, report that run's failure.
