@@ -54,11 +54,17 @@ ResolveRefusal = Literal[
 
 @dataclass(frozen=True)
 class ChannelRef:
-    """One approval prompt as sent: the channel's message ref, when, and to whom."""
+    """One approval prompt as sent: the channel's message ref, when, and to whom.
+
+    PER-320: a prompt posted once in a shared thread is recorded for every approver (each
+    can see and answer it there), with the thread (``channel``, ``thread``) so its expiry
+    reminder goes there once rather than to each approver's own conversation."""
 
     ref: str
     at: datetime
     principal: str
+    channel: str | None = None
+    thread: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,7 +173,13 @@ def _row_to_approval(r: sqlite3.Row) -> Approval:
         decided_at=_dt(r["decided_at"]),
         expires_at=expires,
         channel_refs=tuple(
-            ChannelRef(c["ref"], datetime.fromisoformat(c["at"]), c["principal"])
+            ChannelRef(
+                c["ref"],
+                datetime.fromisoformat(c["at"]),
+                c["principal"],
+                c.get("channel"),
+                c.get("thread"),
+            )
             for c in json.loads(r["channel_refs"])
         ),
         created_at=created,
@@ -442,14 +454,25 @@ def by_resolved_event(conn: sqlite3.Connection, event_id: str) -> list[Approval]
 
 
 def add_channel_ref(
-    conn: sqlite3.Connection, approval_id: str, *, ref: str, at: datetime, principal: str
+    conn: sqlite3.Connection,
+    approval_id: str,
+    *,
+    ref: str,
+    at: datetime,
+    principal: str,
+    channel: str | None = None,
+    thread: str | None = None,
 ) -> bool:
     """Record that the prompt was sent. Returns False if this (ref, principal) is known.
 
     A re-prompt that the channel deduped returns the same ref, and the first send time is
-    the one that counts for the sent-before rule, so it is kept.
+    the one that counts for the sent-before rule, so it is kept. ``channel``/``thread``
+    (PER-320): the shared thread the one copy went to (see ``ChannelRef``).
     """
-    entry = json.dumps({"ref": ref, "at": iso(at), "principal": principal})
+    fields: dict[str, str] = {"ref": ref, "at": iso(at), "principal": principal}
+    if channel is not None and thread is not None:
+        fields.update(channel=channel, thread=thread)
+    entry = json.dumps(fields)
     cur = conn.execute(
         """UPDATE approvals SET channel_refs = json_insert(channel_refs, '$[#]', json(?))
            WHERE id = ? AND NOT EXISTS (

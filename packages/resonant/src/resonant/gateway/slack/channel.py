@@ -68,7 +68,10 @@ the adapter still works for everything else.
 
 **Approvals.** :meth:`request_approval` posts ``prompt.text()`` with Approve and Deny buttons
 (``blocks.approval_blocks``), in ``prompt.thread`` when set, else the principal's DM, deduped
-by ``approval_dedupe_key``. Pay gets no buttons (only a typed ``yes <code>``). A click
+by ``approval_dedupe_key``. PER-320: in a team channel's thread that is the one copy every
+approver answers; ``prompt.mention`` (a member asked) puts ``<@U…>`` for each of those
+principals' Slack identity on its first line, so they are notified (the edited outcome
+drops them). Pay gets no buttons (only a typed ``yes <code>``). A click
 becomes ``ApprovalReply(actor=resolve(slack:<clicker>), channel="slack", path="button",
 code=<the prompt's code>)`` into ``gate.resolve_reply``; only the approval's approvers count:
 anyone else gets an ephemeral "Only Justin or Brian can approve this." and nothing changes.
@@ -915,6 +918,8 @@ class SlackChannel:
                 return prev
             channel, thread_ts = await self._target(principal, uid, thread, dedupe_key)
             formatted = blocks.format_text(text, self.config.link_base)
+            if prompt is not None and (tags := self._tags(prompt.mention)):
+                formatted = f"{tags}\n{formatted}"  # PER-320: notify the approvers
             chunks = [formatted] if prompt is not None else split_text(formatted, blocks.MAX_CHUNK)
             claude = outbound.is_claude_send(dedupe_key)
             at = self.clock()
@@ -1136,6 +1141,18 @@ class SlackChannel:
         if not uids:
             self._refuse(principal, "principal has no slack identity")
         return uids[0]
+
+    def _tags(self, principals: tuple[str, ...]) -> str:
+        """``<@U…>`` for each principal's first Slack identity (PER-320); one without is left
+        out, never refused: a mention only notifies."""
+        uids: list[str] = []
+        for name in principals:
+            p = self.principals.get(name)
+            ids = p.identities if p is not None else ()
+            uid = next((i.partition(":")[2] for i in ids if i.startswith("slack:")), None)
+            if uid and uid not in uids:
+                uids.append(uid)
+        return " ".join(f"<@{u}>" for u in uids)
 
     def _refuse(self, principal: str, reason: str) -> NoReturn:
         with atomic(self.conn):

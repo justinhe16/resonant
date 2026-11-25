@@ -88,6 +88,8 @@ class Channel:
     name = "slack"
 
     def __init__(self) -> None:
+        # threaded: a prompt with a thread lands there (PER-320); else in a DM (no thread)
+        self.threaded = False
         self.prompts: list[tuple[str, ApprovalPrompt]] = []
         self.sent: list[tuple[str, str]] = []
         self._keys: set[str] = set()
@@ -108,7 +110,8 @@ class Channel:
         if key not in self._keys:
             self._keys.add(key)
             self.prompts.append((principal, prompt))
-        return MessageRef("slack", f"p:{len(self.prompts)}")
+        where = prompt.thread.thread if self.threaded and prompt.thread is not None else None
+        return MessageRef("slack", f"p:{len(self.prompts)}", where)
 
 
 class Executor:
@@ -303,14 +306,24 @@ async def test_the_fourth_open_request_is_refused(h: Harness) -> None:
 
 
 async def test_a_member_requested_run_still_needs_an_approvers_click(h: Harness) -> None:
+    h.channel.threaded = True
     code = h.run("miu")
     call = h.request(code, ("commit", "abc"))
-    prompts = await h.prompted(2)
+    prompts = await h.prompted(1)
     approval_id = prompts[0][1].approval_id
     a = ap.get_approval(h.db, approval_id)
     assert a is not None and a.approvers == ("justin", "brian") and a.requested_by == "miu"
-    # Miu isn't an approver: the copy in the thread goes to the first approver
-    assert [(p, pr.thread is not None) for p, pr in prompts] == [("justin", True), ("brian", False)]
+    # PER-320: Miu isn't an approver: one copy in the run's thread, addressed to Miu and
+    # tagging both approvers (no DMs); it counts as sent to each approver
+    await asyncio.sleep(0.05)
+    assert [(p, pr.thread is not None, pr.mention) for p, pr in h.channel.prompts] == [
+        ("miu", True, ("justin", "brian"))
+    ]
+    a = ap.get_approval(h.db, approval_id)
+    assert a is not None and {(c.principal, c.thread) for c in a.channel_refs} == {
+        ("justin", THREAD),
+        ("brian", THREAD),
+    }
     assert prompts[0][1].summary.startswith(f"{code} (for Miu) asks for ")
     assert not h.click(approval_id, "miu")
     await asyncio.sleep(0.05)

@@ -342,12 +342,11 @@ class WorkerRequests:
     async def _prompt(
         self, run: Run, task_id: str, needs: NeedsApproval, summary: str
     ) -> bool | None:
-        """Prompt the approvers (one copy in the run's thread). True: reached; False:
-        unreachable for good; None: retry."""
+        """Prompt the approvers: PER-320 one copy in the run's (shared) thread, addressed to
+        the requester, tagging the approvers when the requester isn't one. True: reached;
+        False: unreachable for good; None: retry."""
         thread = run_thread(self.conn, run)
-        approvers = needs.approvers
-        who = run.requester if run.requester in approvers else (approvers[0] if approvers else None)
-        in_thread = (who, thread) if who is not None and thread is not None else None
+        in_thread = (run.requester, thread) if thread is not None else None
         try:
             result = await prompt_approvers(
                 self.conn, self.channel, needs, task_id=task_id, now=self.clock,

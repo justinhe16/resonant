@@ -19,6 +19,7 @@ from resonant.gateway.channel import (
     ChannelRefused,
     ChannelSendError,
     MessageRef,
+    shared_thread,
 )
 from resonant.gateway.hub import ChannelHub
 from resonant.gateway.slack import SlackChannel
@@ -34,7 +35,7 @@ from resonant.gateway.slack.fixtures import (
 )
 from resonant.loop import NewTask
 from resonant.principals import Principals
-from resonant.runners.approve import prompt_approvers
+from resonant.runners.approve import prompt_approvers, remind_due
 from resonant.secrets import FakeKeychain, SecretMissing, SecretStore
 from resonant.store import approvals as ap
 from resonant.store import slack as slack_store
@@ -504,18 +505,133 @@ async def gw(db: sqlite3.Connection) -> AsyncIterator[tuple[World, PolicyGate]]:
 
 
 async def test_prompts_carry_buttons_in_the_askers_thread(gw: tuple[World, PolicyGate]) -> None:
+    # PER-320: an approver asked in a team channel's thread: one prompt, there; no DMs
     w, gate = gw
     await w.socket.deliver(mention(BRIAN, f"<@{BOT}> wipe it", ts="1700000000.000100"))
     d = await ask(w, gate, WIPE, thread="C0GENERAL:1700000000.000100")
-    by_channel = {p.channel: p for p in w.web.posts}
-    brian, justin = by_channel["C0GENERAL"], by_channel["D1JUSTIN"]
-    assert brian.thread_ts == "1700000000.000100" and justin.thread_ts is None
-    assert brian.buttons and justin.buttons
+    (brian,) = w.web.posts
+    assert (brian.channel, brian.thread_ts) == ("C0GENERAL", "1700000000.000100")
+    assert brian.buttons and "<@" not in brian.text  # an approver asked: nobody is tagged
     assert f"[{d.code}]" in brian.text and "This can't be undone" in brian.text  # L1 wording
-    assert len(slack_store.prompts(w.slack.conn)) == 2
+    assert len(slack_store.prompts(w.slack.conn)) == 1
+    row = ap.get_approval(w.slack.conn, d.approval_id)
+    assert row is not None
+    assert {(r.principal, r.ref, r.thread) for r in row.channel_refs} == {
+        (p, f"C0GENERAL:{brian.ts}", "C0GENERAL:1700000000.000100") for p in ("justin", "brian")
+    }
     # a repeat prompt is deduped
-    await prompt_approvers(w.slack.conn, w.slack, d, task_id="x", now=utcnow)
-    assert len(w.web.posts) == 2
+    assert row.task_id is not None
+    await prompt_approvers(w.slack.conn, w.slack, d, task_id=row.task_id, now=utcnow)
+    assert len(w.web.posts) == 1
+
+
+async def test_another_approver_answers_the_thread_prompt_a_member_cannot(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    w, gate = gw
+    await w.socket.deliver(mention(BRIAN, f"<@{BOT}> add it", ts="1700000000.000100"))
+    d = await ask(w, gate, ADD, thread="C0GENERAL:1700000000.000100")
+    (posted,) = w.web.posts
+    w.clock.now = utcnow() + timedelta(seconds=1)
+    await w.socket.deliver(
+        click(MIU, d.approval_id, d.code, ts=posted.ts, thread_ts="1700000000.000100")
+    )
+    assert w.web.ephemerals[-1]["text"] == "Only Justin or Brian can approve this."
+    await w.socket.deliver(
+        click(JUSTIN, d.approval_id, d.code, ts=posted.ts, thread_ts="1700000000.000100",
+              action_ts="1800000600.000001")
+    )  # fmt: skip
+    row = ap.get_approval(w.slack.conn, d.approval_id)
+    assert row is not None and (row.status, row.decided_by) == ("approved", "justin")
+    assert [u["ts"] for u in w.web.updates] == [posted.ts]
+    assert "Approved by Justin" in w.web.updates[0]["text"]
+
+
+async def test_a_typed_yes_from_another_approver_binds_the_thread_prompt(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    # the one copy counts as sent to every approver (the sent-before rule)
+    w, gate = gw
+    await w.socket.deliver(mention(BRIAN, f"<@{BOT}> add it", ts="1700000000.000100"))
+    d = await ask(w, gate, ADD, thread="C0GENERAL:1700000000.000100")
+    result = gate.resolve_reply(
+        ApprovalReply(
+            actor="justin", actor_identity=f"slack:{JUSTIN}", channel="slack",
+            raw_text=f"yes {d.code}", decision="approve", path="parser",
+            event_id="slack:C0GENERAL:1700000009.000100",
+            occurred_at=utcnow() + timedelta(seconds=1), code=d.code,
+        )
+    )  # fmt: skip
+    assert result.ok, result.reason
+
+
+async def test_a_members_thread_request_tags_every_approver_and_dms_nobody(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    w, gate = gw
+    await w.socket.deliver(mention(MIU, f"<@{BOT}> deploy it", ts="1700000000.000100"))
+    task_id = repo.insert_task(
+        w.slack.conn, NewTask(kind="chat", runner="local", priority=1, principal="brian")
+    )
+    d = gate.evaluate(Intent.for_tool(ADD, task_id=task_id, principal="brian", args={"x": 1}))
+    assert isinstance(d, NeedsApproval)
+    repo.set_status(w.slack.conn, task_id, "waiting", wait_reason="approval")
+    thread = MessageRef("slack", "C0GENERAL:1700000000.000100", "C0GENERAL:1700000000.000100")
+    result = await prompt_approvers(
+        w.slack.conn, w.slack, d, task_id=task_id, now=utcnow, in_thread=("miu", thread)
+    )
+    assert set(result.reached) == {"justin", "brian"} and result.unreachable == ()
+    (posted,) = w.web.posts
+    assert (posted.channel, posted.thread_ts) == ("C0GENERAL", "1700000000.000100")
+    assert posted.text.startswith(f"<@{JUSTIN}> <@{BRIAN}>\n[{d.code}]")
+    assert posted.buttons
+    row = ap.get_approval(w.slack.conn, d.approval_id)
+    assert row is not None and {r.principal for r in row.channel_refs} == {"justin", "brian"}
+    # the edited outcome drops the tags
+    w.clock.now = utcnow() + timedelta(seconds=1)
+    await w.socket.deliver(
+        click(BRIAN, d.approval_id, d.code, ts=posted.ts, thread_ts="1700000000.000100")
+    )
+    assert "<@" not in w.web.updates[-1]["text"]
+
+
+async def test_the_owners_own_dm_thread_keeps_a_copy_per_approver(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    # a 1:1 conversation isn't shared: each approver gets the prompt in their own, as before
+    w, gate = gw
+    await w.socket.deliver(
+        message(BRIAN, "add it", channel="D2BRIAN", channel_type="im", ts="1700000000.000100")
+    )
+    d = await ask(w, gate, ADD, thread="D2BRIAN:1700000000.000100")
+    by_channel = {p.channel: p for p in w.web.posts if p.buttons}
+    assert set(by_channel) == {"D2BRIAN", "D1JUSTIN"}
+    assert by_channel["D2BRIAN"].thread_ts == "1700000000.000100"
+    assert by_channel["D1JUSTIN"].thread_ts is None
+    row = ap.get_approval(w.slack.conn, d.approval_id)
+    assert row is not None and all(r.thread is None for r in row.channel_refs)
+
+
+async def test_a_thread_no_longer_followed_falls_back_to_each_approvers_dm(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    w, gate = gw  # no message in C0GENERAL:1700000000.000100: not a thread Cori posts in
+    await ask(w, gate, ADD, thread="C0GENERAL:1700000000.000100")
+    assert {p.channel for p in w.web.posts if p.buttons} == {"D2BRIAN", "D1JUSTIN"}
+
+
+async def test_a_thread_prompts_reminder_goes_once_in_the_thread(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    w, gate = gw
+    await w.socket.deliver(mention(BRIAN, f"<@{BOT}> add it", ts="1700000000.000100"))
+    d = await ask(w, gate, ADD, thread="C0GENERAL:1700000000.000100")
+    n = len(w.web.posts)
+    assert await remind_due(w.slack.conn, w.slack, d.expires_at - timedelta(minutes=10)) == 1
+    (reminder,) = w.web.posts[n:]
+    assert (reminder.channel, reminder.thread_ts) == ("C0GENERAL", "1700000000.000100")
+    assert reminder.text.startswith(f"[{d.code}] still waiting")
+    assert await remind_due(w.slack.conn, w.slack, d.expires_at - timedelta(minutes=9)) == 0
 
 
 async def test_an_approvers_click_resolves_and_edits_every_prompt(
@@ -774,3 +890,12 @@ def test_brain_history_follows_the_conversations_channel(db: sqlite3.Connection)
     assert channel_of(db, other.id) == "imessage" and channel_of(db, None) == "imessage"
     assert channel_of(db, "missing") == "imessage"
     assert {"imessage", "slack"} <= OWNER_SOURCES
+
+
+def test_shared_thread_is_a_team_channels_thread_only() -> None:
+    assert shared_thread(MessageRef("slack", "C0GENERAL:1.2", "C0GENERAL:1.1"))
+    assert shared_thread(MessageRef("slack", "G0PRIVATE:1.2", "G0PRIVATE:1.1"))
+    assert not shared_thread(MessageRef("slack", "D1JUSTIN:1.2", "D1JUSTIN:1.1"))  # a DM
+    assert not shared_thread(MessageRef("slack", "C0GENERAL:1.2"))  # not in a thread
+    assert not shared_thread(MessageRef("imessage", "guid"))
+    assert not shared_thread(None)
