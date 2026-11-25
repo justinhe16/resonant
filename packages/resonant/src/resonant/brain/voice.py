@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from resonant.runners.reports import MergedBy
 
 TextKind = Literal["outcome", "pulse", "briefing"]
+Audience = Literal["owner", "team"]
 KINDS: tuple[TextKind, ...] = ("outcome", "pulse", "briefing")
 Outcome = Literal[
     "opened_pr",
@@ -214,7 +215,10 @@ class Day:
 class Facts:
     """What a text says. ``going``: names of work still going (status, never news).
     ``approvals``: approval codes, for the closing line only. ``tail``: code-built lines
-    appended verbatim after the prose. Neither reaches Claude (:meth:`prompt_json`)."""
+    appended verbatim after the prose. Neither reaches Claude (:meth:`prompt_json`).
+    ``next_step`` (PER-323): a code-built suggested next step, said last, in place of ``No
+    action needed.``. ``audience`` (PER-323): ``team`` when the text goes to the teammate who
+    asked, in their thread, not to the owner."""
 
     kind: TextKind
     items: tuple[Item, ...]
@@ -222,6 +226,8 @@ class Facts:
     day: Day | None = None
     approvals: tuple[str, ...] = ()
     tail: tuple[str, ...] = ()
+    next_step: str | None = None
+    audience: Audience = "owner"
 
     def prompt_json(self) -> str:
         """The facts Claude sees, as sorted JSON: no approval codes, no tail, no ``needs``."""
@@ -420,6 +426,10 @@ SYSTEM_PROMPT = (
     "Resonant adds that line itself. Don't quote an ask word for word or cut it off; say what "
     "it was about. Reply with the message only, at most {max_chars} characters."
 )
+TEAM_LINE = (
+    "This text goes to the teammate who asked for the run, in their work thread, not to the "
+    "owner: write it to them."
+)
 KIND_LINES: dict[TextKind, str] = {
     "outcome": "One run just ended. One or two sentences.",
     "pulse": "This is the hourly update: what changed since the last one. Two to four sentences.",
@@ -438,7 +448,8 @@ def prompt(facts: Facts, max_chars: int) -> str:
     """The one-shot's stdin: the facts in a tag (every string flattened, no angle brackets),
     then what kind of text to write."""
     del max_chars  # the system prompt carries the limit
-    return f"<facts>{facts.prompt_json()}</facts>\n{KIND_LINES[facts.kind]}\n"
+    team = f"{TEAM_LINE}\n" if facts.audience == "team" else ""
+    return f"<facts>{facts.prompt_json()}</facts>\n{KIND_LINES[facts.kind]}\n{team}"
 
 
 # --- assembly --------------------------------------------------------------------------------
@@ -507,8 +518,13 @@ def record_text(text: str) -> str:
 
 
 def finish(prose: str, facts: Facts) -> str:
-    """The text to send: the prose, the code-built tail lines, the closing line."""
-    return "\n".join([prose, *facts.tail, closing_line(facts)])
+    """The text to send: the prose, the code-built tail lines, the closing line. A suggested
+    next step (PER-323) is said last, in place of ``No action needed.``."""
+    closing = closing_line(facts)
+    if facts.next_step is None:
+        return "\n".join([prose, *facts.tail, closing])
+    ends = [facts.next_step] if closing == NO_ACTION else [closing, facts.next_step]
+    return "\n".join([prose, *facts.tail, *ends])
 
 
 # --- the guard -------------------------------------------------------------------------------
@@ -744,6 +760,8 @@ def outcome_facts(
     lines: Sequence[str] = (),
     also: str | None = None,
     going: Sequence[str] = (),
+    next_step: str | None = None,
+    audience: Audience = "owner",
 ) -> Facts | None:
     """The facts of a run's end text, or None for a state with nothing to voice. The tail
     holds what code keeps verbatim: ``warn`` (⚠ alerts, an unrevoked token), the ⚠ lines of
@@ -757,7 +775,8 @@ def outcome_facts(
         tail.append("I'll merge it when CI is green.")
     if also:
         tail.append(also)
-    return Facts("outcome", (item,), going=tuple(going), tail=tuple(dict.fromkeys(tail)))
+    return Facts("outcome", (item,), going=tuple(going), tail=tuple(dict.fromkeys(tail)),
+                 next_step=next_step, audience=audience)  # fmt: skip
 
 
 def merged_facts(

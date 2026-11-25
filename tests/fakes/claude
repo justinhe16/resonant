@@ -10,7 +10,8 @@ pid files.
 
 Like the real session (docs/repos-plan.md D10) it pushes its branch to ``origin``, opens the PR with
 ``gh pr create`` and waits with ``gh pr checks --watch`` (both are the test's fake gh); ``--no-push``
-and ``--no-pr`` skip those, and ``--ci-fixes N`` makes it push N more commits as if CI had failed.
+and ``--no-pr`` skip those (``--step JSON``, repeatable: a Bash call and its result shown in the
+work turn, PER-323), and ``--ci-fixes N`` makes it push N more commits as if CI had failed.
 
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
 maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, diskgrow, diskpartial, makefile, github, noresult, tokens,
@@ -197,6 +198,8 @@ ap.add_argument("--job-note")  # PER-302: `resonant job-note '<json>'` after the
 ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
 ap.add_argument("--bash", action="append", default=[])  # Bash tool calls shown, not run (TR-1)
+# PER-323: a Bash call and its result, shown in the work turn: {"command", "result", "error"}
+ap.add_argument("--step", action="append", default=[])
 ap.add_argument("--self-op", action="append", default=[])  # resonant restart|update, in order
 ap.add_argument("--rc", default="ok", choices=("ok", "error", "none"))
 ap.add_argument("--owner-turn")
@@ -586,6 +589,14 @@ def work(resumed: bool) -> bool:
 
     if args.sleep:
         time.sleep(args.sleep)
+
+    for n, raw in enumerate(args.step):  # PER-323: calls whose results show milestones
+        spec = json.loads(raw)
+        tid = f"toolu_step_{n}"
+        emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tid,
+              "name": "Bash", "input": {"command": spec["command"]}}]}})  # fmt: skip
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+              "is_error": bool(spec.get("error")), "content": spec.get("result", "")}]}})  # fmt: skip
 
     if args.echo_token:  # a session that prints its own credentials into the transcript
         creds = os.path.join(run_dir, "creds")

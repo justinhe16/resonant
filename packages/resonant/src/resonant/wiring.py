@@ -616,6 +616,8 @@ def build_stack(
         instance=settings.instance.name,
         bridge=bridge,
         requests=requests,
+        # PER-323: a run's milestones in its conversation (default: thread on Slack instances)
+        milestones_mode=settings.runs.milestones_for(settings.channels),
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude

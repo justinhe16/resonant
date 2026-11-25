@@ -54,6 +54,12 @@ channels:
 #     room: pulse                       # a channels.slack.rooms key; null (default) is off
 #     quiet_hours: false                # true: skip pulse.quiet_hours like the owner pulse
 
+# PER-323: a run's milestone lines (PR opened, CI failed and being fixed, review asked for
+# changes, merged, deployed to staging) in the asking thread, each once, after a minute of work.
+# The default with channels.slack on is thread; off posts only the start and final result.
+# runs:
+#   milestones: thread                  # thread | off
+
 # PER-290 (two daemons, one checkout): Ollama and keep-awake stay personal Resonant's (Cori
 # reads these as false and refuses them true; she uses the owner's Ollama at 127.0.0.1:11434),
 # and code deploys come from personal Resonant (Cori's /update, update_resonant and her workers'

@@ -1405,6 +1405,30 @@ class BrainConfig(_Section):
         return _absolute(v, "brain.rg_path") if v is not None else None
 
 
+class RunsConfig(_Section):
+    """``runs`` (PER-323): how a run reports back in the conversation that asked for it.
+
+    ``milestones``: ``thread`` posts a short, code-built line at a run's meaningful points (PR
+    opened, CI failed and being fixed, review asked for changes, merged, deployed to staging),
+    each at most once, after the run has worked a minute (a quicker run posts only its final
+    result); ``off`` posts none. Unset: ``thread`` when ``channels.slack.enabled`` (a team
+    instance), else ``off`` (the owner's iMessage stays as quiet as before)."""
+
+    milestones: Literal["thread", "off"] | None = None
+
+    @field_validator("milestones", mode="before")
+    @classmethod
+    def _off(cls, v: object) -> object:
+        # YAML 1.1 reads a bare off as False: `milestones: off` means "off".
+        return "off" if v is False else v
+
+    def milestones_for(self, channels: ChannelsConfig) -> Literal["thread", "off"]:
+        """The effective ``milestones`` mode for an instance with these channels."""
+        if self.milestones is not None:
+            return self.milestones
+        return "thread" if channels.slack.enabled else "off"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -1439,6 +1463,7 @@ class Settings(BaseSettings):
     watchers: WatchersConfig = Field(default_factory=WatchersConfig)  # PER-299
     jobs: JobsConfig = Field(default_factory=JobsConfig)  # PER-302: seeded jobs
     brain: BrainConfig = Field(default_factory=BrainConfig)
+    runs: RunsConfig = Field(default_factory=RunsConfig)  # PER-323: milestones
     # PER-301: another instance's bridge to personal Resonant (None: no forwarding)
     notify_owner: NotifyOwnerConfig | None = None
     # PER-306: the other instances the dashboard can switch to (empty: no switcher)
