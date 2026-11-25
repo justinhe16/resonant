@@ -20,6 +20,15 @@ message bodies). In order, each left out when it has nothing to say:
 
 Nothing at all: ``Quiet day.``. Code-built, no voice.
 
+**Blocks** (PER-332). A report may also carry ``state.blocks``: Slack Block Kit blocks the
+extension builds itself (a header, sections with fields, a table, ...). When at least one
+listed report has valid ones (``slack.blocks.valid_blocks``: a list of 1..50 objects with a
+string ``type``, no ``<!channel>``-style mention), the post also carries blocks
+(:func:`render_blocks`): each report's own blocks, or a plain-text section of its title and
+lines when it has none, then a section with the runs and approvals lines, a divider between
+parts. Over 50 blocks in all: no blocks. The text above is always posted with them as the
+notification fallback, and alone when Slack rejects the blocks (the adapter's fallback).
+
 **Once a day**: keyed ``digest:<local date>`` through ``pulse_job.deliver`` with its own
 records (``digest.inflight:``), so a restart, a catch-up or a rerun never posts twice; recorded
 as a ``briefing`` system text of ``room:<key>``. It marks nothing told: the owner's pulse items
@@ -44,6 +53,7 @@ from resonant import killswitch
 from resonant.extensions.notify import clean_text
 from resonant.extensions.pulse_job import deliver, prune_inflight
 from resonant.gateway.channel import ChannelError
+from resonant.gateway.slack.blocks import MAX_BLOCKS, SECTION_MAX, valid_blocks
 from resonant.store import approvals as approvals_store
 from resonant.store import pulse as pulse_store
 from resonant.store import runs as runs_store
@@ -87,6 +97,7 @@ class Report:
     title: str
     lines: tuple[str, ...] = ()
     more: int = 0
+    blocks: tuple[dict[str, Any], ...] = ()  # the report's own ``state.blocks`` (PER-332)
 
 
 @dataclass(frozen=True)
@@ -119,6 +130,21 @@ def digest_lines(state: Any) -> tuple[list[str], int]:
     return lines[:REPORT_LINES], max(0, len(lines) - REPORT_LINES)
 
 
+def report_blocks(state: Any) -> list[dict[str, Any]]:
+    """A report's ``state.blocks`` when valid (``valid_blocks``), else none (logged when the
+    key is there but unusable)."""
+    if not isinstance(state, dict):
+        return []
+    raw: object = cast(dict[str, Any], state).get("blocks")
+    if raw is None:
+        return []
+    checked = valid_blocks(raw)
+    if checked is None:
+        log.warning("digest: a report's blocks are invalid; using its text")
+        return []
+    return checked
+
+
 def _reports(conn: sqlite3.Connection, sources: list[str], now: datetime) -> tuple[Report, ...]:
     if not sources:
         return ()
@@ -128,7 +154,8 @@ def _reports(conn: sqlite3.Connection, sources: list[str], now: datetime) -> tup
     out: list[Report] = []
     for item in items:
         lines, more = digest_lines(item.state)
-        out.append(Report(item.source, item.title, tuple(lines), more))
+        blocks = tuple(report_blocks(item.state))
+        out.append(Report(item.source, item.title, tuple(lines), more, blocks))
     return tuple(out)
 
 
@@ -201,6 +228,38 @@ def render(d: RoomDigest) -> str:
     lines += [x for x in (runs_line(d), approvals_line(d)) if x]
     text = "\n".join(lines)
     return text if len(text) <= MAX_CHARS else text[: MAX_CHARS - 1].rstrip() + "…"
+
+
+def _plain(text: str) -> dict[str, Any]:
+    shown = text if len(text) <= SECTION_MAX else text[: SECTION_MAX - 1] + "…"
+    return {"type": "section", "text": {"type": "plain_text", "text": shown, "emoji": True}}
+
+
+def render_blocks(d: RoomDigest) -> list[dict[str, Any]] | None:
+    """The post's Block Kit blocks (see "Blocks"), or None: no report has blocks, or they
+    come to more than ``MAX_BLOCKS``."""
+    if not any(r.blocks for r in d.reports):
+        return None
+    parts: list[list[dict[str, Any]]] = []
+    for r in d.reports:
+        if r.blocks:
+            parts.append(list(r.blocks))
+        else:
+            lines = [r.title, *(f"• {x}" for x in r.lines)]
+            lines += [f"+{r.more} more"] if r.more else []
+            parts.append([_plain("\n".join(lines))])
+    core = [x for x in (runs_line(d), approvals_line(d)) if x]
+    if core:
+        parts.append([_plain("\n".join(core))])
+    out: list[dict[str, Any]] = []
+    for part in parts:
+        if out:
+            out.append({"type": "divider"})
+        out += part
+    if len(out) > MAX_BLOCKS:
+        log.warning("digest: %d blocks is over %d; posting the text alone", len(out), MAX_BLOCKS)
+        return None
+    return out
 
 
 def sections(d: RoomDigest) -> list[str]:
@@ -287,8 +346,9 @@ async def send_room_digest(
 ) -> dict[str, Any]:
     """Post the digest for the local date of ``due`` (else ``now``) to ``briefing.audience``'s
     room, once (``digest:<date>``; ``manual``: ``digest:manual:<date>:<HHMM>``). Returns
-    ``{posted, date, sections?, chars?, skipped?}`` (``skipped``: ``paused``, ``duplicate``,
-    ``failed``); never the text. ``owner`` gets one DM per outage of the room."""
+    ``{posted, date, sections?, chars?, blocks?, skipped?}`` (``blocks``: how many went with
+    it; ``skipped``: ``paused``, ``duplicate``, ``failed``); never the text. ``owner`` gets
+    one DM per outage of the room."""
     room = settings.briefing.room
     assert room is not None, "briefing.audience is the owner"
     local = (due or now).astimezone(ZoneInfo(settings.timezone))
@@ -301,9 +361,12 @@ async def send_room_digest(
         _drop_unsent(conn, keep=INFLIGHT + key)
     d = gather(conn, settings, now)
     text = render(d)
+    rich = render_blocks(d)
 
     async def post(body: str, dedupe: str) -> object:
-        return await channel.post_room(room, body, dedupe_key=dedupe)
+        # blocks go only with this run's own text (a stale record's resend is text alone)
+        extra = rich if dedupe == key and body == text else None
+        return await channel.post_room(room, body, dedupe_key=dedupe, blocks=extra)
 
     try:
         status, _ = await deliver(
@@ -324,7 +387,8 @@ async def send_room_digest(
     _room_up(conn)
     if status == "duplicate":
         return {"posted": False, "date": day, "skipped": "duplicate"}
-    return {"posted": True, "date": day, "sections": sections(d), "chars": len(text)}
+    out = {"posted": True, "date": day, "sections": sections(d), "chars": len(text)}
+    return out | ({"blocks": len(rich)} if rich else {})
 
 
 __all__ = [
@@ -339,6 +403,8 @@ __all__ = [
     "gather",
     "manual_dedupe_key",
     "render",
+    "render_blocks",
+    "report_blocks",
     "room_principal",
     "runs_line",
     "sections",

@@ -646,12 +646,23 @@ class RoomChannel(FakeChannel):
         default_factory=list[tuple[str, str, str | None]]
     )
     fail: bool = False
+    blocks: list[list[dict[str, Any]] | None] = field(
+        default_factory=list[list[dict[str, Any]] | None]
+    )  # each post's blocks (PER-332)
 
-    async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
+    async def post_room(
+        self,
+        key: str,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> MessageRef:
         if self.fail:
             raise ChannelSendError("slack: chat.postMessage failed: not_in_channel")
         if dedupe_key is None or dedupe_key not in self.keys:
             self.posts.append((key, text, dedupe_key))
+            self.blocks.append(blocks)
             if dedupe_key is not None:
                 self.keys.add(dedupe_key)
         return MessageRef("slack", f"room:{len(self.posts)}")
@@ -740,6 +751,77 @@ async def test_report_lines_are_capped() -> None:
     assert rd.digest_lines(None) == ([], 0)
     d = rd.RoomDigest(reports=(rd.Report("acme", "T", ("a",), 3),))
     assert rd.render(d) == "T\n• a\n+3 more"
+
+
+HEADER = {"type": "header", "text": {"type": "plain_text", "text": "Acme daily"}}
+TABLE = {"type": "section", "fields": [{"type": "mrkdwn", "text": "*Orders*\n141"}]}
+
+
+async def test_a_report_with_blocks_makes_the_digest_carry_them_with_the_text() -> None:
+    # PER-332: the extension's own Block Kit, other reports as plain sections, core lines
+    # last; the text is unchanged and goes with them as the fallback
+    room = {**ROOM, "reports": ["acme", "other"]}
+    async with harness(briefing=room, at=MONDAY_9) as h:
+        ch = RoomChannel()
+        report(h.db, "acme", "Acme daily", {"digest": ["Orders 141"], "blocks": [HEADER, TABLE]},
+               MONDAY_9)  # fmt: skip
+        report(h.db, "other", "Other", {"digest": ["one"]}, MONDAY_9)
+        approval(h.db, "A7", MONDAY_9 - timedelta(minutes=40))
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=MONDAY_9)
+        assert out["posted"] is True and out["blocks"] == 6
+        ((_, text, _),) = ch.posts
+        assert text.splitlines()[:2] == ["Acme daily", "• Orders 141"]
+        plain = {"type": "plain_text", "emoji": True}
+        assert ch.blocks == [[
+            HEADER, TABLE,
+            {"type": "divider"},
+            {"type": "section", "text": {**plain, "text": "Other\n• one"}},
+            {"type": "divider"},
+            {"type": "section", "text": {**plain, "text": "✋ 1 approval waiting (oldest 40m)"}},
+        ]]  # fmt: skip
+
+
+async def test_no_blocks_without_a_report_that_has_them() -> None:
+    async with harness(briefing=ROOM, at=MONDAY_9) as h:
+        ch = RoomChannel()
+        report(h.db, "acme", "Acme daily", {"digest": ["Orders 141"]}, MONDAY_9)
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=MONDAY_9)
+        assert "blocks" not in out and ch.blocks == [None]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not a list",
+        [],
+        [{"no": "type"}],
+        [{"type": "section", "text": {"type": "mrkdwn", "text": "<!here> look"}}],
+        [{"type": "divider"}] * 51,
+    ],
+)
+def test_invalid_report_blocks_are_ignored(bad: Any) -> None:
+    assert rd.report_blocks({"blocks": bad}) == []
+    assert rd.report_blocks({"digest": ["x"]}) == [] and rd.report_blocks(None) == []
+    assert rd.report_blocks({"blocks": [HEADER]}) == [HEADER]
+
+
+def test_a_digest_over_fifty_blocks_is_text_only() -> None:
+    many = tuple({"type": "divider"} for _ in range(30))
+    d = rd.RoomDigest(reports=(rd.Report("a", "A", blocks=many), rd.Report("b", "B", blocks=many)))
+    assert rd.render_blocks(d) is None
+    assert rd.render_blocks(rd.RoomDigest(reports=(rd.Report("a", "A", blocks=many),))) is not None
+
+
+async def test_a_retry_of_the_same_day_still_carries_blocks() -> None:
+    async with harness(briefing=ROOM, at=MONDAY_9) as h:
+        ch = RoomChannel(fail=True)
+        report(h.db, "acme", "Acme daily", {"digest": ["a"], "blocks": [HEADER]}, MONDAY_9)
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=MONDAY_9)
+        assert out["skipped"] == "failed"
+        ch.fail = False
+        # the same day's rerun resends its stored record: this run's text, so blocks too
+        out = await rd.send_room_digest(h.db, ch, OWNER, settings=h.settings, now=MONDAY_9)
+        assert out["posted"] is True and ch.blocks == [[HEADER]]
 
 
 async def test_the_room_digest_skips_while_paused() -> None:

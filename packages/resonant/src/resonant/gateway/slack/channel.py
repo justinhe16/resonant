@@ -159,6 +159,18 @@ WATCH_THREAD_PREFIX = "slack.watch_thread:"  # PER-299: threads a watcher's run 
 WATCH_THREAD_TTL = timedelta(days=14)
 LIST_PAGES = 5  # conversations.list pages looked at to find a channel by name
 _RATE_WINDOW = timedelta(minutes=1)
+# Slack's answers that mean "these blocks", not "this room": a room post then goes as text
+BLOCK_ERRORS = frozenset(
+    {"invalid_blocks", "invalid_blocks_format", "msg_blocks_too_long", "too_many_blocks"}
+)
+
+
+class SlackSendError(ChannelSendError):
+    """A Web API call failed; ``error`` is Slack's code (never a body)."""
+
+    def __init__(self, message: str, error: str) -> None:
+        super().__init__(message)
+        self.error = error
 
 
 class WatchRefused(ChannelError):
@@ -1003,19 +1015,38 @@ class SlackChannel:
             )
         return ref
 
-    async def post_room(self, key: str, text: str, *, dedupe_key: str | None = None) -> MessageRef:
+    async def post_room(
+        self,
+        key: str,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> MessageRef:
         """Post ``text`` to the room ``channels.slack.rooms[key]``. Any other key raises
         :class:`ChannelRefused` (audited ``slack.room_refused``). A failure is noted for
-        ``health()`` until the room's next post goes out (see "Rooms")."""
+        ``health()`` until the room's next post goes out (see "Rooms").
+
+        ``blocks`` (PER-332): Block Kit blocks for the post, with ``text`` (clipped to one
+        message) as the notification fallback. Blocks that :func:`blocks.valid_blocks`
+        refuses, or that Slack rejects (``BLOCK_ERRORS``), are dropped (logged, audited
+        ``slack.room_blocks_dropped``) and ``text`` is posted alone, as without blocks."""
         try:
-            ref = await self._post_room(key, text, dedupe_key=dedupe_key)
+            ref = await self._post_room(key, text, dedupe_key=dedupe_key, rich=blocks)
         except ChannelError as e:
             self._room_errors[key] = str(e).removeprefix(f"{CHANNEL_NAME}: ")
             raise
         self._room_errors.pop(key, None)
         return ref
 
-    async def _post_room(self, key: str, text: str, *, dedupe_key: str | None) -> MessageRef:
+    async def _post_room(
+        self,
+        key: str,
+        text: str,
+        *,
+        dedupe_key: str | None,
+        rich: list[dict[str, Any]] | None = None,
+    ) -> MessageRef:
         if not text:
             raise ValueError("cannot send an empty message")
         room = self.config.rooms.get(key)
@@ -1026,8 +1057,10 @@ class SlackChannel:
         if dedupe_key is not None and (prev := self._already_sent(dedupe_key)) is not None:
             return prev
         async with self._send_lock:
-            chunks = split_text(blocks.format_text(text, self.config.link_base), blocks.MAX_CHUNK)
-            first: str | None = None
+            formatted = blocks.format_text(text, self.config.link_base)
+            first = await self._post_blocks(key, room, formatted, rich, dedupe_key)
+            with_blocks = first is not None
+            chunks = [] if with_blocks else split_text(formatted, blocks.MAX_CHUNK)
             for i, chunk in enumerate(chunks, 1):
                 body = await self._call(
                     "chat.postMessage",
@@ -1056,10 +1089,50 @@ class SlackChannel:
                     room=key,
                     idempotency_key=dedupe_key,
                     length=len(text),
-                    chunks=len(chunks),
+                    chunks=len(chunks) or 1,
                     ref=ref.ref,
+                    blocks=len(rich) if with_blocks and rich is not None else 0,
                 )
         return ref
+
+    async def _post_blocks(
+        self,
+        key: str,
+        room: str,
+        text: str,
+        raw: list[dict[str, Any]] | None,
+        dedupe_key: str | None,
+    ) -> str | None:
+        """Post ``raw`` blocks with ``text`` as the fallback; the ts, or None when the caller
+        should post the text alone (no blocks, invalid ones, or Slack rejected them)."""
+        if raw is None:
+            return None
+        checked = blocks.valid_blocks(raw)
+        reason: str | None = None if checked is not None else "invalid"
+        if checked is not None:
+            fallback = text if len(text) <= blocks.MAX_CHUNK else text[: blocks.MAX_CHUNK - 1] + "…"
+            args = {"channel": room, "text": fallback, "blocks": checked, "unfurl_links": False}
+            try:
+                body = await self._call("chat.postMessage", args, None, dedupe_key)
+            except SlackSendError as e:
+                if e.error not in BLOCK_ERRORS:
+                    raise
+                reason = e.error
+            else:
+                ts = body.get("ts")
+                if isinstance(ts, str):
+                    return ts
+                raise ChannelSendError("slack: chat.postMessage returned no ts")
+        log.warning("slack: room %s blocks dropped (%s); posting the text alone", key, reason)
+        with atomic(self.conn):
+            audit(
+                self.conn,
+                "slack.room_blocks_dropped",
+                room=key,
+                idempotency_key=dedupe_key,
+                reason=reason,
+            )
+        return None
 
     async def _target(
         self, principal: str, uid: str, thread: MessageRef | None, dedupe_key: str | None
@@ -1132,7 +1205,7 @@ class SlackChannel:
                         chunks=chunks,
                     )
                 log.warning("slack: %s failed for %s: %s", method, principal, e.error)
-                raise ChannelSendError(f"slack: {method} failed: {e.error}") from None
+                raise SlackSendError(f"slack: {method} failed: {e.error}", e.error) from None
         raise ChannelRateLimited(f"slack: rate limited on {method}; not sent")
 
     def _resolve(self, principal: str) -> str:
