@@ -161,3 +161,40 @@ async def test_a_continuation_that_cant_answer_lets_the_folded_turn_run(
         assert len([t for t in said if "said no" in t]) == 1, said
         assert not [t for t in said if t.startswith("Not done")]
         assert not [r for r in ask_rows(w) if r["result"].get("status") == "folded"]
+
+
+async def test_a_continuation_that_asks_again_still_answers_the_folded_turn_once(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """The folded turn is answered by the continuation's reply even when that turn ends in a
+    new approval: the reply is posted (it answers the new message), then the prompt; the
+    folded turn never runs on its own."""
+    async with start(resonant_home, chat, tmp_path, slack=True) as w:
+        fake = w.slack
+        assert fake is not None
+        w.model.triage = CLAUDE
+        reason = {"approval_reason": "Watch the notes"}
+        w.claude(
+            turns=[{"when": "redeploy the staging site",
+                    "calls": [{"name": "create_watch", "args": {**WATCH, **reason}}],
+                    "answer": "{r0}"}],
+            continued=[{"calls": [{"name": "create_watch",
+                                   "args": {**WATCH, "what": "web app", **reason}}],
+                        "answer": "OK, the web app then: {r0}"}],
+        )  # fmt: skip
+        assert fake.inject(OWNER_ID, "can you redeploy the staging site", thread=THREAD)
+        await wait_until(lambda: any(CODE.search(t) for t in in_thread(fake)), 20)
+        await prompt_recorded(w)  # pyright: ignore[reportArgumentType]
+        m = next(CODE.search(t) for t in in_thread(fake) if CODE.search(t))
+        assert m is not None
+        n = len(fake.sent)
+        assert fake.inject(OWNER_ID, f"no {m.group(1)}", thread=THREAD)
+        assert fake.inject(OWNER_ID, "the web app, not the backend", thread=THREAD)
+        await wait_until(lambda: any(t.startswith("OK, the web app") for t in
+                                     in_thread(fake, n)), 30)  # fmt: skip
+        await wait_until(lambda: any(r["result"].get("status") == "folded"
+                                     for r in ask_rows(w)), 20)  # fmt: skip
+        await asyncio.sleep(0.5)
+        answers = [t for t in in_thread(fake, n) if not CODE.search(t)]
+        assert len([t for t in answers if t.startswith("OK, the web app")]) == 1, answers
+        assert len(w.audits("ask.folded")) == 1

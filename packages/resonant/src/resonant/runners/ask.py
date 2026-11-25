@@ -142,6 +142,7 @@ from resonant.brain.text import drop_pending_asks, flat
 from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, ClaudeSessionConfig, Settings
 from resonant.gate.codes import mask_codes
 from resonant.gate.shell import ASK_RULES, READ_RULES, TOOL_WRITE
+from resonant.gate.summary import plain_line
 from resonant.gateway.channel import (
     Channel,
     ChannelError,
@@ -1413,7 +1414,11 @@ class AskRunner:
         else it waits (that turn wakes it when its step ends)."""
         head = get_task(self.conn, into)
         hcp = head.checkpoint if head is not None else {}
-        if isinstance(hcp.get("reply"), str) and hcp.get("status") == "answered":
+        # answered: its reply is saved, or it went out and the turn now waits on a new yes
+        # (the approval phase drops ``reply`` but keeps ``status``)
+        if hcp.get("status") == "answered" and (
+            isinstance(hcp.get("reply"), str) or hcp.get("phase") == "approval"
+        ):
             return Done({"status": "folded", "kind": cp.get("kind"), "folded_into": into,
                          "untrusted": True, "proposed": False})  # fmt: skip
         if (
@@ -1735,15 +1740,20 @@ class AskRunner:
                                   and has_proposal(text), pending=pending, held=held,
                                   **extra)  # fmt: skip
 
-    @staticmethod
-    def _prompt_says_it(task: Task, bridge: ClaudeTools) -> bool:
+    def _prompt_says_it(self, task: Task, bridge: ClaudeTools) -> bool:
         """PER-328: a turn ending in an approval in a shared thread whose every change has a
-        plain line (PER-324): the one prompt there says it all."""
-        return (
-            bool(bridge.asked)
-            and all(i.call.reason for i in bridge.asked)
-            and shared_thread(thread_of(task, to=task.principal))
-        )
+        plain line (PER-324, as the prompt will show it): the one prompt there says it all.
+        Never for a turn that took others in (its text answers them too)."""
+        if not bridge.asked or not shared_thread(thread_of(task, to=task.principal)):
+            return False
+        if any(plain_line(i.call.reason) is None for i in bridge.asked):
+            return False
+        row = self.conn.execute(
+            "SELECT 1 FROM tasks WHERE runner = ? "
+            "AND json_extract(checkpoint, '$.folded_into') = ? LIMIT 1",
+            (NAME, task.id),
+        ).fetchone()
+        return row is None
 
     def _approval_pending(self, principal: str | None) -> bool:
         """Whether a yes would mean something now: an approval is open for ``principal``, or
@@ -1927,7 +1937,7 @@ class AskRunner:
         # Resonant's own turn: the cursor stays (PER-328: one that took in a newer turn read
         # the thread up to that turn's message)
         own = (approved or continued is not None) and not riders
-        cursor = rider_before[-1] if rider_before else before
+        cursor = rider_before[-1] if rider_before else (None if riders else before)
         if cursor is not None and not own and out.status == "answered":  # it read them
             with contextlib.suppress(sqlite3.Error), atomic(self.conn):
                 kv_set(self.conn, convo.since_kv(self.owner), cursor)
