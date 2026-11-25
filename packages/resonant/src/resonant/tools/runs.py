@@ -109,6 +109,7 @@ class RunnerApi(Protocol):
         report: Report = "digest",
         channel_ref: dict[str, Any] | None = None,
         requested_by: str | None = None,
+        announce: bool = False,
     ) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
@@ -480,7 +481,11 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             thread["channel_ref"] = task.channel_ref
         if asker is not None and asker != owner:
             thread["requested_by"] = asker
-        result = await claude.start_run(repo, ask, owner, merge=merge, report=report, **thread)
+        # PER-319: a run a slash command started is announced by its reply (``On it: R5 ·
+        # …``); one the brain started says ``On it: starting R5 (…).`` in its thread itself
+        announce = call is not None and call.origin != "explicit"
+        result = await claude.start_run(repo, ask, owner, merge=merge, report=report,
+                                        announce=announce, **thread)  # fmt: skip
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)

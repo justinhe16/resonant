@@ -37,6 +37,7 @@ from typing import Any, cast
 from resonant.brain.triage import SCHEMA as TRIAGE_SCHEMA
 from resonant.gateway.channel import (
     ApprovalPrompt,
+    ChannelError,
     ChannelRefused,
     MessageRef,
     SelfTestResult,
@@ -208,6 +209,9 @@ class FakeChannel:
         self.clock = clock
         self.sent: list[FakeSent] = []
         self.prompts: list[ApprovalPrompt] = []
+        # PER-319: an approval prompt to one of these principals raises its error (a DM the
+        # Slack app can't post: ``messages_tab_disabled``)
+        self.fail_approval: dict[str, ChannelError] = {}
         self.selftests = 0
         self._submit: Submit | None = None
         self._keys: dict[str, MessageRef] = {}
@@ -315,6 +319,8 @@ class FakeChannel:
         return ref
 
     async def request_approval(self, principal: str, prompt: ApprovalPrompt) -> MessageRef:
+        if (error := self.fail_approval.get(principal)) is not None:
+            raise error
         key = approval_dedupe_key(prompt.approval_id, principal)
         if key not in self._keys:
             self.prompts.append(prompt)

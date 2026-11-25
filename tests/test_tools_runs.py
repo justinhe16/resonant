@@ -16,7 +16,7 @@ import pytest
 from resonant.api import DaemonState
 from resonant.components import Components, build_components
 from resonant.config import RunnerConfig, RunnerRepo, Settings, load_settings
-from resonant.executor import ToolFailed
+from resonant.executor import CallContext, ToolFailed
 from resonant.gate import Allow, Deny, DryRun, Intent, NeedsApproval
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.router import commands
@@ -51,6 +51,7 @@ class FakeRunner:
         self.calls: list[tuple[Any, ...]] = []
         self.unattended: list[bool] = []
         self.reports: list[str] = []
+        self.announced: list[bool] = []
         self.merge_result: Merged | MergeQueued | Refused = Merged("R1", 41, (".mcp.json",))
         self.questions: list[OpenQuestion] = []
         self.limits: list[str] = []
@@ -69,9 +70,11 @@ class FakeRunner:
         *,
         merge: bool = False,
         report: str = "digest",
+        announce: bool = False,
     ) -> Started | Refused:
         self.calls.append(("start", repo, ask, principal, *(["merge"] if merge else [])))
         self.reports.append(report)
+        self.announced.append(announce)
         if self.missing:
             return Refused(self.missing)
         return Started("R1", repo or "", 30)
@@ -336,6 +339,20 @@ async def test_start_run(components: Components, runner: FakeRunner) -> None:
     assert runner.calls == [("start", "dori", "fix the typo", OWNER)]
     assert report_line(Intent.for_tool(components.registry.get(None, "start_run"), task_id="t",  # type: ignore[arg-type]
                                        principal=OWNER, args={}), out) == out["text"]  # fmt: skip
+
+
+async def test_start_run_announces_only_when_the_brain_started_it(
+    components: Components, runner: FakeRunner
+) -> None:
+    # PER-319: /run's reply is the run's start line; a run the brain started says its own
+    handler = cast(Any, components.handlers[(None, "start_run")])
+    args = {"repo": "demo", "ask": "fix the typo"}
+    for origin in ("explicit", "inferred"):
+        ctx = CallContext(secrets={}, idempotency_key=f"k-{origin}", task_id="t-none",
+                          origin=origin)  # fmt: skip
+        assert (await handler(args, ctx))["started"] is True
+    await call(components, "start_run", args)
+    assert runner.announced == [False, True, False]
 
 
 async def test_start_run_passes_free_text_to_the_runner(

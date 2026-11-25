@@ -143,6 +143,7 @@ from resonant.runners.job import JobRunner
 from resonant.runners.local import LocalRunner
 from resonant.runners.media import MediaRunner
 from resonant.runners.reminder import ReminderRunner
+from resonant.runners.status import StatusLines
 from resonant.runners.voice import ClaudeVoice
 from resonant.runners.watch import WatchRunner
 from resonant.runners.worker_desk import SelfOps
@@ -449,6 +450,8 @@ def build_stack(
         if isinstance(adapter, GateBound) and adapter.gate is None:
             adapter.bind_gate(components.gate)
     channel = ChannelHub(adapters, components.principals, conn)
+    # PER-319: a conversational task's terminal failure is said in its conversation
+    loop.on_failed = StatusLines(conn, channel).task_failed
     router = Router(
         conn,
         principals=components.principals,

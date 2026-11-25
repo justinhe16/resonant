@@ -158,7 +158,7 @@ from resonant.runner.workspace import (
     upstream_merges,
     write_session_credentials,
 )
-from resonant.runners import activity, reaper, worker_cli
+from resonant.runners import activity, reaper, status, worker_cli
 from resonant.runners.live import (
     RC_OFF_TIMEOUT_S,
     RC_TIMEOUT_S,
@@ -1415,6 +1415,7 @@ class ClaudeRunner:
         channel_ref: dict[str, Any] | None = None,
         requested_by: str | None = None,
         job: jobs_store.RunLink | None = None,
+        announce: bool = False,
     ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
         the resolver turns it into a registered repo, registering one it hasn't seen. No repo
@@ -1446,7 +1447,11 @@ class ClaudeRunner:
         linked in kv before the task exists, so its first prompt gets the job's memory
         (``registered_jobs.run_context``), its ``resonant job-note`` writes back, and its end
         text goes to the job's room when it has one. The task's checkpoint says
-        ``origin: scheduled``."""
+        ``origin: scheduled``.
+
+        ``announce`` (PER-319): the asking reply won't say the run started (the Claude brain
+        started it, not ``/run``): its first step says ``On it: starting R5 (…).`` in the
+        run's thread, once (``runners.status``; checkpoint ``announce``)."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         ask = ask.strip()
@@ -1502,6 +1507,7 @@ class ClaudeRunner:
                 **({"merge": True} if auto_merge else {}),
                 **({"local": local} if local is not None else {}),
                 **({"job": job.job, "origin": "scheduled"} if job is not None else {}),
+                **({"announce": True} if announce else {}),
             },
         )
         try:
@@ -2044,12 +2050,44 @@ class ClaudeRunner:
             return self._defer(task, "busy")  # waits without holding a Claude slot
         self._working.add(run.code)  # nothing awaited since the check
         try:
+            if task.checkpoint.get("announce") is True:
+                await self._announce(task, run)
             return await self._drive(task, run, ctx)
         except asyncio.CancelledError:
             await self._on_cancelled(run.code)
             raise
         finally:
             self._working.discard(run.code)
+
+    async def _announce(self, task: Task, run: Run) -> None:
+        """PER-319: ``On it: starting R5 (…).`` in the run's thread, once per task (the
+        channel dedupes ``status:<task>:started``, so a retry or restart never repeats it).
+        A run with no thread (iMessage) stays as quiet as before."""
+        if run_thread(self.conn, run) is None:
+            return
+        text = status.start_line(run.code, run.ask)
+        try:
+            await self._send_run(run, text, dedupe_key=status.status_key(task.id, status.STARTED))
+        except ChannelError as e:
+            log.warning("run start line not sent", extra={"run": run.code,
+                                                          "error": type(e).__name__})  # fmt: skip
+
+    async def _say_failed(self, run: Run) -> None:
+        """PER-319: a failed or cancelled run's ``Couldn't finish that: …`` in its thread,
+        once (``status:<task>:failed``), after its end text. A run with no thread (iMessage)
+        has its end text alone, as before."""
+        if run.task_id is None or run_thread(self.conn, run) is None:
+            return
+        if run.status == "cancelled":
+            why = f"{run.code} was cancelled"
+        else:
+            why = f"{run.code} failed ({status.plain_reason(run.failure)})"
+        key = status.status_key(run.task_id, status.FAILED)
+        try:
+            await self._send_run(run, status.failed_line(why), dedupe_key=key)
+        except ChannelError as e:
+            log.warning("run failure line not sent", extra={"run": run.code,
+                                                            "error": type(e).__name__})  # fmt: skip
 
     def _defer(self, task: Task, why: str) -> Wait:
         # A busy slot or repo lock is a `resource` wait (PER-259), not a usage reset; the run's
@@ -3492,6 +3530,8 @@ class ClaudeRunner:
             await self._send_reply(run, watching=watching, note=note)
         except ChannelError as e:
             return Fail(f"reply failed: {e}", retryable=True)
+        if run.status in ("failed", "cancelled"):
+            await self._say_failed(run)
         if run.status == "failed":
             return Fail(run.failure or "failed")
         return Done({"run": run.code, "status": run.status})

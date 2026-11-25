@@ -1658,8 +1658,8 @@ One step answers the whole task, unless it waits for an approval. In this order:
 - **Pinned** with `ctx.save` before it is gated (direct) or run or prompted (model), so `idempotency_key(task_id, step_no, call_index, intent.hash)` stays the same across retries, waits and restarts.
 - **Resume** (`ToolCore.resume`): `executor.recorded(key)` first. Succeeded: replay the report, no gate call. Started: ambiguous, reported (`Not sure whether <summary> ran…`) and never re-run. Failed: the definite failure is reported. None: `gate.evaluate`.
 - `Allow`: `executor.execute(intent, decision, step_no=pinned, call_index=pinned)`. The reply is code-built: `Saved note 3: "buy milk"`, `Deleted note 3.`, `Cleared 4 notes.`, `⏰ Reminder 3 set for 3:20pm: "stretch"` (the due time from `format_due`), `Cancelled reminder 3.`, `Restarting Resonant…` (builtins in `REPORTS`; see [Ops](#ops-resonantops-resonanttoolsops)), else `Done: <summary>`. When the approval was a `yes always` that saved a standing allow, the line `Rule added: don't ask before running <tool>[ in <scope>] (rule N)` follows. A definite failure replies `Failed: <summary>` with the handler's `ToolFailed` message. `<summary>` uses the ops heading when there is one (`Failed: update Resonant (…)`), as approval prompts and dry-run replies do.
-- `NeedsApproval`: `runners.approve.prompt_approvers` sends `channel.request_approval(approver, ApprovalPrompt)` to **every** approver in order and records each sent ref with `approvals.add_channel_ref(id, ref, at=now(), principal)`, then `Wait("approval", wake_at=expires_at)`. PER-320: when the ask came from a shared thread (`shared_thread`: a team channel's thread, not a 1:1), **one** copy goes there instead (below, **Approval sends**). Every pending step re-prompts (a spurious wake, a crash between save and prompt); the channel dedupes by `approval_dedupe_key`, and the first send time is kept. An approver the channel refuses (`ChannelRefused`: no identity) is skipped and audited `approval.unreachable`, and the others still get the prompt; the task fails for good only if **no** approver was reachable. Any other `ChannelError` is a retryable `Fail` after the remaining approvers are tried.
-- `DryRun`: `Dry run: would <summary>`. `Deny`: `Not done.` (`NOT_APPROVED`), `Not done: the approval for <summary> expired.` (`APPROVAL_EXPIRED`), `Not done: that approval was already used.` (`APPROVAL_USED`), else `Not done: <reason>.`
+- `NeedsApproval`: `runners.approve.prompt_approvers` sends `channel.request_approval(approver, ApprovalPrompt)` to **every** approver in order and records each sent ref with `approvals.add_channel_ref(id, ref, at=now(), principal)`, then `Wait("approval", wake_at=expires_at)`. PER-320: when the ask came from a shared thread (`shared_thread`: a team channel's thread, not a 1:1), **one** copy goes there instead (below, **Approval sends**). Every pending step re-prompts (a spurious wake, a crash between save and prompt); the channel dedupes by `approval_dedupe_key`, and the first send time is kept. An approver the channel refuses (`ChannelRefused`: no identity) is skipped and audited `approval.unreachable`, and the others still get the prompt; the task fails for good only if **no** approver was reachable. Any other `ChannelError` (PER-319): when at least one copy was delivered, it is audited `approval.send_failed` (`approver`, `error`: type and body-free reason, redacted) and skipped, and the task waits for an answer from those who got it (one approver's DM with Slack's Messages tab off doesn't fail the ask; the skipped approver is tried again on the next pending step, deduped); only when **no** copy was delivered is it a retryable `Fail` after the remaining approvers are tried, and once the retries are spent the asking conversation hears `Couldn't finish that: I couldn't send the approval (…)` (**Status lines**, below). When the prompt isn't in the asking conversation (`PromptResult.here` false: a member's ask from a Slack DM, whose prompts go to each approver), a threaded conversation hears `Waiting on an approval from <approvers>.` once per approval.
+- `DryRun`: `Dry run: would <summary>`. `Deny`: `Not done.` (`NOT_APPROVED`), `Not done: the approval for <summary> expired.` (`APPROVAL_EXPIRED`), `Not done: that approval was already used.` (`APPROVAL_USED`), else `Not done: <reason>.` PER-319: in a threaded conversation a denial or expiry after an approval (the single call or a batch) is followed by one `Couldn't finish that: <Name> said no.` / `Couldn't finish that: the approval expired before anyone answered.` (`status.not_approved` reads the task's newest approval; `reply_meta.meta.failure` keeps it for a resend; key `status:<task>:failed`). iMessage keeps its `Not done …` reply alone.
 - After an approval or a direct call there are no more model rounds: the reply is templated.
 
 **Batches** (BA-1; the brain loop and the Claude bridge, never the intents path). A runner that passes `batch=` to `_call_tool` / `CallScope` keeps proposing after the gate asks: the call joins the task's batch (`ToolCore._join`), and `_call_tool` returns `CallResult(..., asked=BatchItem, decision=NeedsApproval)` with `data = {status: "asked the owner", change: <summary>, note: ASKED_NOTE}` (never the code) instead of a `Wait`. When the turn ends, `close_batch(task, principal, items, lines, ctx, spans, pin=, decision=)` pins `checkpoint.batch` (items, in order) with `effects = lines` (the turn's code-built lines: what ran, and the refusal that ended it if one did; the model's own words give way) and the turn's taint, drops a done `call`, and asks. The step (`_batch`):
@@ -1679,9 +1679,13 @@ async prompt_approvers(conn, channel, decision: NeedsApproval, *, task_id, now) 
 # other approver gets a plain yes / no, the summary's code-built note cut (gate.codes.without_offer)
 batch_prompt(batch: ApprovalBatch) -> ApprovalPrompt            # BA-1: lines, the batch id as approval_id
 async prompt_batch(conn, channel, batch, *, now) -> PromptResult  # to the owner; the ref on every approval
-PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: ChannelError | None)
-    .retry            # a transient ChannelError: Fail(retryable=True)
+PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: ChannelError | None,
+             failed: tuple[str, ...] = (), here: bool = False)
+    .retry            # a transient ChannelError and no copy delivered: Fail(retryable=True)
     .none_reachable   # no error and nobody reached: fail for good
+    # PER-319: failed = approvers whose copy failed (not refused) and was skipped because another
+    # got one (each audited approval.send_failed); here = the asking conversation got a copy
+    # (the shared thread's one copy, or the asker's own prompt)
 # PER-320 (gateway.channel):
 shared_thread(thread: MessageRef | None) -> bool   # a team channel's thread; not None, iMessage or a Slack DM (D…)
 ApprovalPrompt.mention: tuple[str, ...] = ()      # principals the threaded copy tags (Slack: <@U…>); not in text()
@@ -1694,6 +1698,27 @@ add_channel_ref(conn, id, *, ref, at, principal, channel=None, thread=None)
 - **No thread to post in**: a scheduled job, a watcher with `output: dm`, iMessage, or a 1:1 conversation (a Slack DM, the owner's own): each approver in their own conversation, the asking principal's copy in their thread, as before. Owner-only iMessage is unchanged.
 - **Reminders** (`remind_due`): the approvers who got a shared-thread copy get **one** reminder in that thread (sent as the first of them the channel reaches); everyone else's goes to their own conversation, as before.
 - Limit: an approver with no identity on the thread's channel is still recorded as reached by the thread copy (Cori's approvers are all on Slack).
+- **A send that fails** (PER-319): a non-refused `ChannelError` for one approver while another's copy (or the thread's one copy) went out is audited `approval.send_failed` and skipped (`PromptResult.failed`), for `in_thread` callers too (a worker's check or request then waits as usual). The thread's one copy failing is still a failure of the whole prompt (nothing was delivered): the caller retries.
+
+**Status lines** (PER-319, `resonant.runners.status`): the conversation that asked keeps up. Each line is code-built, sent to the task's principal in its thread (`thread_of`) like a reply (the adapter chunks at 3,000 chars), deduped by the channel per task and state (`status_key(task_id, state)` = `status:<task>:<state>`), so retries and restarts never repeat one; a failed send is logged (type only) and never fails the task.
+
+```python
+start_line(code, title) -> str      # "On it: starting R5 (fix the README typo)."
+waiting_line(names) -> str          # "Waiting on an approval from <Owner> or <Approver>."
+failed_line(reason) -> str          # "Couldn't finish that: <reason>."
+plain_reason(error) -> str          # first line, redact_secrets, clean_external, Slack codes in words, ≤ 160
+quiet(task) -> bool                 # no thread (the owner's iMessage)
+not_approved(conn, task_id, now) -> str | None   # "<Name> said no" | "the approval expired before anyone answered"
+async say_waiting(conn, channel, task, approval_id, approvers, *, here) -> bool
+async post(channel, task, state, text, *, principal=None, thread=None) -> bool
+StatusLines(conn, channel).task_failed(task, error)   # Loop.on_failed (wiring.build_stack)
+Loop.on_failed: Callable[[Task, str], Awaitable[None]] | None   # after a terminal Fail is saved
+ClaudeRunner.start_run(..., announce: bool = False)  # checkpoint "announce": the first step says the start line
+```
+
+- **Start**: a run whose start the asking reply didn't say (`start_run` called with an origin other than `explicit`: the Claude brain's; `/run`'s reply is the run's own `On it: R5 · …`) says `On it: starting R5 (<its ask>).` in its thread at its first step (`status:<task>:started`). A run with no thread (iMessage), a registered job's or a watcher's firing says nothing new.
+- **Waiting**: above (`say_waiting`, threaded only, not while paused, `status:<task>:waiting:<approval id>`).
+- **Failed**: one `Couldn't finish that: <plain reason>.` (`status:<task>:failed`) for a conversational task's (`local`, `brain`, `ask`, `media`; not a watch's ask) terminal `Fail` on every channel (iMessage too: it was silent), including an approval prompt nobody got (`I couldn't send the approval (Slack: Messages tab off)`); for a denial or expiry in a threaded conversation (above); and for a run that failed (`R5 failed (<reason>)`) or was cancelled (`R5 was cancelled`) in its thread, after its end text. A task the loop fails at startup (`requeue_interrupted`, attempts spent across crashes) isn't said.
 
 ## Brain context and memory: `resonant.brain` (BR-4, migration 015; PER-294 conversations, migration 030)
 

@@ -116,6 +116,10 @@ class Loop:
         self.clock = clock
         self.max_parallel = max_parallel
         self.last_tick: datetime | None = None
+        # PER-319: called once a step's terminal Fail is saved (the task is now 'failed');
+        # ``runners.status.StatusLines.task_failed`` says it in the conversation. Its errors
+        # are logged, never the loop's.
+        self.on_failed: Callable[[Task, str], Awaitable[None]] | None = None
         self._wakeup = asyncio.Event()
         self._stopping = False
         self._fatal: BaseException | None = None
@@ -364,9 +368,15 @@ class Loop:
             _check_serializable(outcome)
         except (TypeError, ValueError) as e:
             outcome = Fail(f"runner returned an unserializable outcome: {e}")
-        self._persist(task, events, outcome)
+        if self._persist(task, events, outcome) and self.on_failed is not None:
+            assert isinstance(outcome, Fail)
+            try:
+                await self.on_failed(task, outcome.error)
+            except Exception:
+                log.exception("on_failed hook failed for task %s", task.id)
 
-    def _persist(self, task: Task, events: list[Event], outcome: StepOutcome) -> None:
+    def _persist(self, task: Task, events: list[Event], outcome: StepOutcome) -> bool:
+        """Save the outcome; True when it was a terminal ``Fail`` that was saved."""
         # A retryable failure leaves its events unconsumed so the retry sees them again.
         retrying = (
             isinstance(outcome, Fail)
@@ -419,6 +429,7 @@ class Loop:
                     )
         if not saved:
             log.info("task %s changed state during its step (likely cancelled)", task.id)
+        return saved and isinstance(outcome, Fail) and not retrying
 
 
 def _check_serializable(outcome: StepOutcome) -> None:
