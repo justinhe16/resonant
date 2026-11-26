@@ -11,6 +11,6 @@ Staging deploys, PRs, merges to main after review, TestFlight builds, App Store 
 Use only the credentials in your environment. This Mac also has the owner's own fly, vercel and gh logins: never use them for anything, and never run `fly auth`, `vercel login` or `gh auth`.
 If a task seems to need anything outside these rules, stop and ask with `resonant ask`.
 
-Toolchain on this Mac (match CI):
-* voyager-web: CI runs Node 20. Run its install, lint, tests and build with Node 22 LTS first on PATH: `export PATH=/opt/homebrew/opt/node@22/bin:$PATH` (the default `node` is 26, which breaks some tests, e.g. localStorage).
-* voyager-ios: `swiftlint` is installed (`/opt/homebrew/bin/swiftlint`), so run `make lint` as robot-surf asks.
+Toolchain on this Mac (installed tools like node, swiftlint, xcodebuild are fine to run; they aren't "outside the repos"):
+* voyager-web: CI runs Node 20, which can't be installed here; use Node 22 LTS for its install, lint, tests and build by prefixing each command (each shell call starts fresh): `PATH=/opt/homebrew/opt/node@22/bin:$PATH npm test`. The default `node` is 26, which breaks some tests (e.g. localStorage).
+* voyager-ios: `swiftlint` is installed (`/opt/homebrew/bin/swiftlint`), so run `make lint` before opening a PR.
