@@ -60,6 +60,11 @@ SUCCEEDED = frozenset({"success"})
 # Check-run conclusions and status-context states that count as red, in GraphQL's casing.
 _RED = frozenset({"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"})
 _PENDING_STATES = frozenset({"PENDING", "EXPECTED"})
+# A check entry's ``state`` (lowercase) once it finished, whatever the outcome.
+_DONE_STATES = frozenset(
+    {"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required",
+     "stale", "startup_failure", "error"}
+)  # fmt: skip
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _AUTHOR = re.compile(r"^(@me|[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$")
@@ -961,9 +966,15 @@ def cmd_rerun_failed(gh: Gh, repo: str, number: int) -> dict[str, Any]:
     }
 
 
-def cmd_merge_pr(gh: Gh, repo: str, number: int, head_sha: str) -> dict[str, Any]:
+def cmd_merge_pr(
+    gh: Gh, repo: str, number: int, head_sha: str, *, ignore_checks: bool = False
+) -> dict[str, Any]:
     """Squash-merges the PR, only if its head is still ``head_sha`` (what was approved),
-    CI is green and GitHub says it's mergeable. Never ``--admin``."""
+    CI is green and GitHub says it's mergeable. Never ``--admin``.
+
+    ``ignore_checks`` (``merge_pr_anyway``: a person said "merge it anyway"): failing or
+    running checks don't stop it; the result's ``warning`` names them. Everything else still
+    holds, and GitHub's branch protection (a *required* check) still refuses it."""
     check_target(repo, number)
     want = head_sha.lower()
     if not _SHA.match(want):
@@ -985,11 +996,17 @@ def cmd_merge_pr(gh: Gh, repo: str, number: int, head_sha: str) -> dict[str, Any
         )
     if v.get("isDraft") is True:
         raise Failed(f"{ref(pr)} is a draft; not merging")
-    ci, failing, _ = checks_of(_l(v.get("statusCheckRollup")))
-    if ci == "failing":
+    ci, failing, checks = checks_of(_l(v.get("statusCheckRollup")))
+    warning: str | None = None
+    if ci == "failing" and not ignore_checks:
         raise Failed(f"{ref(pr)} has failing checks ({', '.join(failing[:5])}); not merging")
-    if ci == "pending":
+    if ci == "pending" and not ignore_checks:
         raise Failed(f"{ref(pr)} still has checks running; not merging")
+    if ignore_checks and ci in ("failing", "pending"):
+        running = [c["name"] for c in checks if c["state"] not in _DONE_STATES]
+        parts = [f"failing: {', '.join(failing[:5])}"] if failing else []
+        parts += [f"still running: {', '.join(running[:5])}"] if running else []
+        warning = "merged with checks not green (" + "; ".join(parts) + ")"
     merge_state = _s(v.get("mergeStateStatus")).upper()
     if merge_state in _UNMERGEABLE_STATES:
         raise Failed(f"{ref(pr)} is {_UNMERGEABLE_STATES[merge_state]}; not merging")
@@ -1014,6 +1031,7 @@ def cmd_merge_pr(gh: Gh, repo: str, number: int, head_sha: str) -> dict[str, Any
         "head_sha": head,
         "method": "squash",
         "url": _s(v.get("url")),
+        **({"warning": warning} if warning else {}),
     }
 
 
@@ -1053,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--number", required=True, type=int)
         if name == "merge_pr":
             p.add_argument("--head-sha", required=True)
+            p.add_argument("--ignore-checks", action="store_true")  # merge_pr_anyway
         if name == "comment_pr":
             p.add_argument("--body", required=True)
     args = parser.parse_args(argv)
@@ -1071,7 +1090,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "rerun_failed":
             out = cmd_rerun_failed(gh, args.repo, args.number)
         elif args.cmd == "merge_pr":
-            out = cmd_merge_pr(gh, args.repo, args.number, args.head_sha)
+            out = cmd_merge_pr(
+                gh, args.repo, args.number, args.head_sha, ignore_checks=args.ignore_checks
+            )
         else:
             out = {"prs": cmd_prs, "watch": cmd_watch, "digest": cmd_digest, "health": cmd_health}[
                 args.cmd
