@@ -2037,8 +2037,9 @@ class AskRunner:
             if problem is None or anyway:
                 return out, None
             if final:
-                # A change ran or waits on the owner: a redo could repeat it, so the
-                # code-built fallback goes out with the report lines instead.
+                # Strict (or tool-call text): the redo failed, or a change ran or waits on
+                # the owner (a redo could repeat it), so the code-built fallback goes out
+                # with the report lines instead.
                 return out, problem
             redone = True
             out = await run(guard.redo(problem))
