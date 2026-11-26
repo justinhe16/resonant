@@ -20,14 +20,19 @@ the date):
   the owner hasn't heard (the 08:00 pulse is skipped, so the briefing says it: ended and
   merged runs, merged PRs, stalls, review requests) and what is still going, marked told
   after the send like the Updates.
-- ``Updates:`` then one line per open pulse item (``store.pulse.open_items``: every
-  extension, and the ``core`` brain notices not yet told, such as ``W3 iPhone 17 in stock
-  ended without firing``; every urgency), changed-since-told first, at most 8 lines and
-  ``+N more``. The items listed are marked told after the send (a manual run too), so the
-  next pulse doesn't repeat them. github's morning summary is one of these
-  (``[github] 3 open PRs, 1 failing CI, 2 awaiting your review``, reported at low urgency).
-  An item with nothing to say (github's all-zero summary) is reported ``quiet`` and never
-  gets here (BF-1, ``extensions/pulse.py``).
+- ``Updates:`` then one line per open pulse item the owner hasn't heard
+  (``store.pulse.open_items`` where ``Item.changed``: never told, or re-reported with a new
+  fingerprint since; every urgency), at most 8 lines and ``+N more``. One rule for every
+  source: an extension's, another instance's forward (``instance:<name>``), a ``core`` brain
+  notice (``notice/``, such as ``W3 iPhone 17 in stock ended without firing``; other
+  ``core`` items have their own sections). So an urgent alert texted live yesterday and
+  unchanged since is not repeated (PER-350); one with news since is. The items listed are
+  marked told after the send (a manual run too), so the next pulse doesn't repeat them.
+  github's morning summary is one of these (``[github] 3 open PRs, 1 failing CI, 2
+  awaiting your review``, reported at low urgency): listed when its counts (its ``state``,
+  so its fingerprint) changed since the last told one. An item with nothing to say
+  (github's all-zero summary) is reported ``quiet`` and never gets here (BF-1,
+  ``extensions/pulse.py``).
 
 For example::
 
@@ -155,7 +160,7 @@ class Briefing:
     queued: int = 0
     approvals: tuple[str, ...] = ()  # one code per pending approval ("" when it has none)
     degraded: tuple[str, ...] = ()  # health check names
-    updates: tuple[pulse_store.Item, ...] = ()  # open pulse items, most changed first
+    updates: tuple[pulse_store.Item, ...] = ()  # open pulse items the owner hasn't heard
     workers: tuple[pulse_store.Item, ...] = ()  # running workers, and finished ones untold
     roll: rollup.Rollup = field(default_factory=rollup.Rollup)  # the Workers rollup's names
     day: date | None = None  # the local date (picks the empty briefing's line)
@@ -308,14 +313,15 @@ def _degraded(conn: sqlite3.Connection) -> tuple[str, ...]:
 
 
 def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
-    """Open pulse items for the Updates section: extension items (the briefing has its own
-    approvals and health lines) and brain notices the owner hasn't heard (``core`` /
-    ``notice/``: a watch that ended without firing, one held by the daily cap), not from
-    muted extensions (they are neither listed nor marked told)."""
+    """Open pulse items for the Updates section: those the owner hasn't heard
+    (``Item.changed``: new, or changed since told), whatever the source (PER-350). Of
+    ``core``'s only brain notices (``notice/``: a watch that ended without firing, one held
+    by the daily cap); the briefing has its own approvals, health and Workers lines. Not
+    from muted sources (they are neither listed nor marked told)."""
     items = [
         i
         for i in pulse_store.open_items(conn, now)
-        if i.source != "core" or (i.key.startswith(NOTICE_PREFIX) and i.changed)
+        if i.changed and (i.source != "core" or i.key.startswith(NOTICE_PREFIX))
     ]
     muted = {s for s in {i.source for i in items} if notify.muted_until(conn, s, now)}
     return tuple(i for i in items if i.source not in muted)

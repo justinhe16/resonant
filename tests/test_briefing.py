@@ -348,6 +348,67 @@ async def test_github_summary_is_an_updates_item_not_a_hard_coded_line() -> None
         assert out["sections"] == ["updates"]
 
 
+def _forward(db: sqlite3.Connection, key: str, title: str, now: datetime) -> pulse_store.Item:
+    """An urgent forward from another instance (``instance:cori``), as the pulse stores it."""
+    with atomic(db):
+        _, item = pulse_store.upsert(
+            db, "instance:cori", key, title, "urgent", None, False, 24 * 3600, now
+        )
+    return item
+
+
+async def test_updates_skip_items_the_owner_already_heard_whatever_the_source() -> None:
+    # PER-350: yesterday's urgent forwards, texted live and unchanged since, aren't repeated;
+    # one re-reported with news since it was told is, first.
+    async with harness() as h:
+        yesterday = T0 - timedelta(hours=16)
+        heard = _forward(h.db, "cori/r1", "R1 failed: tests failed", yesterday)
+        moved = _forward(h.db, "cori/r2", "R2 failed: tests failed", yesterday)
+        pulse_store.mark_told(h.db, [heard, moved], yesterday)  # told live by the pulse
+        _forward(h.db, "cori/r2", "R2 failed again: lint", T0 - timedelta(hours=1))
+        _forward(h.db, "cori/r3", "R3 failed: timeout", T0 - timedelta(hours=2))  # never told
+        out = await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T0)
+        (text,) = h.channel.texts()
+        lines = text.split("\n")
+        assert lines[0] == "Updates:"
+        assert "R1" not in text  # no "+N more" for it either
+        assert lines[1:] == ["[Cori] 🔴 R3 failed: timeout", "[Cori] 🔴 R2 failed again: lint"]
+        assert out["sections"] == ["updates"]
+
+
+async def test_a_briefing_of_only_heard_items_is_the_empty_one() -> None:
+    async with harness() as h:
+        heard = _forward(h.db, "cori/r1", "R1 failed: tests failed", T0 - timedelta(hours=16))
+        pulse_store.mark_told(h.db, [heard], T0 - timedelta(hours=16))
+        out = await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T0)
+        assert h.channel.texts() == [bf.nothing_line(date(2026, 10, 13))]
+        assert out["sections"] == []
+
+
+async def test_github_summary_repeats_only_when_its_counts_change() -> None:
+    def summary(db: sqlite3.Connection, title: str, state: dict[str, int], now: datetime) -> None:
+        with atomic(db):
+            pulse_store.upsert(db, "github", "github/summary", title, "low", state, False,
+                               30 * 3600, now)  # fmt: skip
+
+    async with harness() as h:
+        counts = {"open": 3, "failing": 1, "review_requested": 2}
+        summary(h.db, "3 open PRs, 1 failing CI, 2 awaiting your review", counts, T0)
+        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T0)
+        day2 = T0 + timedelta(days=1)
+        summary(h.db, "3 open PRs, 1 failing CI, 2 awaiting your review", counts, day2)
+        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=day2)
+        day3 = T0 + timedelta(days=2)
+        summary(h.db, "4 open PRs, 0 failing CI, 2 awaiting your review",
+                {"open": 4, "failing": 0, "review_requested": 2}, day3)  # fmt: skip
+        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=day3)
+        assert h.channel.texts() == [
+            "Updates:\n[github] 3 open PRs, 1 failing CI, 2 awaiting your review",
+            bf.nothing_line(date(2026, 10, 14)),
+            "Updates:\n[github] 4 open PRs, 0 failing CI, 2 awaiting your review",
+        ]
+
+
 # --- the job: schedule, catch-up, once a day ----------------------------------------------
 
 

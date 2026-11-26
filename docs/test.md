@@ -61,7 +61,7 @@ Update a row when you try it, with the date and anything odd.
 | 22 | No token in logs or the DB (`grep`, `sqlite3`) | go-live 12, iMessage 5 | 🖥 |
 | 23 | Watch: baseline silent, then a red CI that doesn't text (GH-2), a merge and a 4h-quiet PR in the hourly rollup | go-live 12, iMessage 6–7 | 📱 after 19 and `resonant ext update github` |
 | 24 | `/ext mute github 1h`, then `off` | go-live 12, iMessage 8 | 📱 after 19 |
-| 25 | Next 08:00 briefing shows `Updates:` / `[github] 3 open PRs, …` | go-live 13.3 | 📱 after 19 |
+| 25 | Next 08:00 briefing shows `Updates:` / `[github] 3 open PRs, …` (not again until the counts change) | go-live 13.3 | 📱 after 19 |
 | 26 | `/kill` skips jobs and kills running extension processes | go-live 12, iMessage 10 | 📱 + 🖥 (sqlite check) |
 | 27 | Tamper test: edit the installed copy, then `/restart resonant`, then `resonant ext update github` | go-live 12, iMessage 11 | 🖥 |
 | 28 | Crash mid-approval: `kill -9` the daemon before answering | go-live 11, Stage B 5 | 🖥 ❓ |
