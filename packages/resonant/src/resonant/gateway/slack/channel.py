@@ -50,8 +50,10 @@ reply goes to the thread it answers: ``MessageRef("slack", "<ch>:<ts>", thread="
 
 **Outbound.** ``send(principal, text, thread=...)`` posts in ``thread`` when it is a known
 thread (listed in ``slack_threads``), else DMs the principal's first ``slack:`` identity
-(``conversations.open``, needs ``im:write``). Never any other destination: an unknown
-principal, or one without a Slack identity, raises :class:`ChannelRefused` (audited
+(``conversations.open``, needs ``im:write``). PER-349: with ``unthreaded: room:<key>`` a send
+with no followed thread posts in that room instead, starting ``<@U…>`` (the principal), except
+when its thread is a DM's (that conversation stays in the DM). Never any other destination: an
+unknown principal, or one without a Slack identity, raises :class:`ChannelRefused` (audited
 ``slack.send_refused``). Text is escaped and split at 3,000 characters (``" (i/n)"``); PR
 URLs and run codes become links (``blocks.format_text``). A 429 waits ``Retry-After`` once
 when it is at most 30s, else raises :class:`ChannelRateLimited`; any other failure raises
@@ -113,6 +115,7 @@ from resonant.gateway.channel import (
     SelfTestResult,
     Submit,
     approval_dedupe_key,
+    shared_thread,
 )
 from resonant.gateway.imessage.channel import split_text
 from resonant.gateway.slack import blocks
@@ -934,11 +937,13 @@ class SlackChannel:
         async with self._send_lock:
             if dedupe_key is not None and (prev := self._already_sent(dedupe_key)) is not None:
                 return prev
-            channel, thread_ts = await self._target(principal, uid, thread, dedupe_key)
+            channel, thread_ts, room = await self._target(principal, uid, thread, dedupe_key)
             formatted = blocks.format_text(text, self.config.link_base)
+            if room is not None:  # PER-349: an unthreaded send in a room tags whom it is for
+                formatted = f"<@{uid}> {formatted}"
             # PER-320: notify the approvers, in the thread only (a copy that fell back to a
             # DM tags nobody: they get their own)
-            if prompt is not None and thread_ts and (tags := self._tags(prompt.mention)):
+            elif prompt is not None and thread_ts and (tags := self._tags(prompt.mention)):
                 formatted = f"{tags}\n{formatted}"
             chunks = [formatted] if prompt is not None else split_text(formatted, blocks.MAX_CHUNK)
             claude = outbound.is_claude_send(dedupe_key)
@@ -989,6 +994,7 @@ class SlackChannel:
                     chunks=len(chunks),
                     ref=ref.ref,
                     threaded=thread_ts is not None,
+                    room=room,
                 )
             if not claude:
                 outbound.note(self.conn, principal, at, dedupe_key)
@@ -1142,8 +1148,12 @@ class SlackChannel:
 
     async def _target(
         self, principal: str, uid: str, thread: MessageRef | None, dedupe_key: str | None
-    ) -> tuple[str, str | None]:
-        """``(channel, thread_ts)``: the known thread, else the principal's DM."""
+    ) -> tuple[str, str | None, str | None]:
+        """``(channel, thread_ts, room)``: the known thread, else where a send with no thread
+        goes (PER-349, ``unthreaded``): the principal's DM, or the room ``room`` (a ``rooms``
+        key, then the caller tags the principal). A thread that started in a DM always falls
+        back to the DM: the DM is that conversation."""
+        in_dm = False
         if thread is not None and thread.channel == CHANNEL_NAME and thread.thread:
             channel, _, ts = thread.thread.partition(":")
             with atomic(self.conn):
@@ -1151,8 +1161,13 @@ class SlackChannel:
                     store.known(self.conn, channel, ts) or self._watched(channel, ts)
                 )
             if ok:
-                return channel, ts
-            log.info("slack: thread for %s is not one Cori follows; sending a DM", principal)
+                return channel, ts, None
+            in_dm = not shared_thread(thread)  # a 1:1 conversation stays in the DM
+            log.info("slack: thread for %s is not one Cori follows", principal)
+        key = self.config.unthreaded_room
+        if key is not None and not in_dm and (room := self.config.rooms.get(key)) is not None:
+            log.info("slack: unthreaded send for %s goes to room %s", principal, key)
+            return room, None, key
         dm = self._dms.get(uid)
         if dm is None:
             body = await self._call("conversations.open", {"users": uid}, principal, dedupe_key)
@@ -1161,7 +1176,7 @@ class SlackChannel:
             if not isinstance(ch, str) or not ch:
                 raise ChannelSendError("slack: conversations.open returned no channel")
             dm = self._dms[uid] = ch
-        return dm, None
+        return dm, None, None
 
     async def _call(
         self,
