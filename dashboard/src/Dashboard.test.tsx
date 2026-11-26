@@ -271,9 +271,22 @@ describe("collapsible sections", () => {
       expect(within(section(id)).queryAllByRole("listitem")).toHaveLength(0);
       expect(within(section(id)).queryByText(/by state|Worker runner|trust rule/)).not.toBeInTheDocument();
     }
-    // Header badges still show while collapsed.
+    // Header badges still say what needs a look while collapsed; the breakdowns wait for open.
     expect(within(section("pulse")).getByTestId("pulse-untold")).toBeInTheDocument();
+    expect(within(section("runs")).getByTestId("runs-failed")).toHaveTextContent("1 failed");
+    expect(within(section("runs")).getByTestId("runs-high-impact")).toHaveTextContent("1 high-impact");
+    expect(within(section("tasks")).getByTestId("tasks-failed")).toHaveTextContent("2 failed");
+    expect(within(section("extensions")).getByTestId("extensions-unhealthy")).toHaveTextContent("1 unhealthy");
+    expect(within(section("jobs")).queryByTestId("jobs-failing")).not.toBeInTheDocument(); // none failing
     expect(screen.queryByTestId("detected-effects")).not.toBeInTheDocument();
+  });
+
+  it("counts failing core jobs on the collapsed Jobs header", async () => {
+    const snap = clone(local);
+    snap.core_jobs[0]!.fail_streak = 2;
+    mount(snap);
+    await ready();
+    expect(within(section("jobs")).getByTestId("jobs-failing")).toHaveTextContent("1 failing");
   });
 
   it("keeps a closed 'now' section peeking at its newest rows", async () => {

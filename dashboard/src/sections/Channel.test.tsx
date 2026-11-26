@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { PanelGlance } from "@/components/panel/PanelGlance";
 import { channelName } from "@/lib/snapshot";
 import { Claude } from "@/sections/Claude";
+import { RegisteredJobs } from "@/sections/RegisteredJobs";
 import { Rules } from "@/sections/Rules";
 import { Slack } from "@/sections/Slack";
 import { Credentials } from "@/sections/SystemStatus";
@@ -156,5 +157,22 @@ describe("collapsed headers (PER-345)", () => {
     unmount();
     render(<Claude snap={clone(local, { runner: { ...local.runner, set_up: true } })} now={NOW} />);
     expect(screen.queryByTestId("runner-not-set-up")).not.toBeInTheDocument();
+  });
+
+  it("counts registered jobs that didn't start or failed, not paused ones, on the header", () => {
+    const jobs = cori.jobs!;
+    const snap = clone(cori, {
+      jobs: [
+        { ...jobs[0]!, last_error: "no repo" },
+        { ...jobs[0]!, id: "J3", last_run_status: "failed" },
+        { ...jobs[1]!, last_error: "paused after an error" },
+      ],
+    });
+    const { unmount } = render(<RegisteredJobs snap={snap} now={NOW} />);
+    expect(screen.getByTestId("registered-jobs-failing")).toHaveTextContent("2 failing");
+    expect(screen.queryByTestId("registered-job-row")).not.toBeInTheDocument();
+    unmount();
+    render(<RegisteredJobs snap={cori} now={NOW} />);
+    expect(screen.queryByTestId("registered-jobs-failing")).not.toBeInTheDocument();
   });
 });

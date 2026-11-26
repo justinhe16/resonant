@@ -1,4 +1,4 @@
-import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { CollapsibleSection, HeaderBadge } from "@/components/CollapsibleSection";
 import { Counts, Group, Section } from "@/components/bits";
 import { ListRow } from "@/components/ListRow";
 import { Badge } from "@/components/ui/badge";
@@ -98,6 +98,12 @@ export function RecentRuns({ snap, now }: { snap: Snapshot; now: number }) {
       empty="No finished runs yet."
       keptNote={`The snapshot keeps the newest ${snap.limits.runs} runs; older ones aren't shown.`}
       explainer="runs"
+      action={
+        <>
+          <HeaderBadge n={snap.runs.by_state.failed ?? 0} label="failed" tone="bad" testId="runs-failed" />
+          <HeaderBadge n={snap.runs.detected.high} label="high-impact" tone="bad" testId="runs-high-impact" />
+        </>
+      }
       summary={
         <div className="space-y-4">
           <Group label="Runs by state">
@@ -127,6 +133,7 @@ export function Tasks({ snap, now }: { snap: Snapshot; now: number }) {
       empty="No tasks yet."
       keptNote={`The snapshot keeps ${snap.limits.tasks} tasks: the active ones, then the newest.`}
       explainer="tasks"
+      action={<HeaderBadge n={snap.tasks.by_state.failed ?? 0} label="failed" tone="bad" testId="tasks-failed" />}
       summary={
         <Group label="Tasks by state">
           <Counts

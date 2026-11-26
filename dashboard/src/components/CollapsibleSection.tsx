@@ -2,6 +2,7 @@ import { ChevronDown } from "lucide-react";
 import { type ReactNode, useCallback, useState } from "react";
 import { Explainer } from "@/components/Explainer";
 import { Empty, Rows } from "@/components/bits";
+import { Badge, type BadgeTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -25,6 +26,19 @@ function writeOpen(id: string, open: boolean) {
   } catch {
     /* not remembered */
   }
+}
+
+/**
+ * A problem count for a section's header (`action`), so a collapsed section still says something
+ * needs a look (PER-345). Nothing when the count is 0.
+ */
+export function HeaderBadge({ n, label, tone, testId }: { n: number; label: string; tone: BadgeTone; testId?: string }) {
+  if (n <= 0) return null;
+  return (
+    <Badge variant={tone} data-testid={testId}>
+      {n} {label}
+    </Badge>
+  );
 }
 
 export interface CollapsibleSectionProps<T> {

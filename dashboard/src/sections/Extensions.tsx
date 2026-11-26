@@ -1,9 +1,13 @@
-import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { CollapsibleSection, HeaderBadge } from "@/components/CollapsibleSection";
 import { ListRow } from "@/components/ListRow";
 import { PanelGlance } from "@/components/panel/PanelGlance";
 import { absolute } from "@/lib/time";
 import { healthTone, outcomeTone } from "@/lib/tone";
 import type { Extension, Job, Snapshot } from "@/types";
+
+/** Enabled, but not healthy or with a job failing: what the collapsed header counts. */
+const unhealthy = (ext: Extension) =>
+  ext.status === "enabled" && (["warn", "bad"].includes(healthTone(ext.health)) || ext.jobs.some((j) => j.fail_streak > 0));
 
 export function Extensions({ snap, now }: { snap: Snapshot; now: number }) {
   return (
@@ -15,6 +19,9 @@ export function Extensions({ snap, now }: { snap: Snapshot; now: number }) {
       render={(ext) => <ExtensionRow key={ext.name} ext={ext} now={now} />}
       empty="No extensions installed."
       explainer="extensions"
+      action={
+        <HeaderBadge n={snap.extensions.filter(unhealthy).length} label="unhealthy" tone="warn" testId="extensions-unhealthy" />
+      }
     />
   );
 }
