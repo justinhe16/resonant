@@ -25,6 +25,16 @@ A hit sends one notice (``brain/notices.py``: through the pulse, at most
 (``fired``). ``max_fails`` failed checks in a row end it (``failed``) with a notice. The
 notice is sent before the check is recorded, deduped by ``watch/<id>/<n>``, so a retry after
 a crash never texts twice and never loses the hit.
+
+**Where (PER-346).** Notices go to the watch's origin (``watches.origin_thread``: the creating
+task's thread), else to the principal's own conversation; a thread the channel no longer
+follows falls back there too (the adapter's choice, as for every threaded send).
+``then="follow_up"``: the hit also queues **one** brain ask (``AskRunner.enqueue(...,
+tools=True, tainted=True, taint_hops=0)``) as the watch's principal in the origin's
+``channel_ref``, with the code-built ``watches.follow_up_prompt``; it is marked with the
+notice's key (``checkpoint.watch_follow_up``) and found again on a retry, so it is queued at
+most once. The watch then ends (``fired``). A refused ask (off, at a limit, busy) is said in
+the notice: ``(couldn't follow up: <why>)``.
 """
 
 from __future__ import annotations
@@ -43,9 +53,10 @@ from resonant.brain.notices import send_notice
 from resonant.config import Settings
 from resonant.extensions.notify import clean_text
 from resonant.gate.types import Deny
-from resonant.gateway.channel import Channel, ChannelError
+from resonant.gateway.channel import Channel, ChannelError, MessageRef
 from resonant.loop.types import PRIORITY_BACKGROUND, Done, Fail, NewTask, StepContext, Task
 from resonant.principals import Principals
+from resonant.runners.ask import FOLLOW_UP_KEY, Queued
 from resonant.store import pulse as pulse_items
 from resonant.store.audit import audit
 from resonant.store.db import atomic, utcnow
@@ -197,8 +208,13 @@ class WatchRunner:
     async def _settle(
         self, w: store.Watch, v: store.Verdict, now: datetime, *, ask_task: str | None = None
     ) -> StepOutcome:
+        follow = v.fire and w.then == "follow_up"
         if v.fire:
-            await self._notice(w, f"watch/{w.id}/{w.fired + 1}", store.notice_title(w, v.detail))
+            key = f"watch/{w.id}/{w.fired + 1}"
+            title = store.notice_title(w, v.detail)
+            if follow and (why := self._follow_up(w, v.detail, key)) is not None:
+                title = f"{title} (couldn't follow up: {why})"
+            await self._notice(w, key, title)
         ended = store.record(
             self.conn,
             w,
@@ -208,7 +224,7 @@ class WatchRunner:
             baseline=v.baseline,
             fired=v.fire,
             ask_task=ask_task,
-            end_state="fired" if v.fire and w.then == "stop" else None,
+            end_state="fired" if v.fire and w.then != "continue" else None,
         )
         if ended:
             self._ended(w, "fired")
@@ -235,11 +251,50 @@ class WatchRunner:
             self._ended(w, "failed")
         return Done({"watch": w.id, "status": "failed" if last else "check_failed"})
 
+    def _follow_up(self, w: store.Watch, detail: str, key: str) -> str | None:
+        """Queue the watch's one follow-up ask (module docstring). None when it is queued (now
+        or by an earlier try), else why not (code-built, short)."""
+        prior = self.conn.execute(
+            "SELECT id FROM tasks WHERE runner = 'ask' AND json_extract(checkpoint, ?) = ? LIMIT 1",
+            (f"$.{FOLLOW_UP_KEY}", key),
+        ).fetchone()
+        if prior is not None:  # a retry after a crash: this hit already queued it
+            store.set_follow_up_task(self.conn, w.id, str(prior[0]))
+            return None
+        asks = self.asks()
+        if asks is None:
+            why = "ask_claude isn't running"
+        else:
+            result = asks.enqueue(
+                store.follow_up_prompt(w, detail),
+                kind="general",
+                principal=w.principal,
+                # only the principal's own thread (as for notices), else their conversation
+                channel_ref=w.channel_ref if store.origin_thread(w) is not None else None,
+                tools=True,
+                tainted=True,  # the check's result is outside data
+                taint_hops=0,
+                follow_up=key,
+            )
+            if isinstance(result, Queued):
+                store.set_follow_up_task(self.conn, w.id, result.task_id)
+                with atomic(self.conn):
+                    audit(self.conn, "watch.follow_up", requested_by=w.principal,
+                          decision="queued", watch=w.id, task_id=result.task_id)  # fmt: skip
+                return None
+            why = result.text
+        why = " ".join(why.split())[:ERROR_MAX]
+        with atomic(self.conn):
+            audit(self.conn, "watch.follow_up", requested_by=w.principal, decision="refused",
+                  watch=w.id, reason=why)  # fmt: skip
+        return why
+
     async def _notice(self, w: store.Watch, key: str, title: str) -> None:
+        to = store.origin_thread(w)
         try:
             await send_notice(
                 self.conn,
-                self.channel,
+                self.channel if to is None else _ToThread(self.channel, to),
                 w.principal,
                 self.settings,
                 key=key,
@@ -260,6 +315,19 @@ class WatchRunner:
     def _ended(self, w: store.Watch, state: store.State) -> None:
         with atomic(self.conn):
             audit(self.conn, "watch.ended", requested_by=w.principal, decision=state, watch=w.id)
+
+
+class _ToThread:
+    """A ``Sender`` into one thread: ``send_notice`` sends to a principal; this puts it in the
+    watch's origin thread (the adapter falls back to the principal's own conversation when it
+    no longer follows that thread; an unthreaded adapter ignores it)."""
+
+    def __init__(self, channel: Channel, thread: MessageRef) -> None:
+        self.channel = channel
+        self.thread = thread
+
+    async def send(self, principal: str, text: str, *, dedupe_key: str | None = None) -> object:
+        return await self.channel.send(principal, text, thread=self.thread, dedupe_key=dedupe_key)
 
 
 def _paused(conn: sqlite3.Connection) -> bool:
@@ -316,7 +384,7 @@ def queue_due(conn: sqlite3.Connection, now: datetime) -> dict[str, Any]:
                         runner=NAME,
                         priority=PRIORITY_BACKGROUND,
                         principal=w.principal,
-                        checkpoint={"watch": w.id, "title": f"watch {w.code}"},
+                        checkpoint={"watch": w.id, "title": check_label(w)},
                     ),
                 )
                 if not store.claim(conn, w, task_id, now):
@@ -325,6 +393,15 @@ def queue_due(conn: sqlite3.Connection, now: datetime) -> dict[str, Any]:
             continue
         queued += 1
     return {"queued": queued, "expired": expired}
+
+
+def check_label(w: store.Watch) -> str:
+    """A check task's label (the dashboard's): ``watch W3``, and where it answers and whether
+    it follows up (PER-346): ``watch W3 (in a thread, then follow up)``. Never the
+    instruction's words."""
+    notes = [n for n, on in (("in a thread", store.origin_thread(w) is not None),
+                             ("then follow up", w.then == "follow_up")) if on]  # fmt: skip
+    return f"watch {w.code} ({', '.join(notes)})" if notes else f"watch {w.code}"
 
 
 class _Lost(Exception):
@@ -346,4 +423,12 @@ def watches_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> Co
     return CoreJob(id=JOB_ID, schedule=SCHEDULE, run=run, catchup=CATCHUP, timeout_s=30.0)
 
 
-__all__ = ["JOB_ID", "NAME", "WatchRunner", "note_unfired", "queue_due", "watches_job"]
+__all__ = [
+    "JOB_ID",
+    "NAME",
+    "WatchRunner",
+    "check_label",
+    "note_unfired",
+    "queue_due",
+    "watches_job",
+]

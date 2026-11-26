@@ -15,6 +15,14 @@ and what counts as Y. Two kinds of check:
 On a hit the watch sends **one** notice (``brain/notices.py``, through the pulse, capped per
 day) and ends (``then="stop"``, the default); ``then="continue"`` keeps it and fires again
 only after the condition was false in between (or, for ``changed``, on the next change).
+``then="follow_up"`` (PER-346) also queues **one** brain ask with the watch's ``follow_up``
+instruction (:func:`follow_up_prompt`, code-built; tainted, as the creating principal, in the
+origin conversation) and ends: the brain then acts, every tool through the gate.
+
+Origin (PER-346, migration 037): a watch keeps its creating task's ``channel_ref`` and
+``conversation``; its notices go to that thread (:func:`origin_thread`). With none (a watch
+made before, or by no task) or a thread the channel no longer follows, the channel falls back
+to the principal's own conversation, as before. No channel is named here: the adapter decides.
 A watch that expires without ever firing leaves a ``low`` core item for the next briefing,
 ``W3 iPhone 17 in stock ended without firing`` (``notice/watch/<id>/ended``, no text of its
 own), which expires with its 24h TTL.
@@ -36,20 +44,26 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from resonant.store.db import atomic, iso
 
+if TYPE_CHECKING:
+    from resonant.gateway.channel import MessageRef
+
 CheckKind = Literal["tool", "ask"]
 Op = Literal["contains", "missing", "changed", "yes"]
-Then = Literal["stop", "continue"]
+Then = Literal["stop", "continue", "follow_up"]
 State = Literal["active", "fired", "cancelled", "expired", "failed"]
 OPS: tuple[Op, ...] = ("contains", "missing", "changed", "yes")
 TOOL_OPS: tuple[Op, ...] = ("contains", "missing", "changed")
+THENS: tuple[Then, ...] = ("stop", "continue", "follow_up")
 WHAT_MAX = 100
 VALUE_MAX = 200
 QUESTION_MAX = 1000
 DETAIL_MAX = 140
+FOLLOW_UP_MAX = 500
+MATCH_TEXT_MAX = 60  # longer than this reads like an instruction, not text to look for
 TERMINAL_TASK = ("done", "failed", "cancelled")
 _URL = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 _YES = re.compile(r"^\W*(yes|no)\b", re.IGNORECASE)
@@ -82,6 +96,10 @@ class Watch:
     last_error: str | None
     last_ask_task: str | None
     open_task_id: str | None
+    channel_ref: dict[str, Any] | None = None
+    conversation: str | None = None
+    follow_up: str | None = None
+    follow_up_task: str | None = None
 
     @property
     def code(self) -> str:
@@ -97,6 +115,7 @@ def _row(r: sqlite3.Row) -> Watch:
     created, expires, next_at = _dt(r["created_at"]), _dt(r["expires_at"]), _dt(r["next_at"])
     assert created is not None and expires is not None and next_at is not None
     args: Any = json.loads(r["args"] or "{}")
+    ref: Any = json.loads(r["channel_ref"]) if r["channel_ref"] else None
     return Watch(
         id=int(r["id"]),
         principal=r["principal"],
@@ -123,6 +142,10 @@ def _row(r: sqlite3.Row) -> Watch:
         last_error=r["last_error"],
         last_ask_task=r["last_ask_task"],
         open_task_id=r["open_task_id"],
+        channel_ref=cast(dict[str, Any], ref) if isinstance(ref, dict) else None,
+        conversation=r["conversation"],
+        follow_up=r["follow_up"],
+        follow_up_task=r["follow_up_task"],
     )
 
 
@@ -146,14 +169,18 @@ def create(
     value: str | None = None,
     then: Then = "stop",
     created_by_task: str | None = None,
+    channel_ref: dict[str, Any] | None = None,
+    conversation: str | None = None,
+    follow_up: str | None = None,
 ) -> Watch:
-    """Insert an active watch whose first check is due now. The caller validated it."""
+    """Insert an active watch whose first check is due now. The caller validated it.
+    ``channel_ref`` / ``conversation``: the creating task's (its origin)."""
     with atomic(conn):
         cur = conn.execute(
             """INSERT INTO brain_watches (principal, what, check_kind, extension, tool, args,
                    question, op, value, then_action, interval_s, state, created_at,
-                   expires_at, next_at, created_by_task)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+                   expires_at, next_at, created_by_task, channel_ref, conversation, follow_up)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 principal,
                 what,
@@ -170,6 +197,9 @@ def create(
                 iso(expires_at),
                 iso(now),
                 created_by_task,
+                json.dumps(channel_ref, sort_keys=True) if channel_ref is not None else None,
+                conversation,
+                follow_up if then == "follow_up" else None,
             ),
         )
     found = get(conn, int(cur.lastrowid or 0))
@@ -279,6 +309,14 @@ def record(
         return cur.rowcount == 1
 
 
+def set_follow_up_task(conn: sqlite3.Connection, watch_id: int, task_id: str) -> None:
+    """The brain ask a ``follow_up`` watch queued when it fired."""
+    with atomic(conn):
+        conn.execute(
+            "UPDATE brain_watches SET follow_up_task = ? WHERE id = ?", (task_id, watch_id)
+        )
+
+
 def release(conn: sqlite3.Connection, w: Watch, task_id: str) -> None:
     """The check task is done with the watch."""
     with atomic(conn):
@@ -339,6 +377,33 @@ def judge_ask(w: Watch, answer: str) -> Verdict:
     return Verdict(met, met and not w.last_met, None, detail)
 
 
+def sentence_like(text: str) -> bool:
+    """Whether ``match_text`` reads like an instruction rather than text to look for (the
+    watch would fire at once on ``missing`` and never on ``contains``): longer than
+    ``MATCH_TEXT_MAX``, or words ending a sentence (a space and a ``.`` at the end or before
+    a space). ``v1.2 released`` and ``"state":"MERGED"`` are fine."""
+    t = text.strip()
+    if len(t) > MATCH_TEXT_MAX:
+        return True
+    return " " in t and (t.endswith(".") or ". " in t)
+
+
+def follow_up_prompt(w: Watch, detail: str) -> str:
+    """The follow-up ask's message, code-built: ``Watch W2 (<what>) fired: <detail>. You
+    asked yourself to: <follow_up>``. ``detail`` may quote outside text (the ask is tainted)."""
+    said = f": {detail}" if detail else ""
+    return f"Watch {w.code} ({w.what}) fired{said}. You asked yourself to: {w.follow_up or ''}"
+
+
+def origin_thread(w: Watch) -> MessageRef | None:
+    """Where the watch's notices go: its creating task's thread, only when that thread is the
+    watch principal's (``gateway.channel.thread_of``). None: the principal's own conversation
+    (an unthreaded channel, no origin, a watch made before PER-346)."""
+    from resonant.gateway.channel import thread_of  # the gateway imports the gate: a cycle
+
+    return thread_of(w.channel_ref, to=w.principal)
+
+
 def notice_title(w: Watch, detail: str) -> str:
     """``👀 W3 iPhone 17 in stock: saw "Add to bag"``."""
     head = f"\U0001f440 {w.code} {w.what}"
@@ -359,7 +424,7 @@ def failed_title(w: Watch, error: str | None) -> str:
 def describe(w: Watch) -> dict[str, Any]:
     """A watch as ``list_watches`` shows it (no tool output, no answers)."""
     check: dict[str, Any] = (
-        {"tool": w.tool, "extension": w.extension, "when": w.op, "text": w.value}
+        {"tool": w.tool, "extension": w.extension, "when": w.op, "match_text": w.value}
         if w.check_kind == "tool"
         else {"ask": w.question}
     )
@@ -370,6 +435,8 @@ def describe(w: Watch) -> dict[str, Any]:
         "check": check,
         "every_minutes": w.interval_s // 60,
         "then": w.then,
+        "follow_up": w.follow_up,
+        "origin": "thread" if origin_thread(w) is not None else "direct",
         "expires_at": iso(w.expires_at),
         "next_at": iso(w.next_at) if w.state == "active" else None,
         "checks": w.checks,
@@ -379,7 +446,10 @@ def describe(w: Watch) -> dict[str, Any]:
 
 
 __all__ = [
+    "FOLLOW_UP_MAX",
+    "MATCH_TEXT_MAX",
     "OPS",
+    "THENS",
     "TOOL_OPS",
     "Verdict",
     "Watch",
@@ -391,12 +461,16 @@ __all__ = [
     "end",
     "ended_title",
     "failed_title",
+    "follow_up_prompt",
     "get",
     "judge_ask",
     "judge_tool",
     "list_for",
     "notice_title",
+    "origin_thread",
     "parse_yes",
     "record",
     "release",
+    "sentence_like",
+    "set_follow_up_task",
 ]

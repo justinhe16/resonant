@@ -254,6 +254,7 @@ class _Convo:
         return SINCE_KV if self.plain(owner) else f"{SINCE_KV}:{self.key}"
 
 
+FOLLOW_UP_KEY = "watch_follow_up"  # PER-346: a fired watch's follow-up ask (its notice key)
 DEFER_S = 5.0  # a busy ask (concurrency) looks again this soon
 # PER-256: a session turn that ended like this, with nothing changed and nothing asked, means
 # Claude is down: the owner hears so once and the turn is tried again.
@@ -1151,6 +1152,7 @@ class AskRunner:
         approved: bool = False,
         ack: str | None = None,
         continues: dict[str, Any] | None = None,
+        follow_up: str | None = None,
     ) -> Queued | AskRefused:
         """Queue an ask for ``principal`` (who gets the answer). Refused, with a code-built
         reason, when ask_claude is off, paused, at its usage limit or daily cap, or an
@@ -1165,7 +1167,9 @@ class AskRunner:
         what is ahead of it, when the turn is queued behind others). ``continues`` (PER-321,
         code only): Resonant's own turn feeding a decided approval back to Claude (kept as
         ``checkpoint.continuation``); its message may be longer and it never waits on
-        ``queue_max``: it carries on a turn that was already counted."""
+        ``queue_max``: it carries on a turn that was already counted. ``follow_up`` (PER-346,
+        code only): a fired watch's follow-up turn, kept as ``checkpoint.watch_follow_up``
+        (the watch's notice key), so a retried fire finds the ask it already queued."""
         if not self.cfg.enabled:
             return AskRefused("ask_claude is off (brain.ask_claude.enabled).", "off")
         question = question.strip()
@@ -1192,6 +1196,10 @@ class AskRunner:
                               "limit", until)  # fmt: skip
         if (refused := self._capped()) is not None:
             return refused
+        if follow_up is not None and (not tools or self.tools is None
+                                      or not self.cfg.resonant_tools):  # fmt: skip
+            # PER-346: a follow-up with no tools couldn't do what it was asked: say so
+            return AskRefused("Resonant's tools are off for ask_claude.", "off")
         cp: dict[str, Any] = {"question": question, "kind": kind, "attachments": checked}
         if requested_by is not None:
             cp["requested_by"] = requested_by
@@ -1219,6 +1227,8 @@ class AskRunner:
             cp["ack"] = ack
         if continues is not None:
             cp["continuation"] = continues
+        if follow_up is not None:
+            cp[FOLLOW_UP_KEY] = follow_up
         task_id = self._create_task(
             NewTask(
                 kind=TASK_KIND,
@@ -1845,7 +1855,9 @@ class AskRunner:
         before = source.origin_event_id if source is not None else None
         # PER-294: the conversation this turn is in: the asking task's thread, else its
         # principal's own (the owner's, with no threads: exactly as before).
-        convo = _Convo.of(source, self.owner)
+        # PER-346: a watch's follow-up has no asking task: the turn's own thread.
+        follow = source is None and cp.get(FOLLOW_UP_KEY) is not None
+        convo = _Convo.of(task if follow else source, self.owner)
         owner = convo.principal
 
         def argv(session_id: str, resume: bool) -> list[str]:

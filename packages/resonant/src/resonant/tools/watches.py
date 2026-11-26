@@ -1,12 +1,16 @@
 """Watch tools (BR-7, docs/brain-plan.md D10; ``brain/watches.py``):
 
 - ``create_watch`` (**L2**, write): asks the owner first, with the code-built summary of
-  exactly what will be checked. ``{what, tool?, args?, when?, text?, ask?, every_minutes?,
-  days?, then?}``: either a read tool to call (``tool`` + ``args``, ``when`` ``contains`` /
-  ``missing`` with ``text``, or ``changed``) or a yes/no ``ask`` for Claude. Refused (a
+  exactly what will be checked. ``{what, tool?, args?, when?, match_text?, ask?,
+  every_minutes?, days?, then?, follow_up?}``: either a read tool to call (``tool`` +
+  ``args``, ``when`` ``contains`` / ``missing`` with ``match_text`` (``text`` is the old
+  name, still taken), or ``changed``) or a yes/no ``ask`` for Claude. ``then: follow_up``
+  (PER-346) with a ``follow_up`` instruction wakes the brain once when it fires. Refused (a
   ``ToolFailed`` the model sees) when the tool isn't an L0 read the principal may use, the
-  args don't fit its schema, the interval is under the minimum, or ``max_active`` watches
-  are already active.
+  args don't fit its schema, ``match_text`` reads like a sentence (it belongs in
+  ``follow_up``), the interval is under the minimum, or ``max_active`` watches are already
+  active. The watch keeps the calling task's ``channel_ref`` and ``conversation``: it
+  answers there.
 - ``list_watches`` (L0): the active watches and those ended in the last 7 days.
 - ``cancel_watch{id}`` (L3: do, then report): ``W3`` or ``3``.
 
@@ -28,6 +32,7 @@ from resonant.brain import watches as store
 from resonant.config import WatchConfig
 from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
 from resonant.gate.types import Intent
+from resonant.loop.types import Task
 from resonant.store import tasks as task_store
 from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
 from resonant_sdk import Effect, Level, ToolSpec
@@ -42,10 +47,15 @@ _CODE = re.compile(r"^[Ww]?(\d{1,9})$")
 CREATE_WATCH = ToolSpec(
     name="create_watch",
     description=(
-        "Watch something and text the owner once when it happens ('watch X and tell me when "
-        "Y'). Either call a read tool every few minutes (tool + args) and match its result "
-        "(when: contains/missing with text, or changed), or ask Claude a yes/no question "
-        "(ask; for web pages). Asks the owner first. It ends after it fires or after `days`."
+        "Watch something and tell the asker once when it happens ('watch X and tell me when "
+        "Y'), in the conversation it was asked in. Either call a read tool every few minutes "
+        "(tool + args) and look for match_text in its JSON result (when: contains/missing), "
+        "or when: changed; or ask Claude a yes/no question (ask; for web pages). match_text "
+        "is a short literal string that appears in the tool's output (like MERGED or "
+        '"conclusion":"success"), never an instruction. To act when it fires (\'merge '
+        "it when green'), set then: follow_up and put the instruction in follow_up: you get "
+        "one turn in this conversation to do it. Asks the owner first. It ends after it "
+        "fires (unless then: continue) or after `days`."
     ),
     args_schema={
         "type": "object",
@@ -59,7 +69,19 @@ CREATE_WATCH = ToolSpec(
             "tool": {"type": "string", "maxLength": 64, "description": "a read tool's name"},
             "args": {"type": "object", "description": "that tool's arguments"},
             "when": {"type": "string", "enum": list(store.TOOL_OPS)},
-            "text": {"type": "string", "minLength": 1, "maxLength": store.VALUE_MAX},
+            "match_text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": store.VALUE_MAX,  # the handler refuses a sentence, clearly
+                "description": "a short literal string to find in the tool's JSON result "
+                "(case-insensitive), like MERGED; not an instruction",
+            },
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": store.VALUE_MAX,
+                "description": "old name for match_text",
+            },
             "ask": {
                 "type": "string",
                 "minLength": 1,
@@ -68,7 +90,14 @@ CREATE_WATCH = ToolSpec(
             },
             "every_minutes": {"type": "integer", "minimum": 15, "maximum": 1440},
             "days": {"type": "integer", "minimum": 1, "maximum": 90},
-            "then": {"type": "string", "enum": ["stop", "continue"]},
+            "then": {"type": "string", "enum": list(store.THENS)},
+            "follow_up": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": store.FOLLOW_UP_MAX,
+                "description": "with then: follow_up, what to do when it fires, e.g. 'merge "
+                "PR 159 if checks are green, else say why not'",
+            },
         },
         "required": ["what"],
         "additionalProperties": False,
@@ -103,6 +132,7 @@ SPECS: tuple[ToolSpec, ...] = (CREATE_WATCH, LIST_WATCHES, CANCEL_WATCH)
 
 SUMMARY_ASK_MAX = 300
 SUMMARY_ARGS_MAX = 120
+SUMMARY_FOLLOW_MAX = 200
 
 
 def summary_action(intent: Intent) -> str | None:
@@ -119,7 +149,15 @@ def summary_action(intent: Intent) -> str | None:
     often = f"every {every}m" if isinstance(every, int) else "at the default interval"
     days = a.get("days")
     span = f" for {days}d" if isinstance(days, int) else " for the default days"
-    then = ", and keep watching" if a.get("then") == "continue" else ", then stop"
+    follow = a.get("follow_up")
+    if a.get("then") == "follow_up" or (follow is not None and a.get("then") is None):
+        f = str(follow or "")
+        f = f if len(f) <= SUMMARY_FOLLOW_MAX else f[: SUMMARY_FOLLOW_MAX - 1] + "…"
+        then = f', then follow up: "{f}"'
+    elif a.get("then") == "continue":
+        then = ", and keep watching"
+    else:
+        then = ", then stop"
     ask = a.get("ask")
     if isinstance(ask, str):
         q = ask if len(ask) <= SUMMARY_ASK_MAX else ask[: SUMMARY_ASK_MAX - 1] + "…"
@@ -128,7 +166,8 @@ def summary_action(intent: Intent) -> str | None:
     targs = raw if len(raw) <= SUMMARY_ARGS_MAX else raw[: SUMMARY_ARGS_MAX - 1] + "…"
     when = a.get("when")
     verb = "contains" if when == "contains" else "no longer contains"
-    cond = "it changes" if when == "changed" else f'it {verb} "{a.get("text", "")}"'
+    needle = a.get("match_text", a.get("text", ""))
+    cond = "it changes" if when == "changed" else f'it {verb} "{needle}"'
     return f'watch "{what}": call {a.get("tool")} {targs} {often}{span}, text you when {cond}{then}'
 
 
@@ -159,13 +198,16 @@ class _Tools:
         return self.ctx.state.settings.brain.watches
 
     def _principal(self, ctx: CallContext | None) -> tuple[str, str | None]:
+        principal, task = self._caller(ctx)
+        return principal, task.id if task is not None else None
+
+    def _caller(self, ctx: CallContext | None) -> tuple[str, Task | None]:
+        """The calling task's principal (the owner with no task) and the task itself."""
         owner = self.ctx.principals.owner
-        if ctx is None:
-            return owner, None
-        task = task_store.get_task(self.ctx.conn, ctx.task_id)
+        task = task_store.get_task(self.ctx.conn, ctx.task_id) if ctx is not None else None
         if task is None:
             return owner, None
-        return task.principal or owner, task.id
+        return task.principal or owner, task
 
     def _watchable(self, name: str, principal: str) -> ToolSpec:
         """The read tool a watch may call: builtins first, then a loaded extension's chat
@@ -196,7 +238,7 @@ class _Tools:
         unknown = set(args) - set(cast(dict[str, Any], CREATE_WATCH.args_schema["properties"]))
         if unknown:
             raise ToolFailed(f"create_watch: unknown arguments: {sorted(unknown)}")
-        principal, task_id = self._principal(ctx)
+        principal, task = self._caller(ctx)
         what = _opt_str(args, "what")
         if what is None:
             raise ToolFailed("create_watch: what is required")
@@ -204,9 +246,16 @@ class _Tools:
         tool, ask = _opt_str(args, "tool"), _opt_str(args, "ask")
         if (tool is None) == (ask is None):
             raise ToolFailed("create_watch: give either tool (with args) or ask, not both")
-        then = args.get("then", "stop")
-        if then not in ("stop", "continue"):
-            raise ToolFailed("create_watch: then is stop or continue")
+        follow_up = _opt_str(args, "follow_up")
+        then = args.get("then", "follow_up" if follow_up is not None else "stop")
+        if then not in store.THENS:
+            raise ToolFailed("create_watch: then is stop, continue or follow_up")
+        if then == "follow_up" and follow_up is None:
+            raise ToolFailed("create_watch: then=follow_up needs follow_up (what to do then)")
+        if follow_up is not None and then != "follow_up":
+            raise ToolFailed("create_watch: follow_up goes with then=follow_up")
+        if follow_up is not None:
+            follow_up = " ".join(follow_up.split())[: store.FOLLOW_UP_MAX]
         minimum = cfg.min_interval_minutes if tool is not None else cfg.ask_min_interval_minutes
         every = _int(args, "every_minutes", max(60, minimum))
         if every < minimum:
@@ -228,9 +277,9 @@ class _Tools:
             op = args.get("when")
             if op not in store.TOOL_OPS:
                 raise ToolFailed("create_watch: when is contains, missing or changed")
-            value = _opt_str(args, "text")
+            value = self._match_text(args)
             if op != "changed" and value is None:
-                raise ToolFailed(f"create_watch: when={op} needs text")
+                raise ToolFailed(f"create_watch: when={op} needs match_text")
             fields = {
                 "check_kind": "tool",
                 "tool": spec.name,
@@ -240,8 +289,8 @@ class _Tools:
                 "value": value if op != "changed" else None,
             }
         else:
-            if any(k in args for k in ("args", "when", "text")):
-                raise ToolFailed("create_watch: an ask watch takes no args, when or text")
+            if any(k in args for k in ("args", "when", "text", "match_text")):
+                raise ToolFailed("create_watch: an ask watch takes no args, when or match_text")
             fields = {"check_kind": "ask", "question": ask, "op": "yes"}
         if store.active_count(self.ctx.conn, principal) >= cfg.max_active:
             raise ToolFailed(
@@ -256,10 +305,30 @@ class _Tools:
             now=now,
             expires_at=now + timedelta(days=days),
             then=then,
-            created_by_task=task_id,
+            created_by_task=task.id if task is not None else None,
+            channel_ref=task.channel_ref if task is not None else None,
+            conversation=task.conversation if task is not None else None,
+            follow_up=follow_up,
             **fields,
         )
         return {**store.describe(w), "created": True}
+
+    @staticmethod
+    def _match_text(args: dict[str, Any]) -> str | None:
+        """``match_text`` (``text``, its old name, when only that is given). Refused when it
+        reads like a sentence: that is an instruction, and belongs in ``follow_up``."""
+        value, old = _opt_str(args, "match_text"), _opt_str(args, "text")
+        if value is not None and old is not None and value != old:
+            raise ToolFailed("create_watch: give match_text only (text is its old name)")
+        value = value if value is not None else old
+        if value is not None and store.sentence_like(value):
+            raise ToolFailed(
+                "create_watch: match_text is a short literal string to find in the tool's "
+                f"result (at most {store.MATCH_TEXT_MAX} characters, not a sentence), like "
+                "MERGED. To do something when the watch fires, set then: follow_up and put "
+                "the instruction in follow_up."
+            )
+        return value
 
     async def list(self, args: dict[str, Any], ctx: CallContext | None = None) -> dict[str, Any]:
         no_args(LIST_WATCHES.name, args)
