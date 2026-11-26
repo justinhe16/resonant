@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "@/Dashboard";
 import { clone, FIXTURE_NOW, local, remote } from "@/test/fixtures";
+import { openSections } from "@/test/sections";
 import priceFixture from "@/test/fixtures/price.json";
 import type { DayLoader } from "@/lib/panelDays";
 import type { Panel, PanelDay, PriceWidget, Snapshot } from "@/types";
@@ -11,6 +12,7 @@ const user = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 const mount = (snap: Snapshot) => render(<Dashboard load={async () => snap} />);
 
 beforeEach(() => {
+  openSections();
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(FIXTURE_NOW);
 });

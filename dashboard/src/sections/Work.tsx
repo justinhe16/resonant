@@ -55,6 +55,7 @@ export function ActiveRuns({ snap, now }: { snap: Snapshot; now: number }) {
       render={(r) => <RunRow key={r.code} run={r} now={now} />}
       empty="No runs in flight."
       defaultOpen
+      peek
       explainer="runs"
     />
   );

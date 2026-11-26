@@ -15,7 +15,6 @@ export function Extensions({ snap, now }: { snap: Snapshot; now: number }) {
       render={(ext) => <ExtensionRow key={ext.name} ext={ext} now={now} />}
       empty="No extensions installed."
       explainer="extensions"
-      previewCount={3}
     />
   );
 }

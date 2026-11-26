@@ -33,14 +33,21 @@ export interface CollapsibleSectionProps<T> {
   title: string;
   /** How many exist (for runs: from the counts, which can exceed the rows the snapshot keeps). */
   total: number;
-  /** Newest first; collapsed shows `previewCount`, open pages by `pageSize`. */
+  /** Newest first; open pages by `pageSize` (collapsed shows none unless `peek`). */
   rows?: T[];
   render?: (row: T, index: number) => ReactNode;
+  /** With `peek`, how many rows a collapsed section still shows. */
   previewCount?: number;
   pageSize?: number;
+  /** For a section never opened or closed on this browser; collapsed by default. */
   defaultOpen?: boolean;
+  /**
+   * Collapsed still shows `summary` and the newest `previewCount` rows. Only the "now" sections
+   * (Waiting on you, Active runs) peek; every other section collapses to its header (PER-345).
+   */
+  peek?: boolean;
   explainer?: ExplainerKey;
-  /** Shown in both states under the header (counts, pills). */
+  /** Shown under the header while open (and while collapsed when `peek`). */
   summary?: ReactNode;
   /** Shown when there are no rows. */
   empty?: ReactNode;
@@ -52,8 +59,9 @@ export interface CollapsibleSectionProps<T> {
 }
 
 /**
- * A card whose header is a button (aria-expanded) that opens and closes it. Closed it still
- * shows the newest few rows; open it shows a page of them and a "Show more" button.
+ * A card whose header is a button (aria-expanded) that opens and closes it. Closed it is just
+ * the header (title, total, `action` badges); open it shows the summary, a page of rows and a
+ * "Show more" button. A `peek` section keeps its summary and newest few rows while closed.
  */
 export function CollapsibleSection<T>({
   id,
@@ -64,6 +72,7 @@ export function CollapsibleSection<T>({
   previewCount = 3,
   pageSize = 10,
   defaultOpen = false,
+  peek = false,
   explainer,
   summary,
   empty,
@@ -82,10 +91,11 @@ export function CollapsibleSection<T>({
     [id],
   );
   const all = rows ?? [];
-  const visible = open ? Math.min(all.length, pages * pageSize) : Math.min(all.length, previewCount);
+  const body = open || peek;
+  const visible = open ? Math.min(all.length, pages * pageSize) : peek ? Math.min(all.length, previewCount) : 0;
   const shown = all.slice(0, visible);
   const left = all.length - visible;
-  const count = rows ? `${visible} of ${total}` : `${total}`;
+  const count = rows && body ? `${visible} of ${total}` : `${total}`;
   return (
     <Collapsible open={open} onOpenChange={toggle} data-testid={`section-${id}`}>
       <Card className="[--card-spacing:--spacing(5)]">
@@ -103,23 +113,25 @@ export function CollapsibleSection<T>({
             {explainer && <Explainer name={title} text={explainer} />}
           </div>
         </CardHeader>
-        <CardContent className="space-y-4">
-          {summary}
-          {rows &&
-            render &&
-            (all.length === 0 ? empty && <Empty>{empty}</Empty> : <Rows>{shown.map((r, i) => render(r, i))}</Rows>)}
-          <CollapsibleContent className="space-y-4">
-            {open && left > 0 && (
-              <Button variant="outline" size="sm" onClick={() => setPages((p) => p + 1)}>
-                Show more ({left} left)
-              </Button>
-            )}
-            {open && left === 0 && all.length < total && keptNote && (
-              <p className="text-xs text-muted-foreground">{keptNote}</p>
-            )}
-            {children}
-          </CollapsibleContent>
-        </CardContent>
+        {body && (
+          <CardContent className="space-y-4">
+            {summary}
+            {rows &&
+              render &&
+              (all.length === 0 ? empty && <Empty>{empty}</Empty> : <Rows>{shown.map((r, i) => render(r, i))}</Rows>)}
+            <CollapsibleContent className="space-y-4">
+              {open && left > 0 && (
+                <Button variant="outline" size="sm" onClick={() => setPages((p) => p + 1)}>
+                  Show more ({left} left)
+                </Button>
+              )}
+              {open && left === 0 && all.length < total && keptNote && (
+                <p className="text-xs text-muted-foreground">{keptNote}</p>
+              )}
+              {children}
+            </CollapsibleContent>
+          </CardContent>
+        )}
       </Card>
     </Collapsible>
   );

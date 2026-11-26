@@ -1,17 +1,21 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { PanelGlance } from "@/components/panel/PanelGlance";
 import { channelName } from "@/lib/snapshot";
 import { Claude } from "@/sections/Claude";
 import { Rules } from "@/sections/Rules";
+import { Slack } from "@/sections/Slack";
 import { Credentials } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
 import { clone, cori, FIXTURE_NOW, local } from "@/test/fixtures";
+import { openSections } from "@/test/sections";
 import { credentialGroups } from "@/lib/credentials";
 import type { Panel, SecretExpiry, Snapshot } from "@/types";
 
 const NOW = FIXTURE_NOW.getTime();
+
+beforeEach(openSections);
 
 /** Cori as it runs: Slack on, iMessage off (so no imessage health row). */
 const slackOnly: Snapshot = clone(cori, {
@@ -128,5 +132,29 @@ describe("the credentials card shows every credential", () => {
     await userEvent.setup().click(more);
     expect(await screen.findAllByRole("listitem")).toHaveLength(7);
     expect(screen.getByRole("button", { name: "Show fewer" })).toBeInTheDocument();
+  });
+});
+
+describe("collapsed headers (PER-345)", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  it("shows Slack collapsed, its connection as a header badge", () => {
+    const slack = { connected: true, last_event_at: null, followed_threads: 2 };
+    const { unmount } = render(<Slack slack={{ ...slack, connected: true }} now={NOW} />);
+    expect(screen.getByRole("button", { name: /^Slack/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("slack-row")).not.toBeInTheDocument();
+    expect(screen.getByTestId("slack-state")).toHaveTextContent("connected");
+    unmount();
+    render(<Slack slack={{ ...slack, connected: false }} now={NOW} />);
+    expect(screen.getByTestId("slack-state")).toHaveTextContent("disconnected");
+  });
+
+  it("keeps a worker runner that isn't set up visible on the collapsed Claude header", () => {
+    const { unmount } = render(<Claude snap={clone(local, { runner: { ...local.runner, set_up: false } })} now={NOW} />);
+    expect(screen.getByTestId("runner-not-set-up")).toBeInTheDocument();
+    expect(screen.queryByText("Worker runner")).not.toBeInTheDocument();
+    unmount();
+    render(<Claude snap={clone(local, { runner: { ...local.runner, set_up: true } })} now={NOW} />);
+    expect(screen.queryByTestId("runner-not-set-up")).not.toBeInTheDocument();
   });
 });

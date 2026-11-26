@@ -6,6 +6,7 @@ import { SupabaseGate } from "@/SupabaseGate";
 import { INSTANCE_KEY } from "@/lib/instances";
 import type { RemoteClient } from "@/lib/supabase";
 import { clone, cori, FIXTURE_NOW, local, remote } from "@/test/fixtures";
+import { openSections } from "@/test/sections";
 import type { Snapshot } from "@/types";
 
 type Route = () => Response;
@@ -39,6 +40,7 @@ beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(FIXTURE_NOW);
   window.sessionStorage.clear();
+  openSections();
 });
 afterEach(() => {
   vi.useRealTimers();
