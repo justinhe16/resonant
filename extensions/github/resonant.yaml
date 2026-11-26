@@ -60,7 +60,9 @@ tools:
     approval_summary: "re-run the failed CI on PR #{number} in {repo}"
     args: {repo: string, number: integer}
     secrets: [token]
-    github_app: {repo: repo, permissions: {actions: write, contents: read, pull_requests: read}}
+    github_app:                        # pr view reads statusCheckRollup: checks and statuses
+      repo: repo
+      permissions: {actions: write, contents: read, pull_requests: read, checks: read, statuses: read}
     timeout_s: 120
   merge_pr:
     description: >-

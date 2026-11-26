@@ -113,12 +113,14 @@ APP_NO_USER = (
 )
 PAGE_SIZE = 100
 PAGES_MAX = 3  # 300 files or comments of each kind
-# pr_diff: a file's patch is clipped to PATCH_FILE_MAX characters and all of them to
-# PATCH_TOTAL_MAX bytes as JSON, so the result stays under Resonant's 32 KB store cap with the
-# file list (at most DIFF_FILES_LISTED entries) beside them.
+# pr_diff: a file's patch is clipped to PATCH_FILE_MAX characters (and bytes as JSON), all of
+# them to PATCH_TOTAL_MAX bytes; then the result is trimmed (patches from the end, then files)
+# until it fits RESULT_MAX, under Resonant's 32 KB store cap as the executor measures it
+# (``json.dumps`` with ASCII escapes), so a big PR never collapses to a truncated blob.
 PATCH_FILE_MAX = 3000
 PATCH_TOTAL_MAX = 18000
 DIFF_FILES_LISTED = 100
+RESULT_MAX = 30000
 # pr_comments: the newest of each kind, bodies clipped.
 COMMENTS_MAX = 30
 COMMENT_TEXT_MAX = 600
@@ -556,7 +558,7 @@ def cmd_pr_diff(gh: Gh, repo: str, number: int) -> dict[str, Any]:
         if not isinstance(raw, str):
             entry["no_patch"] = True
         else:
-            patch, cost = fit(raw[:PATCH_FILE_MAX], budget)
+            patch, cost = fit(raw[:PATCH_FILE_MAX], min(PATCH_FILE_MAX + 2, budget))
             budget -= cost
             if patch:
                 entry["patch"] = patch
@@ -566,26 +568,37 @@ def cmd_pr_diff(gh: Gh, repo: str, number: int) -> dict[str, Any]:
         out.append(entry)
     adds = sum(_int(_d(f).get("additions")) for f in files)
     dels = sum(_int(_d(f).get("deletions")) for f in files)
-    summary = f"{ref({'repo': repo, 'number': number})}: {len(files)} files, +{adds} -{dels}"
-    if truncated or len(files) > DIFF_FILES_LISTED:
-        summary += f"; first {len(out)} files listed"
-    if clipped_any:
-        summary += "; some patches clipped"
-    return {
-        "repo": repo,
-        "number": number,
-        "summary": summary,
-        "files": out,
-        "truncated": truncated or len(files) > DIFF_FILES_LISTED,
-    }
+    truncated = truncated or len(files) > DIFF_FILES_LISTED
+
+    def result() -> dict[str, Any]:
+        summary = f"{ref({'repo': repo, 'number': number})}: {len(files)} files, +{adds} -{dels}"
+        if truncated:
+            summary += f"; first {len(out)} files listed"
+        if clipped_any:
+            summary += "; some patches clipped"
+        return {"repo": repo, "number": number, "summary": summary, "files": out,
+                "truncated": truncated}  # fmt: skip
+
+    # Trim to the store cap: the latest patches first, then the latest files.
+    while len(json.dumps(result())) > RESULT_MAX:
+        patched = [e for e in out if "patch" in e]
+        if patched:
+            del patched[-1]["patch"]
+            patched[-1]["patch_clipped"] = clipped_any = True
+        elif out:
+            out.pop()
+            truncated = True
+        else:
+            break
+    return result()
 
 
 def fit(text: str, budget: int) -> tuple[str, int]:
     """``(prefix, its bytes as JSON)``: the longest prefix of ``text`` whose JSON string
-    (escapes and UTF-8 counted) fits in ``budget`` bytes, found by halving."""
+    (ASCII-escaped, as Resonant measures a result) fits in ``budget`` bytes, by halving."""
 
     def cost(t: str) -> int:
-        return len(json.dumps(t, ensure_ascii=False).encode())
+        return len(json.dumps(t))
 
     if budget <= 2:
         return "", 0

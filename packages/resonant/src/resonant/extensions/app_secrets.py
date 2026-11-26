@@ -22,6 +22,7 @@ with no ``secret_sources``, reads every extension secret from the Keychain as be
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Iterable
@@ -32,6 +33,9 @@ from resonant_sdk.tool import APP_READ_DEFAULT
 
 log = logging.getLogger(__name__)
 
+# A revoke retries with backoff; past this the call's result isn't held up any longer (the
+# token expires within the hour anyway).
+REVOKE_TIMEOUT_S = 10.0
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 
 
@@ -65,7 +69,9 @@ class GitHubAppMinter:
 
     async def release(self, value: str) -> None:
         try:
-            await self.app.revoke(value)
+            await asyncio.wait_for(self.app.revoke(value), REVOKE_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("extension token not revoked: timed out after %.0fs", REVOKE_TIMEOUT_S)
         except GitHubAppError as e:
             # The token expires within the hour anyway; the error names no value.
             log.warning("extension token not revoked: %s", e)

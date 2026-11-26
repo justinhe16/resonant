@@ -1001,7 +1001,8 @@ def test_pr_diff_lists_files_and_clips_patches(gh: FakeGh) -> None:
                  "patch": "@@ -1 +1 @@\n-old\n+new"}  # fmt: skip
     assert png["no_patch"] is True and "patch" not in png
     assert renamed["previous_file"] == "src/old.ts" and renamed["patch_clipped"] is True
-    assert len(renamed["patch"]) == 3000 and renamed["patch"].startswith("@@ -1 +1 @@\n+x\n")
+    assert 2990 <= len(json.dumps(renamed["patch"])) <= 3002  # bytes as the executor counts
+    assert renamed["patch"].startswith("@@ -1 +1 @@\n+x\n")
     assert r.out["summary"] == "voyager-web#159: 3 files, +2002 -1; some patches clipped"
     assert r.out["truncated"] is False
     assert gh.calls()[0]["argv"] == ["api", f"repos/{DORI}/pulls/159/files?per_page=100&page=1"]
@@ -1015,7 +1016,7 @@ def test_pr_diff_pages_and_keeps_the_total_under_the_cap(gh: FakeGh) -> None:
     assert [c["argv"][1].rsplit("=", 1)[-1] for c in gh.calls()] == ["1", "2", "3"]
     assert len(r.out["files"]) == 100 and r.out["truncated"] is True
     patched = [f for f in r.out["files"] if "patch" in f]
-    assert 5 <= len(patched) <= 6  # 3002 bytes each as JSON, 18000 in all
+    assert 4 <= len(patched) <= 6  # 3002 bytes each as JSON, 18000 at most
     assert all(f["patch_clipped"] for f in r.out["files"][len(patched) :])
     assert len(r.stdout.encode()) < 32 * 1024  # under Resonant's stored-result cap
     assert "first 100 files listed" in r.out["summary"]
@@ -1028,9 +1029,20 @@ def test_pr_diff_budget_counts_json_escapes(gh: FakeGh) -> None:
     }
     r = gh.run("pr_diff", "--repo", DORI, "--number", "8")
     assert r.code == 0, r.err
-    sizes = [len(json.dumps(f["patch"], ensure_ascii=False).encode()) for f in r.out["files"]
-             if "patch" in f]  # fmt: skip
-    assert sum(sizes) <= 18000 and len(r.stdout.encode()) < 32 * 1024
+    sizes = [len(json.dumps(f["patch"])) for f in r.out["files"] if "patch" in f]
+    assert sum(sizes) <= 18000 and len(json.dumps(r.out)) <= 30000
+
+
+def test_pr_diff_fits_the_store_cap_with_long_names_and_non_ascii(gh: FakeGh) -> None:
+    """The executor measures ``json.dumps`` (ASCII escapes): \u00e9 is 6 bytes there."""
+    name = "src/" + "deeply/nested/" * 5 + "file"
+    files = [diff_file(f"{name}{i}.py", "é" * 2900) for i in range(120)]
+    gh.state["api"] = {f"repos/{DORI}/pulls/9/files": files}
+    r = gh.run("pr_diff", "--repo", DORI, "--number", "9")
+    assert r.code == 0, r.err
+    assert len(json.dumps(r.out)) <= 30000 < 32 * 1024
+    assert r.out["files"] and r.out["truncated"] is True
+    assert r.out["files"][0]["patch"].startswith("é")
 
 
 def test_pr_comments_reviews_inline_and_conversation(gh: FakeGh) -> None:
