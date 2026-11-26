@@ -275,3 +275,48 @@ def test_denials_and_conditional_promises_dont_claim(reply: str) -> None:
 def test_a_real_claim_next_to_a_conditional_still_counts() -> None:
     reply = "I started R4. Once it's done, I'll post the PR."
     assert claims_done(reply, "robot surf DORI-1173 please")
+
+
+# --- PER-340: brain.reply_guard ---------------------------------------------------------------
+
+
+def test_reply_guard_defaults_to_strict_and_takes_only_strict_or_lenient() -> None:
+    from pydantic import ValidationError
+
+    from resonant.config import BrainConfig
+
+    assert BrainConfig().reply_guard == "strict"
+    assert BrainConfig.model_validate({"reply_guard": "lenient"}).reply_guard == "lenient"
+    with pytest.raises(ValidationError):
+        BrainConfig.model_validate({"reply_guard": "off"})
+
+
+@pytest.mark.parametrize("kind", ["numbers", "claim", "allow"])
+def test_lenient_sends_a_flagged_reply_strict_never_does(kind: guard.Kind) -> None:
+    problem = Problem(kind, ("4817",) if kind == "numbers" else ())
+    assert guard.sends_anyway(problem, "lenient")
+    assert not guard.sends_anyway(problem, "strict")
+    assert not guard.sends_anyway(problem, "anything else")  # fails closed to strict
+
+
+def test_tool_call_text_is_never_sent_in_either_mode() -> None:
+    assert not guard.sends_anyway(Problem("call"), "lenient")
+    assert not guard.sends_anyway(Problem("call"), "strict")
+
+
+@pytest.mark.parametrize("mode", ["strict", "lenient"])
+def test_the_daemon_hands_brain_reply_guard_to_the_ask_runner(mode: str) -> None:
+    from resonant.config import load_settings
+    from resonant.daemon import Daemon
+    from resonant.e2e import FakeChannel
+    from resonant.principals import Principal, Principals
+    from resonant.runners.ask import AskRunner
+
+    owner = Principals(principals={"justin": Principal(role="owner", identities=("slack:U1",))})
+    settings = load_settings(brain={"reply_guard": mode})
+    daemon = Daemon(settings, channels={"slack": FakeChannel("slack", owner)})
+    try:
+        asks = daemon.loop.runners["ask"]
+        assert isinstance(asks, AskRunner) and asks.reply_guard == mode
+    finally:
+        daemon.conn.close()

@@ -136,6 +136,9 @@ pulse:
 #                                       #   ~/.aws, .env*, *.pem, *.key, id_*, credentials, .git/config, ...);
 #                                       #   "/abs" or "~/x" is a path, anything else a glob ("*.secret")
 #   rg_path: /opt/homebrew/bin/rg       # ripgrep for search; missing: a bounded Python search
+#   reply_guard: strict                 # PER-340: strict | lenient. strict: a reply the guard doubts
+#                                       #   twice becomes a short fallback; lenient: Claude's words go
+#                                       #   out, flagged (see config/cori.example.yaml)
 #   ask_claude:                         # a Claude session per hard question (BR-5); it reads the
 #                                       #   same roots and deny list (its own tools stay read-only)
 #     enabled: true

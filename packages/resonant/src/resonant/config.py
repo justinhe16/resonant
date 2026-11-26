@@ -1330,6 +1330,12 @@ class BrainConfig(_Section):
     # Claude answer), this many later turns stay tainted (their model-chosen changes ask,
     # except notes, reminders and facts). The turn that read it is tainted as well.
     taint_hops: int = Field(default=3, ge=0, le=20)
+    # PER-340: what the reply guard (``brain/guard.py``) does with a reply it still doubts.
+    # ``strict`` (the default): a flagged reply is redone once, then a short code-built
+    # fallback goes out instead ("I didn't save that; nothing changed."). ``lenient`` (a team
+    # instance): the same one redo, but Claude's own words go out with the flag recorded on
+    # the span, never a canned line; the text of a tool call is still never sent.
+    reply_guard: Literal["strict", "lenient"] = "strict"
     # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
     # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
     read_roots: list[Path] | None = None
