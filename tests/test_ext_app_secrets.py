@@ -442,8 +442,8 @@ async def test_an_instance_with_the_app_reads_reviews_checks_diff_and_merges(
     reads = [m["permissions"] for m in api.mints[:3]]
     assert all(set(p.values()) == {"read"} for p in reads)
     assert api.mints[3]["permissions"] == {
-        "metadata": "read", "contents": "write", "pull_requests": "write", "checks": "read",
-        "statuses": "read",
+        "metadata": "read", "actions": "read", "contents": "write", "pull_requests": "write",
+        "checks": "read", "statuses": "read",
     }  # fmt: skip
     calls = inst.gh_calls()
     assert all(c["token_ok"] for c in calls)

@@ -77,9 +77,9 @@ tools:
     approval_summary: "merge PR #{number} in {repo}{~head_sha}"  # OK to merge PR #121 in …?
     args: {repo: string, number: integer, head_sha: string}
     secrets: [token]
-    github_app:
+    github_app:                        # pr view's statusCheckRollup reads each check's workflow run
       repo: repo
-      permissions: {contents: write, pull_requests: write, checks: read, statuses: read}
+      permissions: {actions: read, contents: write, pull_requests: write, checks: read, statuses: read}
     timeout_s: 120
   comment_pr:
     description: Post a comment on a pull request's conversation (any repo the token can write to).

@@ -195,8 +195,12 @@ def test_manifest_passes_every_check() -> None:
         assert reach is not None and reach.repo == "repo"
         assert set(reach.permissions.values()) == {"read"}
     assert app["merge_pr"] is not None and app["merge_pr"].permissions == {
-        "contents": "write", "pull_requests": "write", "checks": "read", "statuses": "read",
-    }  # fmt: skip
+        "actions": "read",
+        "contents": "write",
+        "pull_requests": "write",
+        "checks": "read",
+        "statuses": "read",
+    }  # fmt: skip  (actions: pr view's statusCheckRollup reads each check's workflow run)
     assert app["comment_pr"] is not None and app["comment_pr"].permissions == {
         "pull_requests": "write"
     }
