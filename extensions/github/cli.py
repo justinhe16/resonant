@@ -63,6 +63,7 @@ _PENDING_STATES = frozenset({"PENDING", "EXPECTED"})
 # A check entry's ``state`` (lowercase) once it finished, whatever the outcome.
 _DONE_STATES = frozenset(
     {"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required",
+     "completed",
      "stale", "startup_failure", "error"}
 )  # fmt: skip
 
