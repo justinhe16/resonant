@@ -495,6 +495,26 @@ async def test_loop_failed_tasks(env: Env) -> None:
     assert _state(env.db, "loop")["state"] == "ok"
 
 
+async def test_loop_ignores_failed_worker_runs(env: Env) -> None:
+    # a failed run task is the run's outcome (shown in Runs), not a loop problem
+    for i in range(5):
+        env.db.execute(
+            "INSERT INTO tasks (id, kind, runner, priority, status, trace_id, created_at,"
+            " updated_at) VALUES (?, 'run', 'claude', 1, 'failed', 't', ?, ?)",
+            (f"R{i}", iso(T0), iso(T0)),
+        )
+    await env.tick()
+    assert _state(env.db, "loop")["state"] == "ok"
+    for i in range(3):
+        env.db.execute(
+            "INSERT INTO tasks (id, kind, runner, priority, status, trace_id, created_at,"
+            " updated_at) VALUES (?, 'k', 'echo', 1, 'failed', 't', ?, ?)",
+            (f"T{i}", iso(T0), iso(T0)),
+        )
+    await env.tick()
+    assert _state(env.db, "loop")["detail"] == "3 tasks failed in the last hour"
+
+
 async def test_persistent_send_failure_goes_to_deadman(env: Env) -> None:
     assert env.channel is not None
     env.channel.fail_sends = True

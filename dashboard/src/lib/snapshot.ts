@@ -183,6 +183,13 @@ export function worstHealth(states: string[]): HealthState {
   return worst;
 }
 
+/** The channel the owner talks to this instance on: Slack when the instance has a Slack
+ * adapter and no iMessage health row (a disabled channel is not reported), else iMessage. */
+export function channelName(snap: Pick<Snapshot, "channels" | "health">): "Slack" | "iMessage" {
+  const imessage = snap.health.some((h) => h.name === "imessage");
+  return snap.channels?.slack && !imessage ? "Slack" : "iMessage";
+}
+
 export function sum(by: Record<string, number>, keys?: string[]): number {
   return Object.entries(by)
     .filter(([k]) => !keys || keys.includes(k))

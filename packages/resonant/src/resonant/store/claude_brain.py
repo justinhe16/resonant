@@ -32,13 +32,15 @@ def session_state(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def status_of(conn: sqlite3.Connection) -> dict[str, Any] | None:
-    """``{state: up|down, turns, remote_url?}``, or None when there is no session yet."""
+    """``{state: up|idle, turns, remote_url?}``, or None when there is no session yet. The brain
+    runs per turn, so a session with no live process is ``idle`` (ready for the next turn),
+    not down."""
     st = session_state(conn)
     if not st.get("session_id"):
         return None
     turns = st.get("turns")
     out: dict[str, Any] = {
-        "state": "up" if isinstance(st.get("pid"), int) else "down",
+        "state": "up" if isinstance(st.get("pid"), int) else "idle",
         "turns": turns if isinstance(turns, int) and not isinstance(turns, bool) else 0,
     }
     url = st.get("remote_url")

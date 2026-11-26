@@ -4,7 +4,7 @@ import { Empty, Group, OutsideText, Rows } from "@/components/bits";
 import { ListRow } from "@/components/ListRow";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { approvalTitle, isOutside } from "@/lib/snapshot";
+import { approvalTitle, channelName, isOutside } from "@/lib/snapshot";
 import { short } from "@/lib/time";
 import { approvalTone, levelTone } from "@/lib/tone";
 import type { ApprovalItem, QuestionItem, Snapshot } from "@/types";
@@ -22,7 +22,7 @@ export function WaitingOnYou({ snap, now }: { snap: Snapshot; now: number }) {
       defaultOpen
       explainer="approvals"
       action={<Badge variant={open ? "warn" : "neutral"}>{open} open</Badge>}
-      summary={<p className="text-xs text-muted-foreground">Answer on iMessage</p>}
+      summary={<p className="text-xs text-muted-foreground">Answer on {channelName(snap)}</p>}
     >
       <div className="space-y-5">
         <Group label="Approvals" count={snap.approvals.open}>

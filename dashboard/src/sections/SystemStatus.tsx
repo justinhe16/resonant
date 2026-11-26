@@ -1,4 +1,5 @@
 import { ChevronDown, OctagonPause } from "lucide-react";
+import { useState } from "react";
 import { Ago, Dot, OutsideText, Row, RouteLink, Rows, Section, StateBadge } from "@/components/bits";
 import type { BadgeTone } from "@/components/ui/badge";
 import { Explainer } from "@/components/Explainer";
@@ -8,7 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Separator } from "@/components/ui/separator";
 import { CREDENTIALS_SHOWN, type CredentialGroup, credentialLabel, credentialTone } from "@/lib/credentials";
 import type { ExplainerKey } from "@/lib/explainers";
-import { isOutside, worstHealth } from "@/lib/snapshot";
+import { channelName, isOutside, worstHealth } from "@/lib/snapshot";
 import { duration } from "@/lib/time";
 import { healthTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
@@ -56,7 +57,7 @@ export function SystemStatus({ snap, now, stale }: { snap: Snapshot; now: number
           <Alert variant="warn">
             <OctagonPause />
             <AlertTitle>Kill switch is on</AlertTitle>
-            <AlertDescription>Autonomy is off and jobs are paused. /resume on iMessage turns it back.</AlertDescription>
+            <AlertDescription>Autonomy is off and jobs are paused. /resume on {channelName(snap)} turns it back.</AlertDescription>
           </Alert>
         )}
         <div className="flex flex-wrap gap-1.5">
@@ -118,6 +119,40 @@ export function SystemStatus({ snap, now, stale }: { snap: Snapshot; now: number
   );
 }
 
+/** The soonest few expiries, with the rest behind "N more". */
+function CredentialList({ group: g }: { group: CredentialGroup }) {
+  const [all, setAll] = useState(false);
+  const hidden = g.secrets.length - CREDENTIALS_SHOWN;
+  const shown = all || hidden <= 0 ? g.secrets : g.secrets.slice(0, CREDENTIALS_SHOWN);
+  return (
+    <>
+      <ul className="space-y-1">
+        {shown.map((e) => {
+          const tone = credentialTone(e, g.taken_at);
+          return (
+            <li key={e.ref} className="flex items-center gap-2 text-sm" data-tone={tone}>
+              <Dot tone={tone} className="size-1.5" />
+              <span className="min-w-0 truncate font-mono text-xs" title={e.expires_at}>
+                {e.ref}
+              </span>
+              <span className={cn("ml-auto shrink-0 tabular-nums", TONE_TEXT[tone])}>{credentialLabel(e, g.taken_at)}</span>
+            </li>
+          );
+        })}
+      </ul>
+      {hidden > 0 && (
+        <button
+          type="button"
+          className="mt-1 text-xs text-muted-foreground underline-offset-2 hover:underline"
+          onClick={() => setAll((v) => !v)}
+        >
+          {all ? "Show fewer" : `${hidden} more`}
+        </button>
+      )}
+    </>
+  );
+}
+
 const TONE_TEXT: Partial<Record<BadgeTone, string>> = { bad: "text-bad", warn: "text-warn-foreground" };
 
 /** The soonest credential expiries of each instance, side by side when there is more than one:
@@ -129,20 +164,7 @@ export function Credentials({ groups, now }: { groups: CredentialGroup[]; now: n
         {groups.map((g) => (
           <div key={g.name} className="min-w-0" data-testid={`credentials-${g.name}`}>
             {groups.length > 1 && <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">{g.name}</h3>}
-            <ul className="space-y-1">
-              {g.secrets.slice(0, CREDENTIALS_SHOWN).map((e) => {
-                const tone = credentialTone(e, g.taken_at);
-                return (
-                  <li key={e.ref} className="flex items-center gap-2 text-sm" data-tone={tone}>
-                    <Dot tone={tone} className="size-1.5" />
-                    <span className="min-w-0 truncate font-mono text-xs" title={e.expires_at}>
-                      {e.ref}
-                    </span>
-                    <span className={cn("ml-auto shrink-0 tabular-nums", TONE_TEXT[tone])}>{credentialLabel(e, g.taken_at)}</span>
-                  </li>
-                );
-              })}
-            </ul>
+            <CredentialList group={g} />
             <p className="mt-1.5 text-xs text-muted-foreground">
               <Ago iso={g.taken_at} now={now} prefix="as of " />
             </p>

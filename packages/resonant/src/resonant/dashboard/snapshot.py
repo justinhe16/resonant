@@ -41,7 +41,7 @@ import json
 import re
 import sqlite3
 import subprocess
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast, get_args
@@ -850,7 +850,7 @@ class ClaudeBrain(_Model):
     """BR-11: the Claude brain's session: up or down, its turns, its Remote Control link while
     one is on (local only), and its last tool calls (PER-258)."""
 
-    state: Literal["up", "down"]
+    state: Literal["up", "idle", "down"]  # idle: no turn running, the session is ready
     turns: int
     remote_url: str | None = _local()
     tools: list[BrainTool] = _list()
@@ -863,7 +863,7 @@ class BrainActivity(_Model):
 
     calls_today: int
     writes_today: int
-    state: Literal["up", "down"] | None = None
+    state: Literal["up", "idle", "down"] | None = None
     turns: int = 0
 
 
@@ -1145,10 +1145,14 @@ def _since(raw: object) -> datetime | None:
         return None
 
 
-def _health(conn: sqlite3.Connection, t: _Text) -> dict[str, HealthRow]:
+def _health(
+    conn: sqlite3.Connection, t: _Text, disabled: Collection[str] = ()
+) -> dict[str, HealthRow]:
+    """The health rows. ``disabled``: channels this instance doesn't run: no row at all, so
+    they can't drag the overall state."""
     rows: dict[str, HealthRow] = {}
     for name, h in health_snapshot(conn).items():
-        if not _ident(name):  # a stale or hand-edited kv key
+        if not _ident(name) or name in disabled:  # a stale or hand-edited kv key
             continue
         detail = h.get("detail")
         reason = t.opt(detail, 200) if isinstance(detail, str) and detail else None
@@ -1726,7 +1730,17 @@ def build_snapshot(
     if session is not None and isinstance(session.get("remote_url"), str):
         links.append(session["remote_url"])
     t = _Text(Redactor([*(redactor.values if redactor else ()), *links]))
-    health = _health(conn, t)
+    channels_cfg = settings.channels
+    health = _health(
+        conn,
+        t,
+        disabled={
+            name
+            for name, on in (("imessage", channels_cfg.imessage.enabled),
+                             ("slack", channels_cfg.slack.enabled))
+            if not on
+        },
+    )  # fmt: skip
     ctx = _Context(conn, now, owner)
 
     task_rows = task_store.recent(conn, TASK_ITEMS)
@@ -2083,9 +2097,12 @@ def _diagram(
     # The core skeleton, health from its check (or the state the snapshot already has).
     for c in diagram_parts.CORE:
         row = health.get(c.check) if c.check else None
-        state: HealthState | None = row.state if row else ("unknown" if c.check else None)
+        # No imessage row: that channel is disabled on this instance, not unknown.
+        state: HealthState | None = (
+            row.state if row else ("unknown" if c.check and c.check != "imessage" else None)
+        )
         if c.id == "brain":
-            state = "unknown" if brain is None else ("ok" if brain.state == "up" else "degraded")
+            state = "unknown" if brain is None else ("degraded" if brain.state == "down" else "ok")
         elif c.id == "workers":
             state = "ok" if runner.set_up else "degraded"
         elif c.id == "scheduler" and core_jobs:
@@ -2611,7 +2628,7 @@ def _claude_brain(conn: sqlite3.Connection, t: _Text) -> ClaudeBrain | None:
     url = found.get("remote_url")
     up = found.get("state") == "up"
     return ClaudeBrain(
-        state="up" if up else "down",
+        state="up" if up else "idle",
         turns=int(found.get("turns") or 0),
         remote_url=url if up and isinstance(url, str) and _RC_URL.fullmatch(url) else None,
         tools=_brain_tools(conn, t),
