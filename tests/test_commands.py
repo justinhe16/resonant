@@ -393,6 +393,7 @@ def test_owner_only_commands() -> None:
         "/run",
         "/runs",
         "/cancel",
+        "/continue",
         "/merge",
         "/repos",
         "/repo",

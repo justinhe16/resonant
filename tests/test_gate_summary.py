@@ -190,6 +190,7 @@ BUILTIN_PROMPTS = {
         "if clean)? [X6] yes / no",
     ),
     "cancel_run": ({"code": "R4"}, "OK to cancel R4? [X6] yes / no"),
+    "continue_run": ({"code": "R4"}, "OK to continue R4? [X6] yes / no"),
     "answer_worker": (
         {"code": "R4", "text": "use main"},
         'OK to answer R4: "use main"? [X6] yes / no',

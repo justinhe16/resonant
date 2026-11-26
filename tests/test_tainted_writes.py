@@ -255,7 +255,7 @@ def test_start_run_is_lifted_but_an_ask_rule_on_its_repo_asks(
 # Every builtin L2/L3 write outside OWNER_TOOLS, and whether ``allow`` lifts it. A new builtin
 # fails this test until it is placed here on purpose (TAINT_LIFTABLE_BUILTINS is an allowlist).
 BUILTIN_WRITES: dict[str, bool] = {
-    "start_run": True, "cancel_run": True, "merge_run": True,
+    "start_run": True, "cancel_run": True, "continue_run": True, "merge_run": True,
     "answer_worker": True, "message_worker": True,
     # a stored prompt that later fires as ``scheduled`` (untainted): never lifted
     "add_job": False, "create_watch": False, "pause_job": False, "resume_job": False,

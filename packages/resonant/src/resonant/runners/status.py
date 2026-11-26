@@ -101,6 +101,13 @@ def start_line(code: str, title: str | None = None) -> str:
     return f"On it: starting {code} ({what})." if what else f"On it: starting {code}."
 
 
+def continue_line(code: str, title: str | None, why: str) -> str:
+    """PER-344: ``Continuing R5 (fix the README typo): it was stopped by the time limit.``"""
+    what = _clip(clean_external(title or ""), TITLE_MAX).rstrip(".")
+    head = f"Continuing {code} ({what})" if what else f"Continuing {code}"
+    return f"{head}: it was stopped by {why}."
+
+
 def names_text(names: Sequence[str]) -> str:
     """``A``, ``A or B``, ``A, B or C``; ``an approver`` for none."""
     if not names:

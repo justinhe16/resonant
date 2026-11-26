@@ -202,6 +202,7 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "mute_extension": _muted,
     "start_run": _run_text,
     "cancel_run": _run_text,
+    "continue_run": _run_text,
     "merge_run": _run_text,
     "answer_worker": _run_text,
     "message_worker": _run_text,

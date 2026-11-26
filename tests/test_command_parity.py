@@ -38,6 +38,7 @@ CHAT_WRITES = {
     # Deliberately chat-reachable: the sandbox is the wall (start, cancel); merge asks yes.
     "start_run",
     "cancel_run",
+    "continue_run",  # PER-344: picks a limit-stopped run back up, bounded like a start
     "merge_run",
     "answer_worker",
     "message_worker",
