@@ -15,7 +15,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 ### As built (deviations from the design below)
 
 - **Health stays with the monitor.** No `core/health` items: the `HealthMonitor` already alerts on degrade and recovery, so the pulse would only say it twice. Approvals are not pulse items since PER-261 (`core/remind` reminds once at half the TTL).
-- **Briefing Updates exclude `core` and muted sources.** They list open extension items at any urgency, changed-since-told first.
+- **Briefing Updates exclude `core` (except `notice/`) and muted sources.** They list open items at any urgency that the owner hasn't heard (new, or changed since told), from every source alike (PER-350): an item told live and unchanged since isn't repeated.
 - **Ordering.** Urgent first, then normal, then low; oldest first within each, so an overflow can't starve old items.
 - **Clears of urgent items inherit urgent.** The "recovered" for an urgent item is texted at once however the extension rated the clear (clamped to the grant), including a clear of something the owner never heard.
 - **All recipients refuse.** An urgent send that no approver takes leaves the item pending (`pulse.unreachable`) for the hourly pulse.
@@ -121,7 +121,7 @@ The first run after install is a baseline (as for notify): items are stored as t
   ✋ A7 still waiting: restart ollama?
   ```
   Dedupe `pulse:<local date>:<HH>`, then `mark_told`. Nothing changed: nothing sent.
-- `core/briefing` keeps its sections and adds an **Updates** section: every open (uncleared, unexpired) item at any urgency, changed-since-told first, up to 8 lines (`+N more`). It then marks them told. The 600-char cap becomes 1,000.
+- `core/briefing` keeps its sections and adds an **Updates** section: every open (uncleared, unexpired) item at any urgency, changed-since-told first (since PER-350 only those: one already told and unchanged is left out), up to 8 lines (`+N more`). It then marks them told. The 600-char cap becomes 1,000.
 - The briefing's hard-coded GitHub line is replaced by a `github/summary` `low` item from the digest job.
 
 ### D5. Commands

@@ -321,20 +321,18 @@ async def test_briefing_updates_section_lists_open_items_and_marks_them_told() -
         report(h, "github", "summary", "3 open PRs", urgency="low")
         report(h, "core", "approval/a7", "✋ A7 still waiting: x")  # core: never listed
         report(h, "dori", "gone", "Dori recovered", clear=True)  # cleared: not listed
-        h.db.execute(  # one the owner already heard sorts last
+        h.db.execute(  # one the owner already heard is left out (PER-350)
             "UPDATE pulse_items SET told_fingerprint = fingerprint WHERE key = 'summary'"
         )
         out = await bf.send_briefing(h.db, h.channel, OWNER, tz="America/Los_Angeles", now=T9)
         ((_, text, _),) = h.channel.sent
-        assert text == (
-            "Updates:\n[dori] 🔴 Dori failing\n[trader] PnL -$1.8k\n[github] 3 open PRs"
-        )
+        assert text == "Updates:\n[dori] 🔴 Dori failing\n[trader] PnL -$1.8k"
         assert "updates" in out["sections"]
         assert (
             told(h, "dori", "k") and told(h, "trader", "pnl") and not told(h, "core", "approval/a7")
         )
         assert not told(h, "dori", "gone")  # the held clear still rides the pulse
-        # Told items stay listed while they are open.
+        # Told and unchanged since: not listed again while they are open (PER-350).
         await bf.send_briefing(
             h.db,
             h.channel,
@@ -343,7 +341,14 @@ async def test_briefing_updates_section_lists_open_items_and_marks_them_told() -
             now=T9 + timedelta(hours=1),
             manual=True,
         )
-        assert h.channel.texts()[-1].startswith("Updates:")
+        assert "Updates:" not in h.channel.texts()[-1]
+        # News since it was told: listed again.
+        report(h, "trader", "pnl", "PnL -$3.2k")
+        await bf.send_briefing(
+            h.db, h.channel, OWNER, tz="America/Los_Angeles", now=T9 + timedelta(hours=2),
+            manual=True,
+        )  # fmt: skip
+        assert h.channel.texts()[-1] == "Updates:\n[trader] PnL -$3.2k"
 
 
 async def test_briefing_updates_cap_eight_lines_and_fit_the_1000_char_limit() -> None:

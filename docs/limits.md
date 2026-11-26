@@ -125,7 +125,7 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **An urgent send races the pulse.** A pulse in the window between `channel.send` and marking it told sends it again. Narrow (top of the hour); add an in-flight skip if it shows up.
 - **A failed pulse job isn't rerun.** The next delivery (or `/pulse now`, or the 08:00 briefing) first finishes an unsent record under 2 hours old with unchanged items; older or changed ones are recomposed.
 - **Muted urgent items ride the pulse after the mute.** They stay pending, so the first pulse after carries the open ones; a short `ttl` lets one expire.
-- **Briefing Updates exclude `core` and muted sources.** If every recipient refuses an urgent send, the item stays pending for the pulse.
+- **Briefing Updates exclude `core` (except `notice/`), muted sources and anything already told.** An item told live and unchanged since isn't repeated at 08:00, even if the owner missed the text. If every recipient refuses an urgent send, the item stays pending for the pulse.
 - **`/pulse` doesn't refresh.** A stall since the last pulse run shows only after the next one.
 - **Stall clocks.** `pulse.stall_after` decides both, but a PR's activity misses some changes (a same-tree force-push), and a run's PR by the GitHub App is measured from the run's end.
 - **A long outage can miss a merge.** The watch looks back two days for closed PRs and the rollup reads seven days of events.
