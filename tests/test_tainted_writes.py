@@ -4,7 +4,7 @@ the owner's and an approver's tainted L2/L3 writes as an untainted L3 would; L1 
 ask with the code, an ``ask`` trust rule still asks, a member's call is unchanged, the kill
 switch still asks for everything, and ``merge_run`` runs only for a ``merge_standable`` run.
 PER-348: ``allow`` also runs the same writes untainted (``inferred``, still L2), audited
-``staff_allowed``, and lifts the watch tools."""
+``staff_allowed``; ``cancel_watch`` lifts either way, ``create_watch`` only untainted."""
 
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ import pytest
 from resonant.components import level_overrides, standable
 from resonant.config import GateConfig
 from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, PolicyGate
-from resonant.gate.policy import TAINT_LIFTABLE_BUILTINS
-from resonant.gate.types import Origin
+from resonant.gate.policy import STAFF_LIFTABLE_BUILTINS, TAINT_LIFTABLE_BUILTINS
+from resonant.gate.types import Origin, OwnerAsk
 from resonant.loop import NewTask
 from resonant.principals import OWNER_TOOLS, Principals
 from resonant.store import repos as repos_store
@@ -375,11 +375,12 @@ def test_start_run_is_lifted_but_an_ask_rule_on_its_repo_asks(
 BUILTIN_WRITES: dict[str, bool] = {
     "start_run": True, "cancel_run": True, "continue_run": True, "merge_run": True,
     "answer_worker": True, "message_worker": True,
-    # a fired watch reports, or follows up as a new tainted turn the gate weighs (PER-348)
-    "create_watch": True, "cancel_watch": True,
-    # a stored prompt that later fires as ``scheduled`` (untainted): never lifted
-    "add_job": False, "pause_job": False, "resume_job": False, "delete_job": False,
-    "run_job_now": False,
+    # only stops a watch (PER-348)
+    "cancel_watch": True,
+    # a stored prompt that later fires as ``scheduled`` (untainted), or an ``ask`` watch's
+    # question run as an untainted research ask: never lifted when tainted
+    "add_job": False, "create_watch": False, "pause_job": False, "resume_job": False,
+    "delete_job": False, "run_job_now": False,
     # a CI workflow onto the default branch (no flagged-paths check), the repo set the trust
     # scopes name, restarts, deleting the owner's notes and reminders
     "add_ci": False, "merge_ci_pr": False, "create_repo": False, "add_repo": False,
@@ -402,6 +403,9 @@ def test_the_builtin_allowlist_is_pinned() -> None:
     assert found == set(BUILTIN_WRITES)
     assert {n for n, lift in BUILTIN_WRITES.items() if lift} == TAINT_LIFTABLE_BUILTINS
     assert not TAINT_LIFTABLE_BUILTINS & OWNER_TOOLS
+    # PER-348: untainted, create_watch too (what staff asked to watch, not planted text)
+    assert TAINT_LIFTABLE_BUILTINS | {"create_watch"} == STAFF_LIFTABLE_BUILTINS
+    assert not STAFF_LIFTABLE_BUILTINS & OWNER_TOOLS
 
 
 def _builtin(name: str) -> ToolSpec:
@@ -424,8 +428,9 @@ def test_a_builtin_off_the_list_still_asks_when_tainted(db: sqlite3.Connection, 
 
 @pytest.mark.parametrize(
     "name",
-    sorted(n for n, lift in BUILTIN_WRITES.items() if not lift and _builtin(n).level is Level.L2),
-)
+    sorted(n for n in BUILTIN_WRITES
+           if n not in STAFF_LIFTABLE_BUILTINS and _builtin(n).level is Level.L2),
+)  # fmt: skip
 def test_a_builtin_off_the_list_still_asks_when_untainted(
     db: sqlite3.Connection, name: str
 ) -> None:
@@ -441,30 +446,66 @@ def test_a_builtin_off_the_list_still_asks_when_untainted(
     assert all(v is None for v in staff_allowed(db))
 
 
-@pytest.mark.parametrize("origin", ["tainted", "inferred"])
-def test_watch_tools_run(db: sqlite3.Connection, gate: PolicyGate, origin: Origin) -> None:
+WATCH = {"what": "PR 159 merged", "ask": "Is PR 159 merged?"}
+
+
+def test_an_untainted_create_watch_runs(db: sqlite3.Connection, gate: PolicyGate) -> None:
     for principal in (OWNER, APPROVER):
-        made = evaluate(db, gate, watch_tools.CREATE_WATCH,
-                        {"what": "PR 159 merged", "ask": "Is PR 159 merged?"},
-                        origin=origin, principal=principal)  # fmt: skip
+        made = evaluate(db, gate, watch_tools.CREATE_WATCH, WATCH, origin="inferred",
+                        principal=principal)  # fmt: skip
         assert isinstance(made, Allow) and made.unattended
+    assert staff_allowed(db) == [True, True]
+    # a member's still asks
+    assert isinstance(evaluate(db, gate, watch_tools.CREATE_WATCH, WATCH, origin="inferred",
+                               principal=MEMBER), Deny | NeedsApproval)  # fmt: skip
+
+
+def test_a_tainted_create_watch_still_asks(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """Outside text could plant an ``ask`` watch's question, later run as an untainted ask."""
+    for principal in (OWNER, APPROVER):
+        made = evaluate(db, gate, watch_tools.CREATE_WATCH, WATCH, principal=principal)
+        assert asks(made)
+    assert all("tainted_allowed" not in r["detail"] for r in evaluated(db))
+
+
+@pytest.mark.parametrize("origin", ["tainted", "inferred"])
+def test_cancel_watch_runs(db: sqlite3.Connection, gate: PolicyGate, origin: Origin) -> None:
+    for principal in (OWNER, APPROVER):
         gone = evaluate(db, gate, watch_tools.CANCEL_WATCH, {"id": "W3"}, origin=origin,
                         principal=principal)  # fmt: skip
         assert isinstance(gone, Allow) and gone.unattended
+    # L3: untainted it already ran (not marked); tainted it is lifted
     key = "tainted_allowed" if origin == "tainted" else "staff_allowed"
-    # cancel_watch is L3: untainted it already ran, so only its tainted call is marked
-    marks = [True, True] * 2 if origin == "tainted" else [True, None] * 2
+    marks = [True, True] if origin == "tainted" else [None, None]
     assert [r["detail"].get(key) for r in evaluated(db)] == marks
+
+
+def test_an_owners_direct_ask_is_lifted_first(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """PER-272's ask is not reached: the row says ``lifted``, and no approval row is made."""
+    tid = task_store.insert_task(db, NewTask(kind="chat", runner="ask", priority=1))
+    task_store.set_status(db, tid, "running")
+    intent = Intent.for_tool(SYNC, task_id=tid, principal=OWNER, args={"x": 1},
+                             origin="inferred", asked=OwnerAsk("sync it", "evt-1"))  # fmt: skip
+    assert isinstance(gate.evaluate(intent), Allow)
+    (row,) = evaluated(db)
+    assert row["detail"]["owner_asked"] == "lifted" and row["detail"]["staff_allowed"] is True
+    assert db.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 0
+
+
+def test_an_explicit_call_is_not_marked(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    assert isinstance(evaluate(db, gate, SYNC, origin="explicit"), Allow)
+    assert staff_allowed(db) == [None]
 
 
 def test_watch_tools_scope_for_an_ask_rule(db: sqlite3.Connection, gate: PolicyGate) -> None:
     """``Standing.tainted_allows`` scopes a watch tool at ``*``: an ask rule there asks."""
     trust_store.add_rule(db, scope="*", action="tool:create_watch", effect="ask",
                          created_from="chat", now=NOW)  # fmt: skip
-    for origin in ("tainted", "inferred"):
-        d = evaluate(db, gate, watch_tools.CREATE_WATCH, {"what": "x", "ask": "y?"},
-                     origin=origin)  # fmt: skip
-        assert isinstance(d, NeedsApproval), origin
+    d = evaluate(db, gate, watch_tools.CREATE_WATCH, WATCH, origin="inferred")
+    assert isinstance(d, NeedsApproval)
+    trust_store.add_rule(db, scope="*", action="tool:cancel_watch", effect="ask",
+                         created_from="chat", now=NOW)  # fmt: skip
+    assert isinstance(evaluate(db, gate, watch_tools.CANCEL_WATCH, {"id": "W3"}), NeedsApproval)
 
 
 def test_the_audit_says_tainted_allowed_only_when_it_ran(

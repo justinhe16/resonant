@@ -408,11 +408,11 @@ class GateConfig(_Section):
     # PER-335: a team instance that runs on its own. ``ask`` (the default): a change the
     # brain chooses after its turn read outside content (``origin=tainted``) asks at L2 and
     # L3. ``allow``: the owner's and an approver's tainted L2/L3 writes (an extension's, or a
-    # run or watch tool: ``gate.policy.TAINT_LIFTABLE_BUILTINS``) run as an untainted L3 would,
-    # and (PER-348) so do the same L2 writes when untainted (``inferred``), so a fresh ask
-    # never asks where a tainted one runs (members, L1, pay, other builtins, an ``ask`` trust
-    # rule and the kill switch are unchanged). The trade-off: text the instance reads could
-    # steer it into an L2/L3 write, never an L1 one.
+    # run tool or ``cancel_watch``: ``gate.policy.TAINT_LIFTABLE_BUILTINS``) run as an
+    # untainted L3 would, and (PER-348) so do the same L2 writes when untainted (``inferred``;
+    # ``create_watch`` too), so staff L2 writes never ask (members, L1, pay, other builtins,
+    # an ``ask`` trust rule and the kill switch are unchanged). The trade-off: text the
+    # instance reads could steer it into an L2/L3 write, never an L1 one.
     tainted_writes: Literal["ask", "allow"] = "ask"
 
 
