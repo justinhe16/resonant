@@ -1,7 +1,7 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
 import { ExternalLink, Group, StateBadge } from "@/components/bits";
 import { ListRow } from "@/components/ListRow";
-import type { BadgeTone } from "@/components/ui/badge";
+import { Badge, type BadgeTone } from "@/components/ui/badge";
 import { isOutside, safeHttpsUrl } from "@/lib/snapshot";
 import type { Snapshot } from "@/types";
 
@@ -46,6 +46,13 @@ export function Claude({ snap, now }: { snap: Snapshot; now: number }) {
       total={Math.max(activity.calls_today, tools.length)}
       rows={tools}
       explainer="claude"
+      action={
+        snap.runner.set_up ? undefined : (
+          <Badge variant="warn" data-testid="runner-not-set-up">
+            runner not set up
+          </Badge>
+        )
+      }
       keptNote={`The snapshot keeps the last ${snap.limits.brain_tools} tool calls.`}
       summary={
         <div className="grid gap-5 sm:grid-cols-2">

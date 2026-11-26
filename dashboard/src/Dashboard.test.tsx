@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "@/Dashboard";
 import { assertSnapshot } from "@/lib/snapshot";
 import { clone, empty, FIXTURE_NOW, local, remote, remoteV1 } from "@/test/fixtures";
+import { openSections } from "@/test/sections";
 import type { RunItem, Snapshot } from "@/types";
 
 function mount(snap: Snapshot | (() => Promise<Snapshot | null>)) {
@@ -17,6 +18,7 @@ const user = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(FIXTURE_NOW);
+  openSections(); // the "collapsible sections" tests clear this to see the defaults
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -33,15 +35,18 @@ const section = (id: string) => screen.getByTestId(`section-${id}`);
 const trigger = (id: string) =>
   within(within(section(id)).getByRole("heading", { level: 2 })).getByRole("button");
 const ASK12 = "Add a dashboard job to CI that rebuilds the UI and fails if dist differs";
-/** PER-279: Extensions right under the approvals, then Pulse; the rest keep their order. */
+/**
+ * PER-279: Extensions right under the approvals, then Pulse; the rest keep their order.
+ * PER-345: a fresh load shows each list section as its header with its total, no rows.
+ */
 const HEADS = [
   "Waiting on you (3)",
-  "Extensions (3 of 3)",
-  "Pulse (3 of 3)",
-  "Recent runs (3 of 8)",
-  "Tasks (3 of 46)",
-  "Claude tool calls (2 of 4)",
-  "Jobs (3 of 3)",
+  "Extensions (3)",
+  "Pulse (3)",
+  "Recent runs (8)",
+  "Tasks (46)",
+  "Claude tool calls (4)",
+  "Jobs (3)",
   "Rules and repos (6)",
 ];
 /** The one-line row (PER-279) that holds `text`. */
@@ -81,6 +86,7 @@ describe("Dashboard, local tier", () => {
   });
 
   it("lays out two columns in order, each section with its count", async () => {
+    localStorage.clear(); // a fresh load
     mount(local);
     await ready();
     expect(headings("column-left")).toEqual(["Slots", "Active runs (2 of 2)", "Active tasks"]);
@@ -122,7 +128,6 @@ describe("Dashboard, local tier", () => {
   });
 
   it("shows run, task, question, pulse and job rows from the snapshot", async () => {
-    const u = user();
     mount(local);
     await ready();
     const left = screen.getByTestId("column-left");
@@ -149,7 +154,6 @@ describe("Dashboard, local tier", () => {
     expect(within(rowOf("notes-sync", section("extensions"))).getByText("disabled")).toBeInTheDocument();
     expect(screen.queryByText("No scheduled jobs.")).not.toBeInTheDocument();
     expect(within(section("jobs")).getByText("briefing")).toBeInTheDocument();
-    await u.click(trigger("rules"));
     expect(screen.getByText("ask merge on trading")).toBeInTheDocument();
     expect(screen.getByText("no CI")).toBeInTheDocument();
   });
@@ -252,20 +256,46 @@ describe("outside text", () => {
 });
 
 describe("collapsible sections", () => {
-  it("starts runs and tasks collapsed with the newest few, and waiting and active runs open", async () => {
+  beforeEach(() => localStorage.clear());
+
+  it("starts every list section collapsed to its header, and waiting and active runs open", async () => {
     mount(local);
     await ready();
-    const runs = within(section("runs"));
-    expect(trigger("runs")).toHaveAttribute("aria-expanded", "false");
-    expect(trigger("tasks")).toHaveAttribute("aria-expanded", "false");
     expect(trigger("waiting")).toHaveAttribute("aria-expanded", "true");
     expect(trigger("active-runs")).toHaveAttribute("aria-expanded", "true");
-    for (const id of ["claude", "extensions", "pulse", "jobs", "rules"])
+    expect(within(section("active-runs")).getAllByRole("listitem")).toHaveLength(2);
+    expect(screen.getByText("3 changes")).toBeInTheDocument();
+    for (const id of ["runs", "tasks", "claude", "extensions", "pulse", "jobs", "rules"]) {
       expect(trigger(id)).toHaveAttribute("aria-expanded", "false");
-    // Three of the four finished runs while collapsed.
-    expect(runs.getByText("R8")).toBeInTheDocument();
-    expect(runs.queryByText("R3")).not.toBeInTheDocument();
-    expect(within(section("tasks")).getAllByRole("listitem")).toHaveLength(3);
+      // Header only: no rows, no summary, nothing under the header.
+      expect(within(section(id)).queryAllByRole("listitem")).toHaveLength(0);
+      expect(within(section(id)).queryByText(/by state|Worker runner|trust rule/)).not.toBeInTheDocument();
+    }
+    // Header badges still say what needs a look while collapsed; the breakdowns wait for open.
+    expect(within(section("pulse")).getByTestId("pulse-untold")).toBeInTheDocument();
+    expect(within(section("runs")).getByTestId("runs-failed")).toHaveTextContent("1 failed");
+    expect(within(section("runs")).getByTestId("runs-high-impact")).toHaveTextContent("1 high-impact");
+    expect(within(section("tasks")).getByTestId("tasks-failed")).toHaveTextContent("2 failed");
+    expect(within(section("extensions")).getByTestId("extensions-unhealthy")).toHaveTextContent("1 unhealthy");
+    expect(within(section("jobs")).queryByTestId("jobs-failing")).not.toBeInTheDocument(); // none failing
+    expect(screen.queryByTestId("detected-effects")).not.toBeInTheDocument();
+  });
+
+  it("counts failing core jobs on the collapsed Jobs header", async () => {
+    const snap = clone(local);
+    snap.core_jobs[0]!.fail_streak = 2;
+    mount(snap);
+    await ready();
+    expect(within(section("jobs")).getByTestId("jobs-failing")).toHaveTextContent("1 failing");
+  });
+
+  it("keeps a closed 'now' section peeking at its newest rows", async () => {
+    localStorage.setItem("resonant.section.active-runs", "closed");
+    mount(local);
+    await ready();
+    expect(trigger("active-runs")).toHaveAttribute("aria-expanded", "false");
+    expect(within(section("active-runs")).getAllByRole("listitem")).toHaveLength(2);
+    expect(within(section("active-runs")).getByRole("heading", { level: 2 })).toHaveTextContent("Active runs (2 of 2)");
   });
 
   it("opens to show every row and remembers it across a remount", async () => {

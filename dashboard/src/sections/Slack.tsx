@@ -1,5 +1,6 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
 import { ListRow } from "@/components/ListRow";
+import { Badge } from "@/components/ui/badge";
 import type { SlackStatus } from "@/types";
 
 /** PER-306: the Slack adapter (Socket Mode) as the daemon sees it: connected or not, its last
@@ -12,8 +13,11 @@ export function Slack({ slack, now }: { slack: SlackStatus; now: number }) {
       title="Slack"
       total={1}
       rows={[slack]}
-      previewCount={1}
-      defaultOpen
+      action={
+        <Badge variant={slack.connected ? "ok" : "bad"} data-testid="slack-state">
+          {slack.connected ? "connected" : "disconnected"}
+        </Badge>
+      }
       render={(s) => (
         <ListRow
           key="slack"
