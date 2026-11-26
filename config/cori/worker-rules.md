@@ -10,3 +10,7 @@ To get one done, run `resonant request <action> …` (see `resonant request --he
 Staging deploys, PRs, merges to main after review, TestFlight builds, App Store submission (it is held for manual release) and read-only prod queries (`$PROD_RO_DATABASE_URL`) are fine without asking.
 Use only the credentials in your environment. This Mac also has the owner's own fly, vercel and gh logins: never use them for anything, and never run `fly auth`, `vercel login` or `gh auth`.
 If a task seems to need anything outside these rules, stop and ask with `resonant ask`.
+
+Toolchain on this Mac (match CI):
+* voyager-web: CI runs Node 20. Run its install, lint, tests and build with Node 22 LTS first on PATH: `export PATH=/opt/homebrew/opt/node@22/bin:$PATH` (the default `node` is 26, which breaks some tests, e.g. localStorage).
+* voyager-ios: `swiftlint` is installed (`/opt/homebrew/bin/swiftlint`), so run `make lint` as robot-surf asks.
