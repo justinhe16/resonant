@@ -345,9 +345,7 @@ async def test_a_scratch_run_has_no_repo_no_token_and_reports_in_the_digest(
         w.claude(calls=[{"name": "start_run", "args": {"ask": manual}}], answer="Working on it.")
         started = await ask(w, "do a manual db update in dori: end acme's trial on friday",
                             starts("Working on it."), "the ack")  # fmt: skip
-        assert started.endswith(
-            "On it: R1 · no repo (scratch dir). Up to 45m. /runs to check, /cancel R1 to stop."
-        )
+        assert "On it: R1 ·" not in started and "/cancel R1" not in started
         await until(settled(w, "R1", "done"), 60, "R1 done")
         await until(line_is(w, "R1", starts("R1 done")), 20, "R1's digest line")
         run = w.run()

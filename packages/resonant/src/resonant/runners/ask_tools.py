@@ -267,6 +267,21 @@ class McpSetup:
     allowed: tuple[str, ...]
 
 
+_ANNOUNCED: set[str] = set()  # ask tasks whose run already said so in the thread
+_ANNOUNCED_KEEP = 512
+
+
+def mark_announced(task_id: str) -> None:
+    """A run this task started announced itself in the thread: no ``On it.`` ack after."""
+    if len(_ANNOUNCED) > _ANNOUNCED_KEEP:
+        _ANNOUNCED.clear()
+    _ANNOUNCED.add(task_id)
+
+
+def was_announced(task_id: str) -> bool:
+    return task_id in _ANNOUNCED
+
+
 class ClaudeTools:
     """One session's bridge, bound to one ask task. ``start`` before the session, ``aclose``
     after; ``observe`` every stream-json message; ``call`` serves the relay."""
@@ -309,6 +324,7 @@ class ClaudeTools:
         specs = [s for s in access.tools_for(self.principal) if s.name != "ask_claude"]
         self.specs: dict[str, ToolSpec] = {s.name: s for s in sorted(specs, key=lambda s: s.name)}
         self.reports: list[str] = []
+        self.announced = 0  # runs this turn started that announced themselves (no report line)
         # BA-1: the changes the gate asked about, pinned in ``checkpoint.batch`` (in order);
         # after the answer the owner gets one prompt for all of them.
         self.asked: list[BatchItem] = []
@@ -490,7 +506,11 @@ class ClaudeTools:
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
         if self._paused():
             return PAUSED, True
-        if change and len(self.reports) >= MAX_SIDE_EFFECTS and self.core.batch_gate is None:
+        if (
+            change
+            and len(self.reports) + self.announced >= MAX_SIDE_EFFECTS
+            and self.core.batch_gate is None
+        ):
             return CAPPED, True  # with batches (PER-261) it asks instead, in the batch
         if self.outside:
             self.tainted = True
@@ -538,7 +558,12 @@ class ClaudeTools:
                 return f"not run: {flat(done.error, 200)}", True
             if done.path not in ("done", "replay"):  # refused, dry run, failed, ambiguous
                 return f"not run: {done.reply}", True
-            self.reports.append(done.reply)
+            if spec.name == "start_run" and (done.data or {}).get("announced") is True:
+                # the run said "On it: starting R7" in the thread itself: no second line
+                self.announced += 1
+                mark_announced(self.task.id)
+            else:
+                self.reports.append(done.reply)
             return f"done: {done.reply}", False
         read = model_result(outcome, spec.name, detail=True)
         if not read.ok:

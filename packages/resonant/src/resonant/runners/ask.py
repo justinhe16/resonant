@@ -179,6 +179,7 @@ from resonant.runners.ask_tools import (
     ToolAccess,
     listing,
     sweep_bridge_dirs,
+    was_announced,
 )
 from resonant.runners.claude import LimitHit, read_lines, usage_limit, wake_time
 from resonant.runners.claude_session import (
@@ -1252,6 +1253,8 @@ class AskRunner:
             if delay > 0:
                 await asyncio.sleep(delay)
             if task_id in self._answered or self._has_answer(task_id):
+                return
+            if was_announced(task_id):  # a run's start line is already in the thread
                 return
             try:
                 thread = thread_of(get_task(self.conn, task_id), to=principal)

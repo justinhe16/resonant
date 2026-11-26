@@ -449,7 +449,8 @@ async def test_r1_chat_request_starts_a_run(
     async with running(w):
         w.claude(**start_run_plan())
         started = await w.say("fix the typo in the README in demo")
-        assert started.endswith("On it: R1 · demo. Up to 45m. /runs to check, /cancel R1 to stop.")
+        # PER-319: the run announced itself; its start text is not repeated in the reply
+        assert "On it: R1 ·" not in started and "/cancel R1" not in started
         # EM-6: a run asked for in plain words reports in the digest, not with a text
         await until(settled(w, "R1", "ready"), 60, "R1 to finish")
         assert w.run().ask == "fix the typo in the README" and w.run().principal == "justin"
@@ -468,7 +469,7 @@ async def test_em6_a_chat_run_that_fails_is_texted_right_away(
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="error")
     async with running(w):
         w.claude(**start_run_plan())
-        assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
+        assert "/cancel R1" not in await w.say("fix the typo in the README in demo")
         failed = await w.next_text()
         assert bare(failed) == f"R1 failed: {w.run().failure}" and w.run().status == "failed"
         assert pulse_store.pending(w.conn, ["normal", "urgent"], utcnow()) == []
@@ -482,7 +483,7 @@ async def test_em6_a_notify_now_rule_texts_a_chat_run_when_it_finishes(
         trust_store.add_rule(w.conn, scope=REPO, action="done", effect="notify_now",
                              created_from="chat", now=utcnow())  # fmt: skip
         w.claude(**start_run_plan())
-        assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
+        assert "/cancel R1" not in await w.say("fix the typo in the README in demo")
         done = await w.next_text()
         assert bare(done).startswith("R1 opened PR #41 (CI green, 1 file, ")
         assert pulse_store.pending(w.conn, ["normal", "urgent"], utcnow()) == []

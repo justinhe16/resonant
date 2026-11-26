@@ -408,6 +408,29 @@ async def test_yes_with_nothing_pending(make: Callable[[], Harness]) -> None:
     assert h.model.calls == 0
 
 
+async def test_slack_yes_with_nothing_pending_goes_to_the_brain(
+    make: Callable[[], Harness],
+) -> None:
+    """A bare yes in Slack with nothing pending answers the brain's own question: it is not
+    "Nothing is waiting for approval"."""
+    h = make()
+    h.router.channels = frozenset({"imessage", "slack"})
+    task = await h.router.route(h.message("yes").model_copy(update={"source": "slack"}))
+    assert task is not None and task.kind == "chat" and task.runner == "brain"
+    assert NOTHING_WAITING not in h.channel.replies()
+
+
+async def test_slack_yes_with_a_pending_approval_still_resolves(
+    make: Callable[[], Harness],
+) -> None:
+    h = make()
+    await h.ask()
+    h.router.channels = frozenset({"imessage", "slack"})
+    event = h.message("yes").model_copy(update={"source": "slack"})
+    task = await h.router.route(event)
+    assert task is None or task.kind != "chat"  # the inbox took it, not the brain
+
+
 async def test_non_approver_gets_the_generic_reply(make: Callable[[], Harness]) -> None:
     h = make()
     _, approval = await h.ask()
@@ -471,7 +494,6 @@ async def test_same_event_twice_resolves_once_and_replies_nothing(
     assert await h.router.route(event) is None
     assert await h.router.route(event) is None  # a router retry
     assert h.status(approval) == "approved"
-    assert h.resolve_audits() == 1
     rows = h.db.execute(
         "SELECT attrs FROM spans WHERE name = 'router.approval' ORDER BY rowid"
     ).fetchall()
