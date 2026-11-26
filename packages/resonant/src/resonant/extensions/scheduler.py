@@ -80,6 +80,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
@@ -110,7 +111,7 @@ from resonant.gate.policy import APPROVAL_USED
 from resonant.gate.types import Deny
 from resonant.loop.types import PRIORITY_BACKGROUND, NewTask
 from resonant.redact import Redactor
-from resonant.secrets import SecretError, SecretStore, values_of
+from resonant.secrets import SecretError, SecretStore, mint_scope, values_of
 from resonant.store import approvals
 from resonant.store import extensions as store
 from resonant.store.audit import audit
@@ -1030,14 +1031,24 @@ class Scheduler:
         args: dict[str, Any] = {"due_at": iso(due), **(extra or {})}
         if not job.core and (refused := await self._admit(job, task_id, args)) is not None:
             return refused
-        env: dict[str, str] = {}
-        if job.spec.secrets:
-            try:
-                if self.secrets is None:
-                    raise SecretError(f"{job.ext}/{job.spec.secrets[0]}", "unavailable")
-                env = await self.secrets.env_for(job.ext, job.spec.secrets)
-            except SecretError as e:
-                return _Result("failed", error=f"ToolFailed: {e}")
+        async with AsyncExitStack() as leases:
+            env: dict[str, str] = {}
+            if job.spec.secrets:
+                try:
+                    if self.secrets is None:
+                        raise SecretError(f"{job.ext}/{job.spec.secrets[0]}", "unavailable")
+                    # PER-336: a secret minted per call is revoked when the lease closes.
+                    scope = mint_scope(job.spec.github_app, args)
+                    env = await leases.enter_async_context(
+                        self.secrets.lease(job.ext, job.spec.secrets, scope)
+                    )
+                except SecretError as e:
+                    return _Result("failed", error=f"ToolFailed: {e}")
+            return await self._run_job(job, args, task_id, env)
+
+    async def _run_job(
+        self, job: ScheduledJob, args: dict[str, Any], task_id: str, env: dict[str, str]
+    ) -> _Result:
         redactor = Redactor(values_of(env))
         ctx = CallContext(secrets=env, idempotency_key=task_id, task_id=task_id)
         start = asyncio.get_running_loop().time()

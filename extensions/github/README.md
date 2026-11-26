@@ -1,17 +1,20 @@
 # github extension
 
-GitHub for Resonant: your open pull requests with CI and review state, a quiet watch that feeds Resonant's hourly progress rollup (merges, PRs that went quiet, review requests), a morning summary that appears in the briefing's Updates section, and two approved writes: re-run failed CI and merge. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
+GitHub for Resonant: your open pull requests with CI and review state, any PR's diff, reviews and comments (an org's, anyone's), a quiet watch that feeds Resonant's hourly progress rollup (merges, PRs that went quiet, review requests), a morning summary that appears in the briefing's Updates section, and three approved writes: re-run failed CI, merge, and comment. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
 
 | Name | Kind | Level | What it does |
 |---|---|---|---|
 | `prs` | tool | L0 | Open PRs you authored (CI rollup, failing checks, review decision), plus PRs awaiting your review. |
-| `pr {repo, number}` | tool | L0 | One PR with its checks, mergeability and size. |
+| `pr {repo, number}` | tool | L0 | One PR (any author, any repo the token sees) with its checks, mergeability and size. |
+| `pr_diff {repo, number}` | tool | L0 | The PR's changed files (status, +/-, renames) with each patch, clipped at 3000 characters a file and 18 KB in all; the first 100 files are listed (PER-336). GitHub leaves out the patch of a binary or huge file (`no_patch`). |
+| `pr_comments {repo, number}` | tool | L0 | The PR's reviews (`review_states`: each reviewer's latest approve or changes-requested), inline review comments (file, line, replies) and conversation comments, the newest 30 of each, bodies clipped at 600 characters (PER-336). |
 | `recent_prs {repo}` | tool | L0 | The newest 15 PRs in one repo (`owner/name`), any state, newest first, with created, merged and closed dates and a `latest merged #N` summary. `prs` lists only open PRs and `pr` needs a number, so "what are the latest PRs?" had no tool (BR-9). |
 | `rerun_failed {repo, number}` | tool | L3 | Re-runs the failed jobs of each workflow whose latest run on the PR's head failed. |
 | `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
+| `comment_pr {repo, number, body}` | tool | L3 | Posts `body` (at most 1000 characters, Resonant's cap on an arg) as a conversation comment on the PR; the number is checked to be a PR first. Acts, then reports; an approval prompt shows the whole body (PER-336). |
 | `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed`, `review_requested`, `pr_active`, `pr_merged` and `pr_closed` events. None of them texts on its own (GH-2): the hourly rollup reads them. |
 | `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. When all three counts are 0 it is reported `quiet` (BF-1), so the briefing leaves it out instead of saying `0 open PRs, 0 failing CI, 0 awaiting your review`. Needs the manifest's `report: {max_urgency: low}` grant. |
-| health | every 30 min | | `gh api user` succeeds. |
+| health | every 30 min | | `gh api user` succeeds (with an App token: `gh api installation/repositories`). |
 
 ## Token
 
@@ -21,6 +24,26 @@ A **fine-grained personal access token**, read-only, limited to the repos you wa
 The two write tools need more, and **only** they do. Leave the token read-only if you don't want them: they then fail cleanly (`Couldn't merge PR #12 in owner/repo: the github token needs … access (see the github extension README). Nothing changed.`) and everything else keeps working. To enable them, edit the token and add:
 - `rerun_failed`: Actions **read and write**.
 - `merge_pr`: Contents **read and write** and Pull requests **read and write**.
+- `comment_pr`: Pull requests **read and write**.
+
+Fine-grained tokens can't read check runs (the `ci` state then reads `none` or misses checks), and they only see the repos and orgs they were granted. For an org's repos, prefer the GitHub App below.
+
+### Or: the instance's GitHub App (PER-336)
+
+An instance whose GitHub credential is its App (Cori) stores **no** `github/token`. Its config maps the secret to the App, and every call gets an installation token minted for that call's repo with only the permissions the tool declares (`github_app:` in `resonant.yaml`), revoked when the call ends ([docs/extensions.md §5](../../docs/extensions.md#secrets-minted-by-the-github-app-per-336)):
+
+```yaml
+# <instance home>/config.yaml
+runner:
+  github_app: {app_id: <id>, installation_id: <id>}   # already set where workers push with the App
+extensions:
+  secret_sources:
+    github/token: github_app
+```
+
+The App needs, on the repos it should work on: Contents (read and write), Pull requests (read and write), Checks, Commit statuses, Actions and Issues (read; Actions read and write for `rerun_failed`), Metadata (read). A PR that changes `.github/workflows` can't be merged with an App token without Workflows permission, which this extension never asks for: merge those by hand.
+
+An installation token is the App's bot, not a person, so "my PRs" has no "my": with `author` left at `@me`, `prs` says to use `recent_prs`/`pr` (or set `author`), and `watch` and `digest` report nothing. Set `{"author": "<login>"}` in `config.json` to watch one person's PRs. Every tool that names a repo and a number works as with a person's token.
 
 Store it on the Mini, in its terminal: `resonant secret set github/token`. Resonant passes it to this extension on a pipe (fd 4, `RESONANT_SECRETS_FD`), never in its environment or argv. The extension writes it to a `hosts.yml` (0600) in a fresh private (0700) `GH_CONFIG_DIR` under the data dir's `tmp/` (`resonant-gh-*`) and points `gh` at it, so `gh` has no token in its env or argv; the dir is removed when the run ends (and any left by a killed run is swept next time, only real 0700 directories of ours older than an hour). It never uses `gh`'s own login, and never prints the token.
 

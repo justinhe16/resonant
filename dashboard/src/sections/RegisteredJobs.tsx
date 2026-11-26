@@ -1,4 +1,4 @@
-import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { CollapsibleSection, HeaderBadge } from "@/components/CollapsibleSection";
 import { ListRow, type RowPill } from "@/components/ListRow";
 import { short } from "@/lib/time";
 import { runTone } from "@/lib/tone";
@@ -18,9 +18,13 @@ export function RegisteredJobs({ snap, now }: { snap: Snapshot; now: number }) {
       render={(j) => <RegisteredJobRow key={j.id} job={j} now={now} linked={j.last_run_code !== null && runs.has(j.last_run_code)} />}
       empty="No registered jobs."
       explainer="registered_jobs"
+      action={<HeaderBadge n={jobs.filter(failing).length} label="failing" tone="bad" testId="registered-jobs-failing" />}
     />
   );
 }
+
+/** Active, and its last firing didn't start or failed (the red pills below). */
+const failing = (j: RegisteredJob) => j.state !== "paused" && (!!j.last_error || j.last_run_status === "failed");
 
 function pillOf(j: RegisteredJob): RowPill {
   if (j.state === "paused") return { tone: "neutral", label: "paused", plain: true, title: j.last_error ?? undefined };

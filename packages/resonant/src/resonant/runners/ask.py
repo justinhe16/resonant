@@ -1018,6 +1018,7 @@ class AskRunner:
         tools: ToolAccess | None = None,
         session: ClaudeSessionConfig | None = None,
         taint_hops: int = DEFAULT_TAINT_HOPS,
+        reply_guard: str = "strict",
         sips: str = SIPS,
         clock: Callable[[], datetime] = utcnow,
         poll_s: float = POLL_S,
@@ -1038,6 +1039,8 @@ class AskRunner:
         Claude brain for the owner's hand-offs (with ``tools``; None or off: one-shot asks
         only); its ``max_per_hour`` is the runaway guard either way. ``taint_hops``:
         ``brain.taint_hops`` (PER-245), for the session's and a one-shot ask's history.
+        ``reply_guard`` (PER-340, ``brain.reply_guard``): ``lenient`` sends a reply the guard
+        still doubts as Claude wrote it (never tool-call text); anything else is ``strict``.
         ``bridge_root``: where the tool bridges' ``rsn-mcp-*`` dirs are swept at startup
         (PER-262; None: the system temp dir, where ``McpServer`` makes them).
         ``claude_config_dir`` (PER-291, ``runner.claude_config_dir``): every ask's and the
@@ -1050,6 +1053,7 @@ class AskRunner:
         self.instructions_file = instructions_file
         self._warned: set[str] = set()
         self.taint_hops = taint_hops
+        self.reply_guard: guard.ReplyGuard = "lenient" if reply_guard == "lenient" else "strict"
         self.bridge_root = bridge_root
         self.conn = conn
         self.cfg = cfg
@@ -1996,8 +2000,10 @@ class AskRunner:
         turn that ran a change, or has one waiting on the owner, is still checked but never
         redone (a redo could repeat the change): a problem there goes straight to the
         fallback, with the report lines. ``fed`` (PER-321): a continuation fed back a change
-        that ran (its report line goes out with the answer). Spans carry kinds and counts
-        only."""
+        that ran (its report line goes out with the answer). PER-340: with ``reply_guard:
+        lenient`` a problem that would get the fallback is sent as Claude wrote it instead
+        (``guard.sends_anyway``; never tool-call text), its span marked ``sent_flagged``.
+        Spans carry kinds and counts only."""
         redone = False
         while out.status == "answered":
             outcome = self._turn_outcome(out, bridge)
@@ -2013,21 +2019,27 @@ class AskRunner:
                 asked=bool(bridge.asked),
             )
             fields = guard.span_fields(problem)
+            # no redo after this one: the fallback (strict) or Claude's words, flagged (PER-340)
+            final = redone or self._acted(bridge)
+            anyway = problem is not None and final and guard.sends_anyway(problem, self.reply_guard)
+            if anyway:
+                fields["sent_flagged"] = True
             with span(
                 self.conn,
                 "runner.ask.guard",
                 trace_id=task.trace_id,
                 task_id=task.id,
                 redone=redone,
-                fallback=problem is not None and redone,
+                fallback=problem is not None and redone and not anyway,
                 **fields,
             ):
                 pass
-            if problem is None:
+            if problem is None or anyway:
                 return out, None
-            if redone or self._acted(bridge):
-                # A change ran or waits on the owner: a redo could repeat it, so the
-                # code-built fallback goes out with the report lines instead.
+            if final:
+                # Strict (or tool-call text): the redo failed, or a change ran or waits on
+                # the owner (a redo could repeat it), so the code-built fallback goes out
+                # with the report lines instead.
                 return out, problem
             redone = True
             out = await run(guard.redo(problem))

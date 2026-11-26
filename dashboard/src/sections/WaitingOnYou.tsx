@@ -20,6 +20,7 @@ export function WaitingOnYou({ snap, now }: { snap: Snapshot; now: number }) {
       title="Waiting on you"
       total={open}
       defaultOpen
+      peek
       explainer="approvals"
       action={<Badge variant={open ? "warn" : "neutral"}>{open} open</Badge>}
       summary={<p className="text-xs text-muted-foreground">Answer on {channelName(snap)}</p>}

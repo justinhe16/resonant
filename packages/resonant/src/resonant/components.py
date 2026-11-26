@@ -28,6 +28,7 @@ from resonant import instance
 from resonant.brain.history import DEFAULT_TAINT_HOPS
 from resonant.config import Settings
 from resonant.executor import Executor, Handler, HandlerKey, ToolHandler
+from resonant.extensions.app_secrets import GitHubAppMinter
 from resonant.extensions.host import ExtensionHost
 from resonant.extensions.process import ExtRunner
 from resonant.gate import Gate, Intent, PolicyGate
@@ -37,6 +38,7 @@ from resonant.gateway.channel import Channel
 from resonant.loop.types import Runner
 from resonant.models import ModelClient
 from resonant.principals import Principal, Principals, load_principals
+from resonant.runner.github_app import GitHubApp
 from resonant.runners.local import MODEL_RESULT_MAX_CHARS, LocalRunner
 from resonant.secrets import SecretStore
 from resonant.tools import ToolRegistry
@@ -233,6 +235,16 @@ def level_overrides(conn: sqlite3.Connection) -> dict[ToolKey, LevelFor]:
     return {(None, runs_tools.MERGE_RUN.name): merge_run}
 
 
+def app_minter(settings: Settings, store: SecretStore) -> GitHubAppMinter | None:
+    """PER-336: the minter for the extension secrets ``extensions.secret_sources`` maps to
+    the GitHub App, or None when it maps none (config validation ensures the App is set)."""
+    refs = [r for r, src in settings.extensions.secret_sources.items() if src == "github_app"]
+    app_cfg = settings.runner.github_app
+    if not refs or app_cfg is None:
+        return None
+    return GitHubAppMinter(GitHubApp(app_cfg, store), refs)
+
+
 def build_components(
     settings: Settings,
     conn: sqlite3.Connection,
@@ -266,6 +278,8 @@ def build_components(
     secret_store = (
         secrets if secrets is not None else SecretStore(service=settings.keychain_service)
     )
+    if (minter := app_minter(settings, secret_store)) is not None:
+        secret_store.minter = minter  # PER-336: some extension secrets come from the App
     host = ExtensionHost.from_settings(settings, conn, registry, runner=ext_runner)
     host.secrets = secret_store
     host.owner = principals.owner if loaded else None  # PER-275: who is asked about MCP drift

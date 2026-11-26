@@ -32,8 +32,10 @@ Each call writes audit rows before and after it, and on every refusal or ambigui
 Secrets (Phase 3). With ``secrets=SecretStore``, a call whose spec declares ``secrets``
 reads exactly those from the Keychain just before it runs (after the replay check, before
 the ``started`` row). A missing or unavailable secret is a definite failure with no
-``executions`` row and a code-built ``notice``. Handlers that subclass
-``ContextHandler`` get them in a ``CallContext``; plain handlers never see them.
+``executions`` row and a code-built ``notice``. A secret the instance mints per call
+(PER-336, ``SecretStore.lease``: its GitHub App) is scoped by the spec's ``github_app`` and
+the call's args, and released (revoked) when the call returns, however it returns. Handlers
+that subclass ``ContextHandler`` get them in a ``CallContext``; plain handlers never see them.
 
 Redaction. Everything the call produced (the result, the error, its events, the audit
 fields) is deep-redacted with ``Redactor`` over that call's secret values before it is
@@ -52,13 +54,14 @@ import sqlite3
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from resonant.gate.codes import clean_external
 from resonant.gate.types import Allow, Decision, Intent, TokenVerifier
 from resonant.redact import Redactor
-from resonant.secrets import SecretError, SecretMissing, SecretStore, values_of
+from resonant.secrets import SecretError, SecretMissing, SecretStore, mint_scope, values_of
 from resonant.store import approvals
 from resonant.store.audit import audit
 from resonant.store.db import atomic, now_iso, transaction, utcnow
@@ -204,22 +207,29 @@ class Executor:
             raise NotAllowedError("executor requires an Allow issued by the gate for this intent")
         key = idempotency_key(intent.task_id, step_no, call_index, intent.hash)
 
-        env: dict[str, str] = {}
-        if intent.spec.secrets and self._may_run(key):
-            try:
-                env = await self._secrets_for(intent)
-            except SecretError as e:
-                # Before 'started': nothing ran, so this is a definite failure with no row.
-                with atomic(self.conn):
-                    self._audit("executor.result", intent, key, decision, ok=False, error=str(e))
-                return ToolResult(
-                    ok=False,
-                    error=f"ToolFailed: {e}",
-                    idempotency_key=key,
-                    notice=secret_notice(e),
-                )
-        redactor = Redactor(values_of(env))
+        async with AsyncExitStack() as leases:
+            env: dict[str, str] = {}
+            if intent.spec.secrets and self._may_run(key):
+                try:
+                    env = await leases.enter_async_context(self._secrets_for(intent))
+                except SecretError as e:
+                    # Before 'started': nothing ran, so this is a definite failure with no row.
+                    with atomic(self.conn):
+                        self._audit(
+                            "executor.result", intent, key, decision, ok=False, error=str(e)
+                        )
+                    return ToolResult(
+                        ok=False,
+                        error=f"ToolFailed: {e}",
+                        idempotency_key=key,
+                        notice=secret_notice(e),
+                    )
+            return await self._execute(intent, decision, key, env)
 
+    async def _execute(
+        self, intent: Intent, decision: Allow, key: str, env: dict[str, str]
+    ) -> ToolResult:
+        redactor = Redactor(values_of(env))
         with transaction(self.conn):
             row = self.conn.execute(
                 "SELECT status, result FROM executions WHERE idempotency_key = ?", (key,)
@@ -271,12 +281,13 @@ class Executor:
         ).fetchone()
         return row is None or row["status"] == "failed"
 
-    async def _secrets_for(self, intent: Intent) -> dict[str, str]:
+    def _secrets_for(self, intent: Intent) -> AbstractAsyncContextManager[dict[str, str]]:
         if self.secrets is None:
             raise SecretError(f"{intent.extension}/{intent.spec.secrets[0]}", "unavailable")
         if intent.extension is None:
             raise SecretError(f"builtin/{intent.spec.secrets[0]}", "unavailable")
-        return await self.secrets.env_for(intent.extension, intent.spec.secrets)
+        scope = mint_scope(intent.spec.github_app, intent.args)
+        return self.secrets.lease(intent.extension, intent.spec.secrets, scope)
 
     def _spend(self, intent: Intent, approval_id: str) -> bool:
         """Mark the approval used. Call inside the transaction that writes 'started'."""

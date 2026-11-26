@@ -549,6 +549,9 @@ class NotifyConfig(_Section):
     max_chars: int = Field(default=300, ge=40, le=1000)
 
 
+_EXT_SECRET_REF = re.compile(r"[a-z][a-z0-9-]{0,47}/[a-z][a-z0-9_]{0,31}")
+
+
 class ExtensionsConfig(_Section):
     # L0 jobs run inline as bounded background coroutines, at most this many at once.
     max_concurrent_jobs: int = Field(default=4, ge=1, le=16)
@@ -559,6 +562,24 @@ class ExtensionsConfig(_Section):
     model_result_max_chars: int = Field(default=4096, ge=256, le=32 * 1024)
     process: ProcessConfig = Field(default_factory=ProcessConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    # PER-336: where an extension secret comes from when not the Keychain, by ref
+    # (``{"github/token": "github_app"}``). ``github_app``: an installation token of
+    # ``runner.github_app``, minted for each call that declares the secret (scoped by the
+    # tool's ``github_app:`` block) and revoked when it ends
+    # (``resonant.extensions.app_secrets``). Unlisted refs are read from the Keychain.
+    secret_sources: dict[str, Literal["github_app"]] = Field(
+        default_factory=dict[str, Literal["github_app"]]
+    )
+
+    @field_validator("secret_sources")
+    @classmethod
+    def _source_refs(cls, v: dict[str, str]) -> dict[str, str]:
+        for ref in v:
+            if not _EXT_SECRET_REF.fullmatch(ref):
+                raise ValueError(
+                    f"extensions.secret_sources: {ref!r} must be an extension secret <ext>/<name>"
+                )
+        return v
 
     @model_validator(mode="after")
     def _model_view_fits(self) -> Self:
@@ -930,6 +951,13 @@ class RunnerConfig(_Section):
     # owner can watch and steer from the Claude app (an undocumented control request; a reply
     # that fails or never comes leaves the run going without it). ``off`` doesn't ask.
     remote_control: Literal["on", "off"] = "on"
+    # PER-341: who words a run's updates in its thread. ``template`` (the default): the
+    # code-built lines, exactly as before (``On it: starting R5 (…)``, ``R5 opened PR #12:
+    # …``, ``Along the way: …``, ``Needs you: …``). ``brain``: Claude writes each update
+    # (start, milestones, outcome, merge) as one short message from code-built facts, through
+    # ``brain.voice`` (its one-shot, guard, cap and fallback), with no ``Along the way`` line
+    # in a thread (the dashboard keeps it); any trouble sends the code-built line instead.
+    update_voice: Literal["template", "brain"] = "template"
     # The per-run token source. Without it workers can't push.
     github_app: GitHubAppConfig | None = None
 
@@ -1330,6 +1358,12 @@ class BrainConfig(_Section):
     # Claude answer), this many later turns stay tainted (their model-chosen changes ask,
     # except notes, reminders and facts). The turn that read it is tainted as well.
     taint_hops: int = Field(default=3, ge=0, le=20)
+    # PER-340: what the reply guard (``brain/guard.py``) does with a reply it still doubts.
+    # ``strict`` (the default): a flagged reply is redone once, then a short code-built
+    # fallback goes out instead ("I didn't save that; nothing changed."). ``lenient`` (a team
+    # instance): the same one redo, but Claude's own words go out with the flag recorded on
+    # the span, never a canned line; the text of a tool call is still never sent.
+    reply_guard: Literal["strict", "lenient"] = "strict"
     # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
     # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
     read_roots: list[Path] | None = None
@@ -1602,6 +1636,17 @@ class Settings(BaseSettings):
             raise ValueError("instances: each name at most once")
         if self.instance.name in names:
             raise ValueError(f"instances: {self.instance.name} is this instance")
+        return self
+
+    @model_validator(mode="after")
+    def _app_secret_sources(self) -> Self:
+        """PER-336: a secret minted by the GitHub App needs the App."""
+        app_refs = [r for r, src in self.extensions.secret_sources.items() if src == "github_app"]
+        if app_refs and self.runner.github_app is None:
+            raise ValueError(
+                f"extensions.secret_sources maps {', '.join(sorted(app_refs))} to github_app, "
+                "but runner.github_app isn't set"
+            )
         return self
 
     @model_validator(mode="after")

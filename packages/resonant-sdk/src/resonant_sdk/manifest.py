@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from resonant_sdk.tool import (
     TOOL_NAME_PATTERN,
+    AppToken,
     Effect,
     Level,
     ToolSpec,
@@ -149,12 +150,22 @@ class Job(_Strict):
     catchup: str = "none"  # "none" or a duration <= 24h
     # What the job does, in one line (PER-277: the dashboard's diagram shows it). Display only.
     description: str = Field(default="", max_length=JOB_DESCRIPTION_MAX)
+    # PER-336: the permissions of a GitHub App token minted for a run (no repo: a job has no
+    # args, so the token covers every repo the installation sees).
+    github_app: AppToken | None = None
 
     @field_validator("description")
     @classmethod
     def _description(cls, v: str) -> str:
         if not v.isprintable():
             raise ValueError("description must be one line with no control characters")
+        return v
+
+    @field_validator("github_app")
+    @classmethod
+    def _app_no_repo(cls, v: AppToken | None) -> AppToken | None:
+        if v is not None and v.repo is not None:
+            raise ValueError("a job's github_app can't name a repo arg (jobs take no args)")
         return v
 
     @field_validator("tz")
@@ -210,6 +221,7 @@ class Job(_Strict):
             extension=extension,
             timeout_s=self.timeout_s,
             secrets=self.secrets,
+            github_app=self.github_app,
         )
 
 
@@ -374,6 +386,17 @@ class CliTool(_Strict):
     approval_summary: str | None = None  # PER-268: see ToolSpec; uses only declared args
     approval_detail: str | None = None  # PER-300: a declared string arg shown in full
     worker_requestable: bool = False  # PER-296: a worker may ask for it (`resonant request`)
+    # PER-336: the reach of a GitHub App token minted for this call, when the instance backs
+    # one of its secrets with the App (see ``app_token``). Ignored for a Keychain secret.
+    github_app: AppToken | None = None
+
+    def app_token(self) -> AppToken | None:
+        """``github_app`` as declared, else the default for a tool with secrets: read access
+        (``APP_READ_DEFAULT``) to the repo in its ``repo`` string arg, or to every repo the
+        installation sees when it has none."""
+        if self.github_app is not None or not self.secrets:
+            return self.github_app
+        return AppToken(repo="repo" if self.args.get("repo") == "string" else None)
 
     @model_validator(mode="after")
     def _placeholders_declared(self) -> Self:
@@ -764,6 +787,7 @@ class Manifest(BaseModel):
                 approval_summary=t.approval_summary,
                 approval_detail=t.approval_detail,
                 worker_requestable=t.worker_requestable,
+                github_app=t.app_token(),
             )
             for name, t in self.tools.items()
         ]

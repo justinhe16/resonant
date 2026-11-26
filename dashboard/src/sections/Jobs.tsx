@@ -1,4 +1,4 @@
-import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { CollapsibleSection, HeaderBadge } from "@/components/CollapsibleSection";
 import { JobRow } from "@/sections/Extensions";
 import type { Snapshot } from "@/types";
 
@@ -13,6 +13,9 @@ export function Jobs({ snap, now }: { snap: Snapshot; now: number }) {
       render={(j) => <JobRow key={j.id} job={j} ext="core" now={now} />}
       empty="No core jobs reported."
       explainer="jobs"
+      action={
+        <HeaderBadge n={snap.core_jobs.filter((j) => j.fail_streak > 0).length} label="failing" tone="bad" testId="jobs-failing" />
+      }
     />
   );
 }

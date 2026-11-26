@@ -176,12 +176,34 @@ def test_manifest_passes_every_check() -> None:
     assert dir_errors(EXT, m) == [] and name_errors(m) == []
     specs = {s.name: s for s in m.tool_specs() + m.job_specs()}
     assert set(specs) == {
-        "prs", "pr", "recent_prs", "rerun_failed", "merge_pr", "job_watch", "job_digest"
+        "prs", "pr", "recent_prs", "pr_diff", "pr_comments", "rerun_failed", "merge_pr",
+        "comment_pr", "job_watch", "job_digest",
     }  # fmt: skip
     for s in specs.values():
         assert s.secrets == ("token",)
-        if s.name not in ("rerun_failed", "merge_pr"):
+        if s.name not in ("rerun_failed", "merge_pr", "comment_pr"):
             assert s.effect is Effect.READ and s.effective_level is Level.L0 and not s.commit
+    # PER-336: comment_pr acts then reports, and shows the whole body when it asks.
+    comment = specs["comment_pr"]
+    assert comment.effect is Effect.WRITE and comment.effective_level is Level.L3
+    assert comment.approval_detail == "body" and not comment.commit
+    assert comment.args_schema["required"] == ["body", "number", "repo"]
+    # The reach of an App-minted token: one repo and only what each tool needs.
+    app = {n: s.github_app for n, s in specs.items()}
+    for name in ("pr", "recent_prs", "pr_diff", "pr_comments"):
+        reach = app[name]
+        assert reach is not None and reach.repo == "repo"
+        assert set(reach.permissions.values()) == {"read"}
+    assert app["merge_pr"] is not None and app["merge_pr"].permissions == {
+        "contents": "write", "pull_requests": "write", "checks": "read", "statuses": "read",
+    }  # fmt: skip
+    assert app["comment_pr"] is not None and app["comment_pr"].permissions == {
+        "pull_requests": "write"
+    }
+    assert app["rerun_failed"] is not None and app["rerun_failed"].permissions["actions"] == "write"
+    for name in ("prs", "job_watch", "job_digest"):  # no repo arg: every repo, read only
+        reach = app[name]
+        assert reach is None or (reach.repo is None and set(reach.permissions.values()) == {"read"})
     rerun, merge = specs["rerun_failed"], specs["merge_pr"]
     assert rerun.effect is Effect.WRITE and rerun.effective_level is Level.L3
     assert not rerun.commit
@@ -946,3 +968,222 @@ def test_config_dir_is_removed_and_only_real_stale_ones_are_swept(gh: FakeGh) ->
 def test_extension_reads_secrets_only_from_the_pipe() -> None:
     src = CLI.read_text()
     assert "RESONANT_SECRETS_FD" in src and "RESONANT_SECRET_" not in src
+
+
+# --- PER-336: pr_diff, pr_comments, comment_pr, and an App-minted token -----------------
+
+DORI = "dori-app-code/voyager-web"
+APP_TOKEN = "ghs_" + "AppMinted0123456789" * 2
+
+
+def diff_file(name: str, patch: str | None, *, adds: int = 1, dels: int = 0) -> dict[str, Any]:
+    f: dict[str, Any] = {"filename": name, "status": "modified", "additions": adds,
+                         "deletions": dels}  # fmt: skip
+    if patch is not None:
+        f["patch"] = patch
+    return f
+
+
+def test_pr_diff_lists_files_and_clips_patches(gh: FakeGh) -> None:
+    big = "@@ -1 +1 @@\n" + "+x\n" * 2000  # 4000+ chars: over the per-file cap
+    gh.state["api"] = {
+        f"repos/{DORI}/pulls/159/files": [
+            diff_file("src/a.ts", "@@ -1 +1 @@\n-old\n+new", adds=1, dels=1),
+            diff_file("logo.png", None),
+            {**diff_file("src/big.ts", big, adds=2000), "status": "renamed",
+             "previous_filename": "src/old.ts"},
+        ]
+    }  # fmt: skip
+    r = gh.run("pr_diff", "--repo", DORI, "--number", "159")
+    assert r.code == 0, r.err
+    a, png, renamed = r.out["files"]
+    assert a == {"file": "src/a.ts", "status": "modified", "additions": 1, "deletions": 1,
+                 "patch": "@@ -1 +1 @@\n-old\n+new"}  # fmt: skip
+    assert png["no_patch"] is True and "patch" not in png
+    assert renamed["previous_file"] == "src/old.ts" and renamed["patch_clipped"] is True
+    assert 2990 <= len(json.dumps(renamed["patch"])) <= 3002  # bytes as the executor counts
+    assert renamed["patch"].startswith("@@ -1 +1 @@\n+x\n")
+    assert r.out["summary"] == "voyager-web#159: 3 files, +2002 -1; some patches clipped"
+    assert r.out["truncated"] is False
+    assert gh.calls()[0]["argv"] == ["api", f"repos/{DORI}/pulls/159/files?per_page=100&page=1"]
+
+
+def test_pr_diff_pages_and_keeps_the_total_under_the_cap(gh: FakeGh) -> None:
+    files = [diff_file(f"f{i}.py", "+" + "y" * 2999) for i in range(250)]
+    gh.state["api"] = {f"repos/{DORI}/pulls/7/files": files}
+    r = gh.run("pr_diff", "--repo", DORI, "--number", "7")
+    assert r.code == 0, r.err
+    assert [c["argv"][1].rsplit("=", 1)[-1] for c in gh.calls()] == ["1", "2", "3"]
+    assert len(r.out["files"]) == 100 and r.out["truncated"] is True
+    patched = [f for f in r.out["files"] if "patch" in f]
+    assert 4 <= len(patched) <= 6  # 3002 bytes each as JSON, 18000 at most
+    assert all(f["patch_clipped"] for f in r.out["files"][len(patched) :])
+    assert len(r.stdout.encode()) < 32 * 1024  # under Resonant's stored-result cap
+    assert "first 100 files listed" in r.out["summary"]
+
+
+def test_pr_diff_budget_counts_json_escapes(gh: FakeGh) -> None:
+    quoted = '"\\' * 1500 + "é" * 500  # escapes double; é is two bytes
+    gh.state["api"] = {
+        f"repos/{DORI}/pulls/8/files": [diff_file(f"q{i}", quoted) for i in range(9)]
+    }
+    r = gh.run("pr_diff", "--repo", DORI, "--number", "8")
+    assert r.code == 0, r.err
+    sizes = [len(json.dumps(f["patch"])) for f in r.out["files"] if "patch" in f]
+    assert sum(sizes) <= 18000 and len(json.dumps(r.out)) <= 30000
+
+
+def test_pr_diff_fits_the_store_cap_with_long_names_and_non_ascii(gh: FakeGh) -> None:
+    """The executor measures ``json.dumps`` (ASCII escapes): \u00e9 is 6 bytes there."""
+    name = "src/" + "deeply/nested/" * 5 + "file"
+    files = [diff_file(f"{name}{i}.py", "é" * 2900) for i in range(120)]
+    gh.state["api"] = {f"repos/{DORI}/pulls/9/files": files}
+    r = gh.run("pr_diff", "--repo", DORI, "--number", "9")
+    assert r.code == 0, r.err
+    assert len(json.dumps(r.out)) <= 30000 < 32 * 1024
+    assert r.out["files"] and r.out["truncated"] is True
+    assert r.out["files"][0]["patch"].startswith("é")
+
+
+def test_pr_comments_reviews_inline_and_conversation(gh: FakeGh) -> None:
+    gh.state["api"] = {
+        f"repos/{DORI}/pulls/159/reviews": [
+            {"user": {"login": "ana"}, "state": "CHANGES_REQUESTED", "body": "fix the test",
+             "submitted_at": "2026-11-20T10:00:00Z", "commit_id": "a" * 40},
+            {"user": {"login": "ana"}, "state": "APPROVED", "body": "",
+             "submitted_at": "2026-11-21T10:00:00Z", "commit_id": "b" * 40},
+            {"user": {"login": "bo"}, "state": "COMMENTED", "body": "nit\nsecond line",
+             "submitted_at": "2026-11-21T11:00:00Z", "commit_id": "b" * 40},
+            {"user": {"login": "cy"}, "state": "CHANGES_REQUESTED", "body": "x" * 900,
+             "submitted_at": "2026-11-21T12:00:00Z", "commit_id": "b" * 40},
+            {"user": {"login": "me"}, "state": "PENDING", "body": "draft"},
+        ],
+        f"repos/{DORI}/pulls/159/comments": [
+            {"id": 11, "user": {"login": "bo"}, "path": "src/a.ts", "line": 3,
+             "body": "rename this", "created_at": "2026-11-21T11:00:00Z"},
+            {"id": 12, "user": {"login": "brian"}, "path": "src/a.ts", "line": 3,
+             "in_reply_to_id": 11, "body": "done", "created_at": "2026-11-21T12:00:00Z"},
+        ],
+        f"repos/{DORI}/issues/159/comments": [
+            {"user": {"login": "brian"}, "body": "ready", "created_at": "2026-11-22T09:00:00Z"},
+        ],
+    }  # fmt: skip
+    r = gh.run("pr_comments", "--repo", DORI, "--number", "159")
+    assert r.code == 0, r.err
+    # The latest deciding review per reviewer; a comment-only review doesn't count.
+    assert r.out["review_states"] == {"ana": "approved", "cy": "changes_requested"}
+    assert [rv["author"] for rv in r.out["reviews"]] == ["ana", "ana", "bo", "cy"]  # no pending
+    assert r.out["reviews"][2]["body"] == "nit\nsecond line"  # line breaks kept
+    assert len(r.out["reviews"][3]["body"]) == 600 and r.out["reviews"][3]["body"].endswith("…")
+    assert r.out["review_comments"][1] == {
+        "author": "brian", "file": "src/a.ts", "line": 3, "created_at": "2026-11-21T12:00:00Z",
+        "reply_to": 11, "id": 12, "body": "done",
+    }  # fmt: skip
+    assert r.out["comments"] == [
+        {"author": "brian", "created_at": "2026-11-22T09:00:00Z", "body": "ready"}
+    ]
+    assert r.out["summary"] == (
+        "voyager-web#159: 4 reviews; 2 review comments; 1 comments; approved by ana; "
+        "changes requested by cy"
+    )
+
+
+def test_comment_pr_posts_on_the_pr_conversation(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{DORI}#159": {"number": 159, "state": "OPEN", "url": "u"}}
+    body = "- looks good\n- merging after CI"
+    r = gh.run("comment_pr", "--repo", DORI, "--number", "159", f"--body={body}")
+    assert r.code == 0, r.err
+    view_call, post = gh.calls()
+    assert view_call["argv"][:5] == ["pr", "view", "159", "--repo", DORI]
+    assert post["argv"] == [
+        "api", f"repos/{DORI}/issues/159/comments", "--method", "POST", "-f", f"body={body}",
+    ]  # fmt: skip
+    assert r.out == {
+        "summary": "commented on voyager-web#159", "repo": DORI, "number": 159,
+        "url": f"https://github.com/repos/{DORI}/issues/159/comments#issuecomment-1",
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("body", "err"),
+    [("   ", "the comment is empty"), ("x" * 1001, "at most 1000")],
+)
+def test_comment_pr_refuses_bad_bodies_without_calling_gh(gh: FakeGh, body: str, err: str) -> None:
+    r = gh.run("comment_pr", "--repo", DORI, "--number", "159", f"--body={body}")
+    assert r.code == 1 and err in r.err and gh.calls() == []
+
+
+def test_comment_pr_refuses_an_issue_number(gh: FakeGh) -> None:
+    r = gh.run("comment_pr", "--repo", DORI, "--number", "5", "--body=hi")
+    assert r.code == 1 and "Could not resolve to a PullRequest" in r.err
+    assert [c["argv"][0] for c in gh.calls()] == ["pr"]  # nothing posted
+
+
+def test_comment_pr_without_write_access_says_what_to_widen(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{DORI}#159": {"number": 159, "state": "OPEN", "url": "u"}}
+    gh.state["fail_on"] = {
+        f"api repos/{DORI}/issues/159/comments": {
+            "exit": 1, "stderr": "Resource not accessible by integration (HTTP 403)"}
+    }  # fmt: skip
+    r = gh.run("comment_pr", "--repo", DORI, "--number", "159", "--body=hi")
+    assert r.code == 1 and "needs Pull requests: write access" in r.err
+
+
+def app_gh(gh: FakeGh) -> dict[str, str]:
+    gh.state["token"] = APP_TOKEN
+    return {"token": APP_TOKEN}
+
+
+def test_app_token_reads_and_merges_an_org_pr_by_someone_else(gh: FakeGh) -> None:
+    """An App-minted token (``ghs_``) on an org repo, a PR the token's owner didn't open:
+    pr, pr_diff and merge_pr work exactly as with a person's token."""
+    secrets = app_gh(gh)
+    gh.state["prs"] = {f"{DORI}#159": {**view(159), "author": {"login": "brian"},
+                                       "url": f"https://github.com/{DORI}/pull/159"}}  # fmt: skip
+    gh.state["api"] = {f"repos/{DORI}/pulls/159/files": [diff_file("a.ts", "+a")]}
+    shown = gh.run("pr", "--repo", DORI, "--number", "159", secrets=secrets)
+    assert shown.code == 0, shown.err
+    assert shown.out["author"] == "brian" and shown.out["ci"] == "passing"
+    assert gh.run("pr_diff", "--repo", DORI, "--number", "159", secrets=secrets).code == 0
+    merged = gh.run("merge_pr", "--repo", DORI, "--number", "159", "--head-sha", HEAD,
+                    secrets=secrets)  # fmt: skip
+    assert merged.code == 0, merged.err
+    assert merged.out["summary"] == "merged voyager-web#159 (squash) at a1b2c3d"
+    assert all(c["token_ok"] for c in gh.calls())
+    assert APP_TOKEN not in shown.stdout + merged.stdout
+
+
+def test_app_token_has_no_person_for_my_prs(gh: FakeGh) -> None:
+    secrets = app_gh(gh)
+    r = gh.run("prs", secrets=secrets)
+    assert r.code == 1 and "recent_prs {repo} or pr {repo, number}" in r.err
+    for job in ("watch", "digest"):  # nothing to watch, and the job doesn't fail
+        out = gh.run(job, secrets=secrets)
+        assert out.code == 0 and "App token has no person" in out.out["summary"]
+        assert out.events == []
+    assert gh.calls() == []
+
+
+def test_app_token_with_an_author_searches_for_that_person(gh: FakeGh) -> None:
+    secrets = app_gh(gh)
+    (gh.data / "config.json").write_text(json.dumps({"author": "brian", "repos": [DORI]}))
+    gh.state["mine"] = [pr_node(159, "a" * 40, repo=DORI, contexts=[check("ci")])]
+    r = gh.run("prs", secrets=secrets)
+    assert r.code == 0, r.err
+    assert r.out["summary"] == "1 open PRs, 0 failing CI, 0 awaiting your review"
+    assert f"repo:{DORI} author:brian" in " ".join(gh.calls()[0]["argv"])
+
+
+def test_app_token_health_lists_installation_repos(gh: FakeGh) -> None:
+    secrets = app_gh(gh)
+    gh.state["api"] = {"installation/repositories": {"total_count": 4, "repositories": []}}
+    r = gh.run("health", secrets=secrets)
+    assert r.code == 0, r.err
+    assert r.out == {"ok": True, "app": True, "repos": 4}
+    assert gh.calls()[0]["argv"] == ["api", "installation/repositories?per_page=1"]
+
+
+def test_static_token_health_still_reads_the_user(gh: FakeGh) -> None:
+    r = gh.run("health")
+    assert r.code == 0 and r.out == {"ok": True, "login": "octo"}
+    assert gh.calls()[0]["argv"] == ["api", "user"]

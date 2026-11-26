@@ -188,8 +188,8 @@ def test_the_graph_comes_from_the_installed_manifests(db: sqlite3.Connection) ->
     assert ("mcp:linear/linear", save.id) in edges and ("ext:linear", "mcp:linear/linear") in edges
 
     github = nodes["ext:github"]
-    assert github.text.startswith("github: local CLI tools; 3 reads run without asking")
-    assert "1 write runs, then tells you, 1 write asks first, 2 scheduled jobs" in github.text
+    assert github.text.startswith("github: local CLI tools; 5 reads run without asking")
+    assert "2 writes run, then tell you, 1 write asks first, 2 scheduled jobs" in github.text
     watch = nodes["job:github/watch"]
     assert watch.text.startswith("github/watch: every 10 min job (read, runs without asking)")
     assert (watch.ext, watch.job) == ("github", "watch")

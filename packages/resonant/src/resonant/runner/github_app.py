@@ -20,6 +20,9 @@ protection changes), and valid for an hour. Workflows is left out when the repo'
 - PER-334: ``mint_scoped`` is the daemon's own token for one repo with the permissions one
   ``gh`` call needs (the PR's view, its checks, the merge), on an instance with no daemon
   token; the workspace revokes it right after the call.
+- PER-336: ``mint_wide`` is a token for every repo the installation sees, with exactly the
+  permissions asked for: an App-backed extension secret for a call that names no repo (a
+  job, a health check). Extension calls that name a repo use ``mint_scoped``.
 
 Errors name the HTTP status and GitHub's own message, never a token, a key or a response
 body.
@@ -161,18 +164,31 @@ def check_grant(
         full = str(repo.get("full_name"))
         if full.lower() != f"{owner}/{repo_name}".lower():
             return f"it is for {full}, not {owner}/{repo_name}"
-    granted_raw = data.get("permissions")
-    if not isinstance(granted_raw, dict):
-        return "it lists no permissions"
-    granted = {str(k): str(v) for k, v in cast(dict[object, object], granted_raw).items()}
-    for perm, level in granted.items():
-        if perm not in requested or _LEVEL.get(level, 99) > _LEVEL[requested[perm]]:
-            return f"it grants {perm}: {level}, which was not asked for"
+    if (problem := _beyond(data, requested)) is not None:
+        return problem
+    granted = _granted(data)
     for perm in _ESSENTIAL:
         if perm not in requested:  # a read-only lookup token (PER-327)
             continue
         if _LEVEL.get(granted.get(perm, "none"), 0) < _LEVEL[requested[perm]]:
             return f"the app lacks {perm}: {requested[perm]} on this repository"
+    return None
+
+
+def _granted(data: dict[str, Any]) -> dict[str, str]:
+    raw = data.get("permissions")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in cast(dict[object, object], raw).items()}
+
+
+def _beyond(data: dict[str, Any], requested: Mapping[str, str]) -> str | None:
+    """Why a mint reply's permissions go beyond (or outside) ``requested``, or None."""
+    if not isinstance(data.get("permissions"), dict):
+        return "it lists no permissions"
+    for perm, level in _granted(data).items():
+        if perm not in requested or _LEVEL.get(level, 99) > _LEVEL[requested[perm]]:
+            return f"it grants {perm}: {level}, which was not asked for"
     return None
 
 
@@ -263,6 +279,26 @@ class GitHubApp:
         owner, _, name = slug.partition("/")
         wanted = {"metadata": "read", **perms}
         return await self._mint(name, wanted, owner, read=True, what="asking GitHub as the App")
+
+    async def mint_wide(self, perms: Mapping[str, str]) -> InstallationToken:
+        """PER-336: a token for every repo the installation can see, with ``perms``
+        (``metadata: read`` added). A reply granting a permission beyond (or outside) that is
+        revoked and refused, as in ``check_grant``."""
+        wanted = {"metadata": "read", **perms}
+        jwt = await self._jwt()
+        url = f"{self._base}/app/installations/{self.cfg.installation_id}/access_tokens"
+        resp = await self._send("POST", url, jwt, body={"permissions": wanted})
+        if resp.status_code != 201:
+            raise GitHubAppError(_why("asking GitHub as the App", resp, ""))
+        data = _json(resp)
+        token, expires = data.get("token"), data.get("expires_at")
+        if not isinstance(token, str) or not token:
+            raise GitHubAppError("GitHub's token reply had no token")
+        if (problem := _beyond(data, wanted)) is not None:
+            with contextlib.suppress(GitHubAppError):
+                await self.revoke(token)
+            raise GitHubAppError(f"GitHub's token was refused: {problem}")
+        return InstallationToken(token, expires if isinstance(expires, str) else "")
 
     async def ready(self) -> bool:
         """Whether the App's key is in the store (by name; no value is read). A store that

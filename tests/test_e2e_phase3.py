@@ -495,7 +495,10 @@ async def test_e3_show_my_prs_reaches_github_through_claudes_tools(
         offered = {
             t.name for t in r.daemon.imessage.brain.tools_for("justin") if t.extension == "github"
         }
-        assert offered == {"merge_pr", "pr", "prs", "recent_prs", "rerun_failed"}
+        assert offered == {
+            "merge_pr", "pr", "prs", "recent_prs", "rerun_failed", "pr_diff", "pr_comments",
+            "comment_pr",
+        }  # fmt: skip
 
 
 # --- E4 / E8 / E11: scheduled jobs and the kill switch -----------------------------------
@@ -664,7 +667,7 @@ async def test_e2_e14_github_commands_over_imessage(
         lines = listing.splitlines()
         assert lines[0] == "Extensions (1):"
         assert lines[1].startswith("github · enabled · a1b2c3d4 digest ")
-        assert " · 5 tools" in lines[1]
+        assert " · 8 tools" in lines[1]
         assert lines[2].startswith("- digest (L0) · next ")
         assert lines[3].startswith("- watch (L0) · next ")
         assert lines[4] == "core · built in"  # core jobs too, next due from config
