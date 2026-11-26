@@ -2030,8 +2030,9 @@ class ClaudeRunner:
         )
         try:
             task_id = self._create_task(spec)
-        except Exception:
-            runs.finish(self.conn, run.code, "failed", failure=run.failure, step="reply")
+        except Exception:  # as it was: failed on its limit, still continuable
+            runs.finish(self.conn, run.code, "failed", failure=run.failure, step="reply",
+                        max_seconds=run.max_seconds, resume_prompt=run.resume_prompt)  # fmt: skip
             raise
         runs.update(self.conn, run.code, task_id=task_id)
         self.reports.set_report(run.code, "now")  # asked for by name: its end is texted
@@ -2154,6 +2155,8 @@ class ClaudeRunner:
                 "by": "owner",
                 "since": self.clock().isoformat(),
                 **({"unattended": True} if unattended else {}),
+                # PER-344: the run's continuations stay with it (``end_ref``)
+                **({"continued": n} if task and (n := continuations(task.checkpoint)) else {}),
             },
         )
         task_id = self._create_task(spec)

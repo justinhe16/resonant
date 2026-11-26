@@ -38,7 +38,7 @@ _COLUMNS = frozenset(
         "wait_seconds", "waiting_since", "cost_usd", "tokens_in", "tokens_out", "exit_code",
         "pr_number", "pr_url", "files_changed", "flagged_paths", "summary", "failure",
         "started_at", "ended_at", "workspace", "checkout", "wait_reason", "last_note",
-        "resume_prompt", "remote_url",
+        "resume_prompt", "remote_url", "max_seconds",
     }
 )  # fmt: skip
 
