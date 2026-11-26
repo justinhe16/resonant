@@ -951,6 +951,13 @@ class RunnerConfig(_Section):
     # owner can watch and steer from the Claude app (an undocumented control request; a reply
     # that fails or never comes leaves the run going without it). ``off`` doesn't ask.
     remote_control: Literal["on", "off"] = "on"
+    # PER-341: who words a run's updates in its thread. ``template`` (the default): the
+    # code-built lines, exactly as before (``On it: starting R5 (…)``, ``R5 opened PR #12:
+    # …``, ``Along the way: …``, ``Needs you: …``). ``brain``: Claude writes each update
+    # (start, milestones, outcome, merge) as one short message from code-built facts, through
+    # ``brain.voice`` (its one-shot, guard, cap and fallback), with no ``Along the way`` line
+    # in a thread (the dashboard keeps it); any trouble sends the code-built line instead.
+    update_voice: Literal["template", "brain"] = "template"
     # The per-run token source. Without it workers can't push.
     github_app: GitHubAppConfig | None = None
 

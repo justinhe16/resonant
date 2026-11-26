@@ -211,6 +211,9 @@ pulse:
 #                                       #   login, no sandbox); thin: the Seatbelt thin guard (needs a token)
 #   remote_control: on                  # each worker opens a Remote Control session you can watch and steer
 #                                       #   in the Claude app (needs your claude login; off: don't ask)
+#   update_voice: template              # PER-341: template | brain. brain: Claude words a run's updates in
+#                                       #   its thread (brain.voice; code-built on any trouble), no
+#                                       #   "Along the way" line there (see config/cori.example.yaml)
 #   github_app: {app_id: 123456, installation_id: 12345678}   # public IDs; key: Keychain runner/github_app_key
 #   code_dir: ~/code                    # checkouts; worktrees in .worktrees/<name>/R<n>, scratch in .scratch/R<n>
 #   work_dir: ~/resonant-runs           # run dirs (the session's tmp, credentials; its home under thin)
