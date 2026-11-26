@@ -555,6 +555,14 @@ def limit_of(failure: str | None) -> Limit | None:
     return None
 
 
+def continue_step(run: Run) -> str | None:
+    """PER-347: a failed run's next step when a limit stopped it (``continue_run`` picks it up
+    from its kept work), else None."""
+    if run.status != "failed" or limit_of(run.failure) is None:
+        return None
+    return f'Say "continue {run.code}" to pick it up from its kept work.'
+
+
 def continuations(checkpoint: Mapping[str, Any]) -> int:
     """PER-344: how many times the run of this task checkpoint was continued (0: never)."""
     n = checkpoint.get("continued")
@@ -2577,17 +2585,21 @@ class ClaudeRunner:
 
     async def _say_failed(self, run: Run) -> None:
         """PER-319: a failed or cancelled run's ``Couldn't finish that: …`` in its thread,
-        once (``status:<task>:failed``), after its end text. A run with no thread (iMessage)
-        has its end text alone, as before."""
+        once (``status:<task>:failed``), when its end text didn't go out (PER-347: left to
+        the digest, or refused); with ``continue R5`` when a limit stopped it. A run with no
+        thread (iMessage) has its end text alone, as before."""
         if run.task_id is None or run_thread(self.conn, run) is None:
             return
         if run.status == "cancelled":
             why = f"{run.code} was cancelled"
         else:
             why = f"{run.code} failed ({status.plain_reason(run.failure)})"
+        text = status.failed_line(why)
+        if (nxt := continue_step(run)) is not None:
+            text = f"{text} {nxt}"
         key = status.status_key(run.task_id, status.FAILED)
         try:
-            await self._send_run(run, status.failed_line(why), dedupe_key=key)
+            await self._send_run(run, text, dedupe_key=key)
         except ChannelError as e:
             log.warning("run failure line not sent", extra={"run": run.code,
                                                             "error": type(e).__name__})  # fmt: skip
@@ -4072,11 +4084,13 @@ class ClaudeRunner:
             await self._deprovision(run.code)
             await self._end_cli(run.code)
         try:
-            voiced = await self._send_reply(run, watching=watching, note=note)
+            said = await self._send_reply(run, watching=watching, note=note)
         except ChannelError as e:
             return Fail(f"reply failed: {e}", retryable=True)
-        # PER-328: a voiced end text already explains the failure: no second line under it
-        if run.status in ("failed", "cancelled") and not voiced:
+        # PER-328/347: one failure message per run. The end text, once out (voiced or
+        # code-built; a retry's send is a no-op on its dedupe key and still counts), says
+        # the code, what failed and the next step: no ``Couldn't finish that`` under it.
+        if run.status in ("failed", "cancelled") and not said:
             await self._say_failed(run)
         if run.status == "failed":
             return Fail(run.failure or "failed")
@@ -4102,7 +4116,8 @@ class ClaudeRunner:
         marked told. A refused text leaves the line for the next digest. A cancel is always
         texted (the owner did it), and so is a token that wasn't revoked. ``watching`` and
         ``note`` are the auto-merge's; a fork run's reply names its upstream. True when the
-        voice wrote the text that went out (PER-328: it explains a failure itself)."""
+        end text went out (PER-347: it is the run's one failure message); False when it is
+        left to the digest, refused, or the state has none."""
         repo = repo_store.find(self.conn, run.repo) if run.repo else None
         no_ci = repo is not None and repo.mode == "push" and repo.ci is False
         upstream = repo.slug if repo is not None and repo.mode == "fork" else None
@@ -4203,7 +4218,7 @@ class ClaudeRunner:
             ref = end_ref(self.conn, run)
             system_texts.record(self.conn, run.requester, "run", said, ref=ref,
                                 task_id=run.task_id, outside=True)  # fmt: skip
-        return voiced is not None and voiced.used
+        return True
 
     async def _send_end(self, run: Run, text: str) -> None:
         """The end text: to the run's thread (else the principal), or, for a registered
@@ -4235,7 +4250,10 @@ class ClaudeRunner:
 
     def _next_step(self, run: Run) -> str | None:
         """PER-323: the final result's suggested next step (staging has it, production
-        doesn't), for a run that ended with its work in; None otherwise or on any trouble."""
+        doesn't), for a run that ended with its work in; PER-347: ``continue R5`` for one a
+        limit stopped; None otherwise or on any trouble."""
+        if run.status == "failed":
+            return continue_step(run)
         if run.status not in ("done", "ready", "merged"):
             return None
         try:

@@ -355,9 +355,14 @@ async def test_a_retry_after_failed_runs_starts_new_runs(
         where = thread(2)
         c.claude(calls=[surf("DORI-1173")], answer="Started R1 (DORI-1173); I'll post here.")
         await c.ask(JUSTIN, "robot-surf DORI-1173", where,
-                    lambda s: any(t.startswith("Couldn't finish that: R1") for t in s),
+                    lambda s: any(t.startswith("R1 (") and " failed: " in t for t in s),
                     "R1's failure")  # fmt: skip
         assert c.runs()[0].status == "failed"
+        await until(lambda: c.conn.execute("SELECT status FROM tasks WHERE runner = 'claude'")
+                    .fetchone()["status"] == "failed", 30, "R1's task to end")  # fmt: skip
+        # PER-347: one failure message per run, not the end text and a Couldn't finish that
+        failures = [t for t in c.said(where) if "R1" in t and "failed" in t]
+        assert len(failures) == 1 and not failures[0].startswith("Couldn't"), failures
         reply = "I started R2 (DORI-1173) again; I'll post the PR here."
         c.claude(calls=[surf("DORI-1173")], answer=reply)
         said = await c.ask(JUSTIN, "retry DORI-1173", where,
