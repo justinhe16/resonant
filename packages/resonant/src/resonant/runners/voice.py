@@ -1,13 +1,13 @@
 """Proactive texts in Claude's voice, the call (PER-273, docs/brain-plan.md).
 
-``ClaudeVoice`` writes the prose of a run's outcome, the hourly pulse and the briefing with
-ONE one-shot ``claude -p`` call per text; ``brain/voice.py`` holds the facts, the prompt and
-the guard. Why a one-shot and not the Claude brain's long-lived session (``claude_session``):
-that session is serial under a lock (a pulse would delay the owner's turn and the other way
-round), the text needs no tools, its inputs include outside content (worker summaries, PR
-titles) that would taint the shared session, and every call would use up its turn budget
-before the session rotates. The one-shot is stateless: voice continuity comes from the prompt
-and from the brains seeing the texts afterwards.
+``ClaudeVoice`` writes the prose of a run's outcome, the hourly pulse and the briefing (and,
+PER-341, a run's updates: kind ``update``) with ONE one-shot ``claude -p`` call per text;
+``brain/voice.py`` holds the facts, the prompt and the guard. Why a one-shot and not the Claude
+brain's long-lived session (``claude_session``): that session is serial under a lock (a pulse
+would delay the owner's turn and the other way round), the text needs no tools, its inputs
+include outside content (worker summaries, PR titles) that would taint the shared session, and
+every call would use up its turn budget before the session rotates. The one-shot is stateless:
+voice continuity comes from the prompt and from the brains seeing the texts afterwards.
 
 The call::
 
@@ -311,7 +311,9 @@ class ClaudeVoice:
 
     async def _write(self, facts: Facts, fallback: str, ref: str | None) -> VoiceResult:
         cfg = self.cfg
-        if not cfg.enabled or facts.kind not in cfg.kinds:
+        # PER-341: a run update is asked for by ``runner.update_voice: brain`` itself, not
+        # ``brain.voice.kinds`` (which lists the texts every instance sends on its own)
+        if not cfg.enabled or (facts.kind != "update" and facts.kind not in cfg.kinds):
             return self._unused(fallback, "disabled")
         prompt = voice.prompt(facts, cfg.max_chars)
         digest = _digest(prompt, fallback)

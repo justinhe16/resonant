@@ -87,6 +87,10 @@ ops:
   self_update: false
 runner:
   self_repo: false                      # no "resonant" repo for her workers (GD-1)
+  # PER-341: Claude words each run update in the thread (start, PR opened, CI failed,
+  # merged, deployed, the result) from code-built facts, with no "Along the way: ..." line;
+  # any trouble with the voice sends the code-built line. Personal Resonant keeps template.
+  update_voice: brain                   # template (default) | brain
   # PER-291 (Cori's scope; docs/employee-plan.md CS-1). Workers stay unguarded: these are
   # instructions and credentials, not a wall.
   # Appended to every worker's system prompt (at most 8 KB, read at run start).
@@ -120,6 +124,10 @@ runner:
 # instance's home or worker dirs (config validation).
 brain:
   instructions_file: ~/resonant/config/cori/brain-rules.md
+  # PER-341: each run spends about 3 to 6 voice calls (start, milestones, result); past the
+  # day's cap updates are code-built again.
+  voice:
+    daily_cap: 200
   # PER-340: a reply the guard still doubts after its one redo goes out as Claude wrote it
   # (flagged on the span), never "I didn't save that; nothing changed." in a team thread.
   # Tool-call text is still never sent. Personal Resonant keeps the default, strict.

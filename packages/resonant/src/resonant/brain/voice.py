@@ -12,6 +12,10 @@ from a small set of **facts** (:class:`Facts`) and code does the rest:
   links, commands, questions). Any miss and the code-built text goes out instead
   (:func:`compose` returns the fallback), so a text is never worse than before.
 
+PER-341: with ``runner.update_voice: brain`` a run's progress updates (its start and each
+milestone) are voiced too (kind ``update``, :func:`update_facts`), and its texts are
+``plain`` (:class:`Facts`): a needs without a slash command is Claude's to say in words.
+
 This module is the pure half (facts, prompt, guard, assembly). ``runners/voice.py`` runs the
 one-shot ``claude -p`` call. ``extensions/voice_facts.py`` builds the pulse and briefing
 facts from the store.
@@ -36,9 +40,9 @@ from resonant.store.runs import Run
 if TYPE_CHECKING:
     from resonant.runners.reports import MergedBy
 
-TextKind = Literal["outcome", "pulse", "briefing"]
+TextKind = Literal["outcome", "pulse", "briefing", "update"]
 Audience = Literal["owner", "team"]
-KINDS: tuple[TextKind, ...] = ("outcome", "pulse", "briefing")
+KINDS: tuple[TextKind, ...] = ("outcome", "pulse", "briefing", "update")
 Outcome = Literal[
     "opened_pr",
     "upstream_pr",
@@ -57,11 +61,16 @@ Outcome = Literal[
     "review_requested",
     "pr_stalled",
     "pr_waiting_merge",
+    "started",
+    "ci_failed",
+    "changes_requested",
+    "deployed",
 ]
 OUTCOMES: tuple[str, ...] = (
     "opened_pr", "upstream_pr", "merged", "merged_onto_base", "no_changes", "finished",
     "local_branch", "couldnt_push", "failed", "running", "stalled", "waiting_merge", "queued",
-    "pr_merged", "review_requested", "pr_stalled", "pr_waiting_merge",
+    "pr_merged", "review_requested", "pr_stalled", "pr_waiting_merge", "started", "ci_failed",
+    "changes_requested", "deployed",
 )  # fmt: skip
 
 # The code-built section headers: a voiced text has none of them (the guard's format rule).
@@ -102,6 +111,10 @@ OUTCOME_VERBS: dict[Outcome, frozenset[str]] = {
     "review_requested": frozenset(),
     "pr_stalled": frozenset(),
     "pr_waiting_merge": frozenset(),
+    "started": frozenset(),
+    "ci_failed": _FAILED,
+    "changes_requested": frozenset(),
+    "deployed": frozenset({"deployed"}),
 }
 # Resonant's run tools: a reply that is the text of a call to one is never sent.
 CALL_TOOLS = (
@@ -179,12 +192,13 @@ class Item:
     quiet: str | None = None
     owner_approved: bool = False  # the merge answered the owner's yes; the code never goes in
     urgent: bool = False
-    needs: str | None = None  # code-built, for the closing line only (never shown to Claude)
+    needs: str | None = None  # code-built, for the closing line (PER-341: plain, Claude's)
+    env: str | None = None  # PER-341: a deploy's target (``staging``, ``production``)
 
     def prompt_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"ref": flat(self.ref), "outcome": self.outcome}
         for key in ("repo", "ask", "title", "summary", "failure", "pr_url", "ci", "base",
-                    "took", "quiet"):  # fmt: skip
+                    "took", "quiet", "env"):  # fmt: skip
             value: str | None = getattr(self, key)
             if value:
                 out[key] = flat(value)
@@ -218,7 +232,10 @@ class Facts:
     appended verbatim after the prose. Neither reaches Claude (:meth:`prompt_json`).
     ``next_step`` (PER-323): a code-built suggested next step, said last, in place of ``No
     action needed.``. ``audience`` (PER-323): ``team`` when the text goes to the teammate who
-    asked, in their thread, not to the owner."""
+    asked, in their thread, not to the owner. ``plain`` (PER-341, ``runner.update_voice:
+    brain``): an item's ``needs`` that carries no slash command is Claude's to say in words
+    (it is in the facts Claude sees, never in the closing line), and nothing is added when
+    nothing is needed (no ``No action needed.``)."""
 
     kind: TextKind
     items: tuple[Item, ...]
@@ -228,13 +245,18 @@ class Facts:
     tail: tuple[str, ...] = ()
     next_step: str | None = None
     audience: Audience = "owner"
+    plain: bool = False
 
     def prompt_json(self) -> str:
-        """The facts Claude sees, as sorted JSON: no approval codes, no tail, no ``needs``."""
-        data: dict[str, Any] = {
-            "kind": self.kind,
-            "items": [i.prompt_dict() for i in self.items],
-        }
+        """The facts Claude sees, as sorted JSON: no approval codes, no tail, no ``needs``
+        (PER-341: but a plain one, with ``plain``)."""
+        items: list[dict[str, Any]] = []
+        for i in self.items:
+            d = i.prompt_dict()
+            if self.plain and plain_needs(i.needs):
+                d["needs"] = flat(i.needs or "")
+            items.append(d)
+        data: dict[str, Any] = {"kind": self.kind, "items": items}
         if self.going:
             data["going"] = [flat(g) for g in self.going[:GOING_SHOWN]]
         if self.day is not None:
@@ -313,7 +335,7 @@ def _count(d: Mapping[str, Any], key: str, where: str) -> int:
 
 _ITEM_KEYS = {
     "ref", "outcome", "repo", "ask", "title", "summary", "failure", "pr", "pr_url", "ci",
-    "base", "merged", "took", "quiet", "owner_approved", "urgent", "needs",
+    "base", "merged", "took", "quiet", "owner_approved", "urgent", "needs", "env",
 }  # fmt: skip
 
 
@@ -345,6 +367,7 @@ def _item(raw: Any, where: str) -> Item:
         owner_approved=_flag(d, "owner_approved", where),
         urgent=_flag(d, "urgent", where),
         needs=_opt_str(d, "needs", where),
+        env=_opt_str(d, "env", where),
     )
 
 
@@ -426,6 +449,11 @@ SYSTEM_PROMPT = (
     "Resonant adds that line itself. Don't quote an ask word for word or cut it off; say what "
     "it was about. Reply with the message only, at most {max_chars} characters."
 )
+# PER-341: a plain text says what's needed itself, in words (``Facts.plain``).
+PLAIN_LINE = (
+    "If an item has needs, end by saying plainly, in your own words, what you need from "
+    "them; Resonant adds no line of its own for that."
+)
 TEAM_LINE = (
     "This text goes to the teammate who asked for the run, in their work thread, not to the "
     "owner: write it to them."
@@ -436,6 +464,14 @@ KIND_LINES: dict[TextKind, str] = {
     "briefing": (
         "This is the 08:00 morning text. Start with 'Morning.', cover today's reminders with "
         "their times and the open work, then the worker news. Two to five sentences."
+    ),
+    "update": (
+        "This is a progress update on one run that is still going, in its work thread: say "
+        "what just happened in one short sentence, present tense is fine. The outcome says "
+        "which step: started (the run is starting on its ask now), opened_pr (it opened the "
+        "PR), ci_failed (CI failed on its PR and it is fixing it), changes_requested (the "
+        "review asked for changes and it is working on them), merged (it merged its PR), "
+        "deployed (it deployed to env)."
     ),
 }
 
@@ -449,7 +485,8 @@ def prompt(facts: Facts, max_chars: int) -> str:
     then what kind of text to write."""
     del max_chars  # the system prompt carries the limit
     team = f"{TEAM_LINE}\n" if facts.audience == "team" else ""
-    return f"<facts>{facts.prompt_json()}</facts>\n{KIND_LINES[facts.kind]}\n{team}"
+    plain = f"{PLAIN_LINE}\n" if facts.plain else ""
+    return f"<facts>{facts.prompt_json()}</facts>\n{KIND_LINES[facts.kind]}\n{team}{plain}"
 
 
 # --- assembly --------------------------------------------------------------------------------
@@ -496,7 +533,9 @@ def _and_list(items: Sequence[str]) -> str:
 
 def closing_line(facts: Facts) -> str:
     """``No action needed.`` or ``Needs you: approve A7 and C3; /merge R14 to merge PR #18.``
-    Approvals first, then each item's ``needs``. The one place a code or a command appears."""
+    Approvals first, then each item's ``needs``. The one place a code or a command appears.
+    PER-341: with ``facts.plain`` a needs without a command is Claude's to say, and nothing
+    needed is "" (no line)."""
     needs: list[str] = []
     if facts.approvals:
         codes = [c for c in facts.approvals if c]
@@ -506,9 +545,19 @@ def closing_line(facts: Facts) -> str:
             n = len(facts.approvals)
             needs.append(f"{n} approval{'' if n == 1 else 's'} waiting (/approvals)")
     for item in facts.items:
+        if facts.plain and plain_needs(item.needs):
+            continue
         if item.needs and item.needs not in needs:
             needs.append(item.needs)
-    return f"Needs you: {'; '.join(needs)}." if needs else NO_ACTION
+    if needs:
+        return f"Needs you: {'; '.join(needs)}."
+    return "" if facts.plain else NO_ACTION
+
+
+def plain_needs(needs: str | None) -> bool:
+    """PER-341: a needs Claude may say in words: one without a slash command (``a look at
+    R9's branch``, not ``/merge R14 once CI is green``)."""
+    return bool(needs) and _COMMAND.search(needs or "") is None
 
 
 def record_text(text: str) -> str:
@@ -522,9 +571,10 @@ def finish(prose: str, facts: Facts) -> str:
     next step (PER-323) is said last, in place of ``No action needed.``."""
     closing = closing_line(facts)
     if facts.next_step is None:
-        return "\n".join([prose, *facts.tail, closing])
-    ends = [facts.next_step] if closing == NO_ACTION else [closing, facts.next_step]
-    return "\n".join([prose, *facts.tail, *ends])
+        ends = [closing]
+    else:
+        ends = [facts.next_step] if closing == NO_ACTION else [closing, facts.next_step]
+    return "\n".join(line for line in [prose, *facts.tail, *ends] if line)
 
 
 # --- the guard -------------------------------------------------------------------------------
@@ -574,6 +624,8 @@ def _free_words(facts: Facts) -> set[str]:
     texts: list[str] = [*facts.going]
     for i in facts.items:
         texts += [t for t in (i.ask, i.title, i.summary, i.failure, *i.merged) if t]
+        if facts.plain and plain_needs(i.needs):
+            texts.append(i.needs or "")
     if facts.day is not None:
         texts += [r for _t, r in facts.day.reminders]
     return {w for t in texts for w in _WORD.findall(t.lower())}
@@ -762,6 +814,7 @@ def outcome_facts(
     going: Sequence[str] = (),
     next_step: str | None = None,
     audience: Audience = "owner",
+    plain: bool = False,
 ) -> Facts | None:
     """The facts of a run's end text, or None for a state with nothing to voice. The tail
     holds what code keeps verbatim: ``warn`` (⚠ alerts, an unrevoked token), the ⚠ lines of
@@ -776,7 +829,7 @@ def outcome_facts(
     if also:
         tail.append(also)
     return Facts("outcome", (item,), going=tuple(going), tail=tuple(dict.fromkeys(tail)),
-                 next_step=next_step, audience=audience)  # fmt: skip
+                 next_step=next_step, audience=audience, plain=plain)  # fmt: skip
 
 
 def merged_facts(
@@ -786,6 +839,8 @@ def merged_facts(
     deps_line: str | None = None,
     also: str | None = None,
     owner_approved: bool = False,
+    audience: Audience = "owner",
+    plain: bool = False,
 ) -> Facts:
     """The facts of an unattended merge's text (``R8 merged: PR #2``): ``title`` is the PR's
     first commit subject; the deps line and side effects stay code-built."""
@@ -796,7 +851,35 @@ def merged_facts(
         owner_approved=owner_approved,
     )
     tail = [line for line in (deps_line, also) if line]
-    return Facts("outcome", (item,), tail=tuple(tail))
+    return Facts("outcome", (item,), tail=tuple(tail), audience=audience, plain=plain)
+
+
+UpdateOutcome = Literal["started", "opened_pr", "ci_failed", "changes_requested", "merged",
+                        "deployed"]  # fmt: skip
+
+
+def update_facts(
+    run: Run,
+    outcome: UpdateOutcome,
+    *,
+    pr: int | None = None,
+    pr_url: str | None = None,
+    env: str | None = None,
+    audience: Audience = "owner",
+) -> Facts:
+    """PER-341: the facts of one progress update of a running run (``runner.update_voice:
+    brain``): its start or one milestone (``runners/milestones.py``). The run's code, repo
+    and ask, and the milestone's PR and target, all code-built; nothing to add after it."""
+    item = Item(
+        ref=run.code,
+        outcome=outcome,
+        repo=run.repo or None,
+        ask=ask_text(run.ask),
+        pr=pr,
+        pr_url=pr_url,
+        env=env,
+    )
+    return Facts("update", (item,), audience=audience, plain=True)
 
 
 __all__ = [
@@ -810,6 +893,7 @@ __all__ = [
     "Outcome",
     "Problem",
     "TextKind",
+    "UpdateOutcome",
     "Voice",
     "VoiceResult",
     "ask_text",
@@ -823,9 +907,11 @@ __all__ = [
     "normalize",
     "note_why",
     "outcome_facts",
+    "plain_needs",
     "prompt",
     "record_text",
     "run_item",
     "strip_closing",
     "system_prompt",
+    "update_facts",
 ]

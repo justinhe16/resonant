@@ -89,7 +89,16 @@ import psutil
 
 from resonant import instance as inst
 from resonant import killswitch
-from resonant.brain.voice import Voice, VoiceResult, merged_facts, outcome_facts, record_text
+from resonant.brain.voice import (
+    Facts,
+    UpdateOutcome,
+    Voice,
+    VoiceResult,
+    merged_facts,
+    outcome_facts,
+    record_text,
+    update_facts,
+)
 from resonant.config import RunnerConfig, RunnerRepo
 from resonant.config import resonant_home as default_resonant_home
 from resonant.extensions.notify import clean_text
@@ -302,6 +311,14 @@ LOCK_POLL_S = 0.25
 # a push run's session left commits it couldn't push: the run fails with this reason, and
 # the reply leads with it (PER-271: not "made no changes")
 COULDNT_PUSH = "couldn't push: "
+# PER-341: a milestone as the voice's update outcome (``brain.voice.update_facts``)
+MILESTONE_OUTCOME: dict[milestones.Kind, UpdateOutcome] = {
+    "pr_opened": "opened_pr",
+    "ci_failed": "ci_failed",
+    "changes_requested": "changes_requested",
+    "merged": "merged",
+    "deployed": "deployed",
+}
 REVOKE_TIMEOUT_S = (
     github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
     + github_app_mod.BACKOFF_S * (2**github_app_mod.ATTEMPTS - 1)
@@ -1045,6 +1062,10 @@ class ClaudeRunner:
         code-built text stays the fallback and the ⚠ lines, side effects and the closing
         line stay code-built. None: every text is code-built.
 
+        PER-341: with ``runner.update_voice: brain`` the voice also words the run's start
+        line and its milestones (``_brain_words``), and a run's texts in a thread leave out
+        ``Along the way: …``; any trouble with the voice sends the code-built line.
+
         PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies.
 
         PER-301: ``bridge`` (an instance with ``notify_owner``) also forwards a run's urgent
@@ -1147,6 +1168,9 @@ class ClaudeRunner:
             requests=requests,  # PER-296: `resonant request`
         )
         self.voice = voice
+        # PER-341: a brain-worded start line still being written, by run code (the run's
+        # milestones and end text wait for it, so the thread reads in order)
+        self._announcing: dict[str, asyncio.Task[None]] = {}
         self.owner = owner
         self.home = home or Path.home()
         self._login_check: Callable[[], Awaitable[bool]] = login_check or LoginCheck(
@@ -2223,6 +2247,7 @@ class ClaudeRunner:
         pending for the next one. Never raises."""
         if self.milestones_mode != "thread" or code not in self._loud:
             return  # off, or the run already ended (``_end_milestones``)
+        await self._announced(code)  # PER-341: the start line first
         async with self._milestone_locks.setdefault(code, asyncio.Lock()):
             try:
                 run = runs.get(self.conn, code)
@@ -2235,9 +2260,15 @@ class ClaudeRunner:
                 log.exception("milestones not read", extra={"run": code})
                 return
             for key, m in todo:
-                dedupe = status.status_key(run.task_id, milestones.dedupe_suffix(key))
+                suffix = milestones.dedupe_suffix(key)
+                dedupe = status.status_key(run.task_id, suffix)
+                text = milestones.line(code, m)
+                if self._brain_words():  # PER-341
+                    facts = update_facts(run, MILESTONE_OUTCOME[m.kind], pr=m.pr, pr_url=m.url,
+                                         env=m.env, audience=self._audience(run))  # fmt: skip
+                    text = await self._worded(facts, text, ref=f"run:{code}:{suffix}")
                 try:
-                    await self._send_run(run, milestones.line(code, m), dedupe_key=dedupe)
+                    await self._send_run(run, text, dedupe_key=dedupe)
                 except ChannelError as e:
                     why = {"run": code, "kind": m.kind, "error": type(e).__name__}
                     log.warning("milestone not sent", extra=why)
@@ -2284,7 +2315,10 @@ class ClaudeRunner:
         self._working.add(run.code)  # nothing awaited since the check
         try:
             if task.checkpoint.get("announce") is True:
-                await self._announce(task, run)
+                if self._brain_words():  # PER-341: the worker needn't wait on the wording
+                    self._announce_soon(task, run)
+                else:
+                    await self._announce(task, run)
             return await self._drive(task, run, ctx)
         except asyncio.CancelledError:
             await self._on_cancelled(run.code)
@@ -2299,11 +2333,53 @@ class ClaudeRunner:
         if run_thread(self.conn, run) is None:
             return
         text = status.start_line(run.code, run.ask)
+        if self._brain_words():  # PER-341
+            facts = update_facts(run, "started", audience=self._audience(run))
+            text = await self._worded(facts, text, ref=f"run:{run.code}:{status.STARTED}")
         try:
             await self._send_run(run, text, dedupe_key=status.status_key(task.id, status.STARTED))
         except ChannelError as e:
             log.warning("run start line not sent", extra={"run": run.code,
                                                           "error": type(e).__name__})  # fmt: skip
+
+    def _announce_soon(self, task: Task, run: Run) -> None:
+        """PER-341: ``_announce`` in the background (its wording is a Claude call); the run's
+        milestones and end text wait for it (``_announced``). Once per run at a time."""
+        live = self._announcing.get(run.code)
+        if live is not None and not live.done():
+            return
+        job = asyncio.ensure_future(self._announce(task, run))
+        self._announcing[run.code] = job
+        self._background.add(job)
+        job.add_done_callback(self._background.discard)
+
+    async def _announced(self, code: str) -> None:
+        """PER-341: wait for run ``code``'s start line if it is still being written. Never
+        raises but a cancel."""
+        job = self._announcing.get(code)
+        if job is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.shield(job)
+        if self._announcing.get(code) is job:
+            self._announcing.pop(code, None)
+
+    def _brain_words(self) -> bool:
+        """PER-341: run updates are worded by the brain (``runner.update_voice: brain``) and
+        there is a voice to word them; else every update is code-built, as before."""
+        return self.cfg.update_voice == "brain" and self.voice is not None
+
+    async def _worded(self, facts: Facts, fallback: str, *, ref: str) -> str:
+        """PER-341: the voice's text for one run update, else ``fallback`` (the code-built
+        line): paused, a usage limit, the cap, no Claude, a timeout or a guard miss."""
+        if self.voice is None:
+            return fallback
+        return (await self.voice.write(facts, fallback, ref=ref)).text
+
+    def _no_along(self, run: Run) -> bool:
+        """PER-341: brain-worded texts in a thread leave out ``Along the way: …`` (the run's
+        ``did:`` list stays on the dashboard)."""
+        return self._brain_words() and run_thread(self.conn, run) is not None
 
     async def _say_failed(self, run: Run) -> None:
         """PER-319: a failed or cancelled run's ``Couldn't finish that: …`` in its thread,
@@ -3776,6 +3852,7 @@ class ClaudeRunner:
         reply (once), and tell the loop how the task ended. ``watching`` and ``note`` are
         the auto-merge's (it will merge once CI is green; why it won't)."""
         self._forks.pop(run.code, None)
+        await self._announced(run.code)  # PER-341: the start line comes first
         await self._end_milestones(run.code)
         if run.status == "cancelled":
             await self._finish_cancelled(run.code, send=False)
@@ -3843,7 +3920,7 @@ class ClaudeRunner:
                 head += f" {still}"
             if note:  # the auto-merge's note says how to merge it: no second hint
                 lines = [line for line in lines if not line.startswith(f"/merge {run.code} ")]
-            also = self.reports.also_line(run, skip=merged)
+            also = None if self._no_along(run) else self.reports.also_line(run, skip=merged)
             extra = [*warn, *setup, *([note] if note else []), *lines, *([also] if also else []),
                      *said]  # fmt: skip
             text = end_text(head, extra)
@@ -3882,7 +3959,8 @@ class ClaudeRunner:
                                   note=note,
                                   lines=parts[1], also=also,
                                   going=self._still_names(run), next_step=nxt,
-                                  audience=self._audience(run))  # fmt: skip
+                                  audience=self._audience(run),
+                                  plain=self._brain_words())  # fmt: skip
             if facts is not None:
                 voiced = await self.voice.write(facts, text, ref=f"run:{run.code}:{run.status}")
                 if voiced.used:
@@ -3999,8 +4077,11 @@ class ClaudeRunner:
         text = item.title  # with its did: list
         voiced: VoiceResult | None = None
         if self.voice is not None and self._voiced(run):
+            brain = self._brain_words()  # PER-341: the teammate's thread, in words
+            also = None if self._no_along(run) else self.reports.also_line(run)
             facts = merged_facts(run, title=title, deps_line=deps_line(deps) or None,
-                                 also=self.reports.also_line(run))  # fmt: skip
+                                 also=also, plain=brain,
+                                 audience=self._audience(run) if brain else "owner")  # fmt: skip
             voiced = await self.voice.write(facts, text, ref=f"run:{run.code}:merged")
             if voiced.used:
                 text = voiced.text
