@@ -115,6 +115,7 @@ from resonant.gateway.channel import (
     SelfTestResult,
     Submit,
     approval_dedupe_key,
+    shared_thread,
 )
 from resonant.gateway.imessage.channel import split_text
 from resonant.gateway.slack import blocks
@@ -1161,10 +1162,11 @@ class SlackChannel:
                 )
             if ok:
                 return channel, ts, None
-            in_dm = channel.startswith("D")
-            log.info("slack: thread for %s is not one Cori follows; sending unthreaded", principal)
+            in_dm = not shared_thread(thread)  # a 1:1 conversation stays in the DM
+            log.info("slack: thread for %s is not one Cori follows", principal)
         key = self.config.unthreaded_room
         if key is not None and not in_dm and (room := self.config.rooms.get(key)) is not None:
+            log.info("slack: unthreaded send for %s goes to room %s", principal, key)
             return room, None, key
         dm = self._dms.get(uid)
         if dm is None:
