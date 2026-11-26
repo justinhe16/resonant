@@ -689,7 +689,9 @@ def test_cli_list_shows_expiries(
     later = datetime.combine(today, time(12), tzinfo=zone).astimezone(UTC)
     expiry_store.upsert(conn, "runner/github_app_key", expires_at=later, source="owner",
                         set_at=now)  # fmt: skip
-    expiry_store.upsert(conn, "runner/github_token", expires_at=now - timedelta(days=2, hours=1),
+    # noon two calendar days ago: "expired 2d ago" whatever the hour (2d1h before 00:30 is 3d)
+    expired = datetime.combine(today - timedelta(days=102), time(12), tzinfo=zone).astimezone(UTC)
+    expiry_store.upsert(conn, "runner/github_token", expires_at=expired,
                         source="owner", set_at=now)  # fmt: skip
     expiry_store.upsert(conn, "linear/token", expires_at=now + timedelta(days=5),
                         source="owner", set_at=now)  # fmt: skip
