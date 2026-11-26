@@ -398,7 +398,7 @@ def _day(raw: Any) -> Day:
 
 ProblemKind = Literal[
     "empty", "format", "call", "too_long", "question", "ask", "command", "promise", "code",
-    "url", "missing", "numbers", "claim",
+    "url", "missing", "numbers", "claim", "needs",
 ]  # fmt: skip
 
 
@@ -485,7 +485,7 @@ def prompt(facts: Facts, max_chars: int) -> str:
     then what kind of text to write."""
     del max_chars  # the system prompt carries the limit
     team = f"{TEAM_LINE}\n" if facts.audience == "team" else ""
-    plain = f"{PLAIN_LINE}\n" if facts.plain else ""
+    plain = f"{PLAIN_LINE}\n" if _plain_items(facts) else ""
     return f"<facts>{facts.prompt_json()}</facts>\n{KIND_LINES[facts.kind]}\n{team}{plain}"
 
 
@@ -552,6 +552,20 @@ def closing_line(facts: Facts) -> str:
     if needs:
         return f"Needs you: {'; '.join(needs)}."
     return "" if facts.plain else NO_ACTION
+
+
+def _plain_items(facts: Facts) -> list[Item]:
+    """PER-341: the items whose needs Claude says itself (``Facts.plain``)."""
+    return [i for i in facts.items if facts.plain and plain_needs(i.needs)]
+
+
+def _says_needs(prose: str, item: Item) -> bool:
+    """PER-341: the prose says the item's plain needs: one of its words of four letters or
+    more (``look`` or ``branch`` of ``a look at R9's branch``), the ref aside."""
+    words = {w for w in _WORD.findall((item.needs or "").lower()) if len(w) >= 4}
+    words.discard(item.ref.lower())
+    have = set(_WORD.findall(prose.lower()))
+    return not words or bool(words & have)
 
 
 def plain_needs(needs: str | None) -> bool:
@@ -647,7 +661,8 @@ def check(
     tool call), ``too_long``, ``question``, ``ask`` (asks for a reply or a yes), ``command``
     (a slash command), ``promise`` (``I'll ...``), ``code`` (an approval-code look-alike, or
     a run or repo reference not in the facts), ``url`` (a link that isn't an item's PR),
-    ``missing`` (an item or reminder time not named), ``numbers`` (a number in no fact, the
+    ``missing`` (an item or reminder time not named), ``needs`` (PER-341: a plain needs
+    not said), ``numbers`` (a number in no fact, the
     fallback or the calendar), ``claim`` (a change verb the facts don't back)."""
     if not prose:
         return Problem("empty")
@@ -682,6 +697,8 @@ def check(
         unnamed = unnamed or any(_clock_keys(t) - have for t, _ in facts.day.reminders)
     if unnamed:
         return Problem("missing")
+    if any(not _says_needs(prose, i) for i in _plain_items(facts)):
+        return Problem("needs")
     extra = guard.unsourced(prose, [known, mask_codes(fallback), guard.calendar_text(now, tz)])
     if extra:
         return Problem("numbers", len(extra))

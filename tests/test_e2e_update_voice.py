@@ -14,8 +14,11 @@ Nothing touches the real ~/.resonant, ~/code, Keychain or claude.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 from test_e2e_milestones import (
@@ -159,3 +162,33 @@ async def test_template_is_the_code_built_lines(
         # the outcome is voiced as before (PER-273), with its Along the way line
         assert script.calls == 1 and '"kind":"outcome"' in script.prompts[0]
         assert [t for t in texts if "Along the way" in t]
+
+
+async def test_a_cancel_drops_a_start_line_still_being_written(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The start line's wording is still out when the run is cancelled: it never posts."""
+    async with slack_run(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
+        assert d.stack is not None and d.stack.claude is not None
+        claude = d.stack.claude
+        brain(d, tmp_path, ByOutcome())
+        gate = asyncio.Event()
+        claude._announce = _held(claude._announce, gate)  # pyright: ignore[reportPrivateUsage]
+        await start(d)
+        await until(lambda: "R1" in claude._announcing, 20, "the start line")  # pyright: ignore[reportPrivateUsage]
+        job = claude._announcing["R1"]  # pyright: ignore[reportPrivateUsage]
+        await claude._on_cancelled("R1")  # pyright: ignore[reportPrivateUsage]
+        with contextlib.suppress(asyncio.CancelledError):
+            await job
+        assert job.cancelled()
+        assert "R1" not in claude._announcing  # pyright: ignore[reportPrivateUsage]
+        await claude._announced("R1")  # pyright: ignore[reportPrivateUsage]
+        assert WORDS["started"] not in thread_texts(fake)
+
+
+def _held(announce: Any, gate: asyncio.Event) -> Any:
+    async def held(task: Any, run: Any) -> None:
+        await gate.wait()  # never set: the wording is still out
+        await announce(task, run)
+
+    return held

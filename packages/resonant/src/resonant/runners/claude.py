@@ -2248,7 +2248,11 @@ class ClaudeRunner:
         if self.milestones_mode != "thread" or code not in self._loud:
             return  # off, or the run already ended (``_end_milestones``)
         await self._announced(code)  # PER-341: the start line first
+        if code not in self._loud:
+            return  # the run ended while it was written: the final result says them
         async with self._milestone_locks.setdefault(code, asyncio.Lock()):
+            if code not in self._loud:
+                return
             try:
                 run = runs.get(self.conn, code)
                 if run is None or run.status != "running" or run.task_id is None:
@@ -2359,8 +2363,13 @@ class ClaudeRunner:
         job = self._announcing.get(code)
         if job is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             await asyncio.shield(job)
+        except asyncio.CancelledError:
+            if not job.cancelled():  # the caller was cancelled, not the start line
+                raise
+        except Exception:
+            log.warning("run start line failed", extra={"run": code})
         if self._announcing.get(code) is job:
             self._announcing.pop(code, None)
 
@@ -4127,6 +4136,9 @@ class ClaudeRunner:
         """The step was cancelled from outside: by ``/cancel`` or ``/kill`` (the run row says
         so), by a shutdown or by the stuck-step limit (it doesn't: the run stays as it is and
         resumes later)."""
+        job = self._announcing.pop(code, None)  # PER-341: no start line after a cancel
+        if job is not None:
+            job.cancel()
         run = runs.get(self.conn, code)
         if run is not None and run.status == "cancelled":
             await self._finish_cancelled(code)

@@ -150,3 +150,13 @@ async def test_an_update_falls_back_when_the_voice_is_off_or_fails(
     timed_out = scripted_voice(db, tmp_path, Script(CallResult("timeout")))
     out = await timed_out.write(update_facts(RUN, "started"), fallback)
     assert (out.text, out.used) == (fallback, False)
+
+
+def test_a_plain_needs_must_be_said_or_the_text_falls_back() -> None:
+    failed = run_of(status="done", pr_url=None, code="R9")  # local_branch: a look at R9's branch
+    facts = voice.outcome_facts(failed, plain=True)
+    assert facts is not None
+    assert compose("R9 finished the change.", facts).reason == "guard:needs"
+    assert compose("R9 finished on a local branch; worth a look at it.", facts).used
+    # an update has no needs: no PLAIN_LINE nudging Claude to invent one
+    assert voice.PLAIN_LINE not in voice.prompt(update_facts(RUN, "started"), 600)
