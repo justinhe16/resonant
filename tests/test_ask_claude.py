@@ -977,3 +977,16 @@ async def test_ack_is_skipped_when_a_run_already_announced_in_the_thread() -> No
         )
         await asyncio.gather(*stub._acks)
     assert sent == [ask_mod.SHARED_ACK]
+
+
+def test_a_run_that_announced_itself_counts_as_a_change_for_the_guard() -> None:
+    # Cori 2026-11-25: "Started R10, R11 and R12 …" after three announced start_runs was
+    # swapped for the guard's fallback: the runs had no report line, so nothing had "run".
+    from types import SimpleNamespace
+
+    from resonant.runners.ask import AskRunner
+
+    quiet = SimpleNamespace(reports=[], progress=[], announced=0)
+    started = SimpleNamespace(reports=[], progress=[], announced=3)
+    assert not AskRunner._ran(cast(Any, quiet))  # pyright: ignore[reportPrivateUsage]
+    assert AskRunner._ran(cast(Any, started))  # pyright: ignore[reportPrivateUsage]

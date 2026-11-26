@@ -2009,7 +2009,7 @@ class AskRunner:
                 sources=self._sources(message, primed, bridge, before, question, convo),
                 tools=set(bridge.specs),
                 called=bridge.called,
-                changed=bool(bridge.reports or bridge.progress) or fed,
+                changed=self._ran(bridge) or fed,
                 asked=bool(bridge.asked),
             )
             fields = guard.span_fields(problem)
@@ -2032,6 +2032,12 @@ class AskRunner:
             redone = True
             out = await run(guard.redo(problem))
         return out, None
+
+    @staticmethod
+    def _ran(bridge: ClaudeTools) -> bool:
+        """A change ran this turn: a report line, a change of Claude's own, or a run that
+        announced itself in the thread (it has no report line, PER-319)."""
+        return bool(bridge.reports or bridge.progress or bridge.announced)
 
     @staticmethod
     def _acted(bridge: ClaudeTools) -> bool:
