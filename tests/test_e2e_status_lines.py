@@ -8,7 +8,7 @@ always asks).
 - One approver's DM failing with a non-refused error doesn't fail the ask: the other copy
   stands, the task waits, and ``approval.send_failed`` names the failed send.
 - An approval nobody got (every send failed) ends in one ``Couldn't finish that: …`` line in
-  the asking thread; so do a denial and a run's failure.
+  the asking thread; so does a denial. A run's failure is said once, by its end text (PER-347).
 - A member's ask from a DM says who it waits on (the prompt isn't in their conversation).
 - A run the brain starts says ``On it: starting R1 (…).`` in its thread once.
 """
@@ -120,6 +120,12 @@ async def team(
             daemon.stop()
         assert await asyncio.wait_for(task, 20) == 0
         w.daemon = None
+
+
+def run_task_ended(d: Daemon) -> bool:
+    """The run's task has ended: anything it says after its end text is out."""
+    row = d.conn.execute("SELECT status FROM tasks WHERE runner = 'claude'").fetchone()
+    return row is not None and row["status"] in ("done", "failed", "cancelled")
 
 
 def in_thread(fake: FakeChannel, thread: str, start: str) -> list[str]:
@@ -254,7 +260,10 @@ async def test_a_failed_run_says_so_in_its_thread_once(
         ref = {"channel": "slack", "thread": CHANNEL_THREAD, "ref": "slack-in:9",
                "principal": "lead"}  # fmt: skip
         await d.stack.claude.start_run(REPO, "fix the typo", "lead", channel_ref=ref)
-        await until(lambda: bool(in_thread(fake, CHANNEL_THREAD, "Couldn't")), 60, "the line")
-        (line,) = in_thread(fake, CHANNEL_THREAD, "Couldn't")
-        assert line.startswith("Couldn't finish that: R1 failed ("), line
+        await until(lambda: bool(in_thread(fake, CHANNEL_THREAD, "R1 ")), 60, "the end text")
+        await until(lambda: run_task_ended(d), 30, "the run task to end")
+        # PER-347: the end text is the one failure message; no Couldn't finish that under it
+        (line,) = in_thread(fake, CHANNEL_THREAD, "R1 ")
+        assert line.startswith("R1 (fix the typo) failed: "), line
+        assert not in_thread(fake, CHANNEL_THREAD, "Couldn't")
         assert not in_thread(fake, CHANNEL_THREAD, "On it")  # not announced: /run's reply is
