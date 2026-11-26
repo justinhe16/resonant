@@ -11,6 +11,7 @@ GitHub for Resonant: your open pull requests with CI and review state, any PR's 
 | `recent_prs {repo}` | tool | L0 | The newest 15 PRs in one repo (`owner/name`), any state, newest first, with created, merged and closed dates and a `latest merged #N` summary. `prs` lists only open PRs and `pr` needs a number, so "what are the latest PRs?" had no tool (BR-9). |
 | `rerun_failed {repo, number}` | tool | L3 | Re-runs the failed jobs of each workflow whose latest run on the PR's head failed. |
 | `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
+| `merge_pr_anyway {repo, number, head_sha}` | tool | L2, commit | `merge_pr` when a person said to merge it anyway: failing or running checks don't stop it, and the result's `warning` names them. Every other rule holds, and a *required* check (branch protection) still refuses it. |
 | `comment_pr {repo, number, body}` | tool | L3 | Posts `body` (at most 1000 characters, Resonant's cap on an arg) as a conversation comment on the PR; the number is checked to be a PR first. Acts, then reports; an approval prompt shows the whole body (PER-336). |
 | `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed`, `review_requested`, `pr_active`, `pr_merged` and `pr_closed` events. None of them texts on its own (GH-2): the hourly rollup reads them. |
 | `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. When all three counts are 0 it is reported `quiet` (BF-1), so the briefing leaves it out instead of saying `0 open PRs, 0 failing CI, 0 awaiting your review`. Needs the manifest's `report: {max_urgency: low}` grant. |
@@ -23,7 +24,7 @@ A **fine-grained personal access token**, read-only, limited to the repos you wa
 
 The two write tools need more, and **only** they do. Leave the token read-only if you don't want them: they then fail cleanly (`Couldn't merge PR #12 in owner/repo: the github token needs … access (see the github extension README). Nothing changed.`) and everything else keeps working. To enable them, edit the token and add:
 - `rerun_failed`: Actions **read and write**.
-- `merge_pr`: Contents **read and write** and Pull requests **read and write**.
+- `merge_pr`, `merge_pr_anyway`: Contents **read and write**, Pull requests **read and write**, Actions **read** (the check rollup reads workflow runs).
 - `comment_pr`: Pull requests **read and write**.
 
 Fine-grained tokens can't read check runs (the `ci` state then reads `none` or misses checks), and they only see the repos and orgs they were granted. For an org's repos, prefer the GitHub App below.

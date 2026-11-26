@@ -30,7 +30,9 @@ tools:
     secrets: [token]
     timeout_s: 60
   pr:
-    description: One pull request (any author, any repo the token sees) with its checks.
+    description: >-
+      One pull request (any author, any repo the token sees) with its checks; a failing check
+      carries its details link (a Vercel deployment, a CI job).
     run: python3 cli.py pr --repo {repo} --number {number}
     effect: read
     args: {repo: string, number: integer}
@@ -75,9 +77,25 @@ tools:
     approval_summary: "merge PR #{number} in {repo}{~head_sha}"  # OK to merge PR #121 in …?
     args: {repo: string, number: integer, head_sha: string}
     secrets: [token]
-    github_app:
+    github_app:                        # pr view's statusCheckRollup reads each check's workflow run
       repo: repo
-      permissions: {contents: write, pull_requests: write, checks: read, statuses: read}
+      permissions: {actions: read, contents: write, pull_requests: write, checks: read, statuses: read}
+    timeout_s: 120
+  merge_pr_anyway:
+    description: >-
+      Squash-merge a pull request even though some checks failed or are still running, only
+      when a person said to merge it anyway. Same head_sha rule; never bypasses branch
+      protection. The result's warning names the checks that weren't green.
+    run: python3 cli.py merge_pr --repo {repo} --number {number} --head-sha {head_sha} --ignore-checks
+    effect: write
+    level: L2
+    commit: true
+    approval_summary: "merge PR #{number} in {repo} despite checks that aren't green{~head_sha}"
+    args: {repo: string, number: integer, head_sha: string}
+    secrets: [token]
+    github_app:                        # the same reach as merge_pr
+      repo: repo
+      permissions: {actions: read, contents: write, pull_requests: write, checks: read, statuses: read}
     timeout_s: 120
   comment_pr:
     description: Post a comment on a pull request's conversation (any repo the token can write to).

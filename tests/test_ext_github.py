@@ -177,11 +177,11 @@ def test_manifest_passes_every_check() -> None:
     specs = {s.name: s for s in m.tool_specs() + m.job_specs()}
     assert set(specs) == {
         "prs", "pr", "recent_prs", "pr_diff", "pr_comments", "rerun_failed", "merge_pr",
-        "comment_pr", "job_watch", "job_digest",
+        "merge_pr_anyway", "comment_pr", "job_watch", "job_digest",
     }  # fmt: skip
     for s in specs.values():
         assert s.secrets == ("token",)
-        if s.name not in ("rerun_failed", "merge_pr", "comment_pr"):
+        if s.name not in ("rerun_failed", "merge_pr", "merge_pr_anyway", "comment_pr"):
             assert s.effect is Effect.READ and s.effective_level is Level.L0 and not s.commit
     # PER-336: comment_pr acts then reports, and shows the whole body when it asks.
     comment = specs["comment_pr"]
@@ -194,9 +194,19 @@ def test_manifest_passes_every_check() -> None:
         reach = app[name]
         assert reach is not None and reach.repo == "repo"
         assert set(reach.permissions.values()) == {"read"}
+    # merge_pr_anyway: the same reach and level as merge_pr, its own plain approval line.
+    anyway, strict = specs["merge_pr_anyway"], specs["merge_pr"]
+    assert anyway.effect is Effect.WRITE and anyway.effective_level is Level.L2 and anyway.commit
+    assert app["merge_pr_anyway"] == app["merge_pr"]
+    assert anyway.args_schema == strict.args_schema
+    assert "despite checks" in (anyway.approval_summary or "")
     assert app["merge_pr"] is not None and app["merge_pr"].permissions == {
-        "contents": "write", "pull_requests": "write", "checks": "read", "statuses": "read",
-    }  # fmt: skip
+        "actions": "read",
+        "contents": "write",
+        "pull_requests": "write",
+        "checks": "read",
+        "statuses": "read",
+    }  # fmt: skip  (actions: pr view's statusCheckRollup reads each check's workflow run)
     assert app["comment_pr"] is not None and app["comment_pr"].permissions == {
         "pull_requests": "write"
     }
@@ -333,6 +343,34 @@ def test_pr_shape(gh: FakeGh) -> None:
     ]
     argv = gh.calls()[0]["argv"]
     assert argv[:5] == ["pr", "view", "40", "--repo", RESONANT]
+
+
+def test_pr_failing_checks_carry_their_details_link(gh: FakeGh) -> None:
+    """A red Vercel status or check run links to where the failure is explained; green ones
+    and non-https links don't."""
+    vercel = "https://vercel.com/team/voyager-web/Dyxog"
+    gh.state["prs"] = {
+        f"{RESONANT}#41": view(
+            41,
+            checks=[
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "FAILURE",
+                    "targetUrl": vercel,
+                },
+                {**check("build", conclusion="FAILURE"), "detailsUrl": "http://insecure/job"},
+                {**check("test"), "detailsUrl": "https://github.com/x/y/actions/runs/1"},
+            ],
+        )
+    }
+    r = gh.run("pr", "--repo", RESONANT, "--number", "41")
+    assert r.code == 0, r.err
+    assert r.out["checks"] == [
+        {"name": "Vercel", "state": "failure", "url": vercel},
+        {"name": "build", "state": "failure"},
+        {"name": "test", "state": "success"},
+    ]
 
 
 def test_recent_prs_newest_first_any_state(gh: FakeGh) -> None:
@@ -875,6 +913,48 @@ def test_merge_pr_refuses_without_merging(
     r = merge(gh, sha=sha)
     assert r.code == 1 and r.stdout == "" and err in r.err, r.err
     assert mutating(gh) == []
+
+
+def test_merge_pr_anyway_merges_past_red_and_running_checks_with_a_warning(gh: FakeGh) -> None:
+    """A person said "merge it anyway": failing and running checks don't stop it, and the
+    result names them. The head binding and squash are the same; never --admin."""
+    vercel = {"__typename": "StatusContext", "context": "Vercel", "state": "FAILURE"}
+    running = check("e2e", conclusion=None, status="IN_PROGRESS")
+    gh.state["prs"] = {
+        f"{RESONANT}#40": view(checks=[check("test"), vercel, running], merge_state="UNSTABLE")
+    }
+    r = gh.run("merge_pr", "--repo", RESONANT, "--number", "40", "--head-sha", HEAD,
+               "--ignore-checks")  # fmt: skip
+    assert r.code == 0, r.err
+    (argv,) = mutating(gh)
+    assert argv == [
+        "pr", "merge", "40", "--repo", RESONANT, "--squash", "--match-head-commit", HEAD,
+    ]  # fmt: skip
+    assert r.out["warning"] == "merged with checks not green (failing: Vercel; still running: e2e)"
+
+
+@pytest.mark.parametrize(
+    ("pr", "err"),
+    [
+        (view(head="f" * 40), "has new commits since it was approved"),
+        (view(merge_state="BLOCKED"), "blocked by branch protection"),
+        (view(draft=True), "is a draft"),
+        (view(mergeable="CONFLICTING", merge_state="DIRTY"), "in conflict with its base"),
+    ],
+)
+def test_merge_pr_anyway_keeps_every_other_rule(gh: FakeGh, pr: dict[str, Any], err: str) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": pr}
+    r = gh.run("merge_pr", "--repo", RESONANT, "--number", "40", "--head-sha", HEAD,
+               "--ignore-checks")  # fmt: skip
+    assert r.code == 1 and err in r.err, r.err
+    assert mutating(gh) == []
+
+
+def test_merge_pr_green_has_no_warning(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    r = gh.run("merge_pr", "--repo", RESONANT, "--number", "40", "--head-sha", HEAD,
+               "--ignore-checks")  # fmt: skip
+    assert r.code == 0 and "warning" not in r.out, r.err
 
 
 @pytest.mark.parametrize("sha", ["", "abc", "zzzzzzz", "a1b2c3d e", "a" * 65])
