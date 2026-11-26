@@ -335,6 +335,34 @@ def test_pr_shape(gh: FakeGh) -> None:
     assert argv[:5] == ["pr", "view", "40", "--repo", RESONANT]
 
 
+def test_pr_failing_checks_carry_their_details_link(gh: FakeGh) -> None:
+    """A red Vercel status or check run links to where the failure is explained; green ones
+    and non-https links don't."""
+    vercel = "https://vercel.com/team/voyager-web/Dyxog"
+    gh.state["prs"] = {
+        f"{RESONANT}#41": view(
+            41,
+            checks=[
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "FAILURE",
+                    "targetUrl": vercel,
+                },
+                {**check("build", conclusion="FAILURE"), "detailsUrl": "http://insecure/job"},
+                {**check("test"), "detailsUrl": "https://github.com/x/y/actions/runs/1"},
+            ],
+        )
+    }
+    r = gh.run("pr", "--repo", RESONANT, "--number", "41")
+    assert r.code == 0, r.err
+    assert r.out["checks"] == [
+        {"name": "Vercel", "state": "failure", "url": vercel},
+        {"name": "build", "state": "failure"},
+        {"name": "test", "state": "success"},
+    ]
+
+
 def test_recent_prs_newest_first_any_state(gh: FakeGh) -> None:
     """BR-9: "most recent PRs?" needs merged PRs and no number (``pr`` guessed #1)."""
 

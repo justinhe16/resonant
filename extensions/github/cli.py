@@ -340,6 +340,13 @@ def login(v: Any) -> str:
     return _s(_d(v).get("login"))
 
 
+def _details_link(c: dict[str, Any]) -> str | None:
+    """A failing check's details link (``targetUrl`` of a status, ``detailsUrl`` of a check
+    run): https only, clipped, so a reader can go straight to why it failed."""
+    url = _s(c.get("targetUrl") or c.get("detailsUrl"))
+    return clip(url, 300) if url.startswith("https://") else None
+
+
 def checks_of(contexts: list[Any]) -> tuple[str, list[str], list[dict[str, str]]]:
     """``(ci, failing names, checks)`` from rollup contexts (GraphQL or ``gh pr view``)."""
     checks: list[dict[str, str]] = []
@@ -355,7 +362,10 @@ def checks_of(contexts: list[Any]) -> tuple[str, list[str], list[dict[str, str]]
             waiting = status != "COMPLETED"
             state = conclusion or status
             red = not waiting and conclusion in _RED
-        checks.append({"name": clip(name, 60), "state": state.lower()})
+        entry = {"name": clip(name, 60), "state": state.lower()}
+        if red and (link := _details_link(c)):
+            entry["url"] = link  # where the failure is explained (a Vercel deployment, a job log)
+        checks.append(entry)
         pending = pending or waiting
         if red:
             failing.append(clip(name, 60))

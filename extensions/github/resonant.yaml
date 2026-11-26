@@ -30,7 +30,9 @@ tools:
     secrets: [token]
     timeout_s: 60
   pr:
-    description: One pull request (any author, any repo the token sees) with its checks.
+    description: >-
+      One pull request (any author, any repo the token sees) with its checks; a failing check
+      carries its details link (a Vercel deployment, a CI job).
     run: python3 cli.py pr --repo {repo} --number {number}
     effect: read
     args: {repo: string, number: integer}
