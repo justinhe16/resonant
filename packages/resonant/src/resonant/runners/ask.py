@@ -1195,6 +1195,10 @@ class AskRunner:
                               "limit", until)  # fmt: skip
         if (refused := self._capped()) is not None:
             return refused
+        if follow_up is not None and (not tools or self.tools is None
+                                      or not self.cfg.resonant_tools):  # fmt: skip
+            # PER-346: a follow-up with no tools couldn't do what it was asked: say so
+            return AskRefused("Resonant's tools are off for ask_claude.", "off")
         cp: dict[str, Any] = {"question": question, "kind": kind, "attachments": checked}
         if requested_by is not None:
             cp["requested_by"] = requested_by
@@ -1849,8 +1853,9 @@ class AskRunner:
         before = source.origin_event_id if source is not None else None
         # PER-294: the conversation this turn is in: the asking task's thread, else its
         # principal's own (the owner's, with no threads: exactly as before).
-        # PER-346: with no asking task (a watch's follow-up), the turn's own thread.
-        convo = _Convo.of(source if source is not None else task, self.owner)
+        # PER-346: a watch's follow-up has no asking task: the turn's own thread.
+        follow = source is None and cp.get(FOLLOW_UP_KEY) is not None
+        convo = _Convo.of(task if follow else source, self.owner)
         owner = convo.principal
 
         def argv(session_id: str, resume: bool) -> list[str]:

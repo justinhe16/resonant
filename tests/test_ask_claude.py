@@ -997,8 +997,13 @@ def test_a_watch_follow_up_is_marked_with_its_key(db: sqlite3.Connection, tmp_pa
     """PER-346: a fired watch's follow-up ask carries the notice key, so a retry finds it;
     an ordinary ask carries none."""
     h = make(db, tmp_path)
+    off = h.runner.enqueue("Watch W1 (x) fired.", principal="justin", tools=True,
+                           follow_up="watch/1/1")  # fmt: skip
+    assert isinstance(off, AskRefused) and "tools are off" in off.text  # no tools: no follow-up
+    h.runner.tools = cast(Any, object())
     plain = h.runner.enqueue("hello?", principal="justin")
-    marked = h.runner.enqueue("Watch W1 (x) fired.", principal="justin", follow_up="watch/1/1")
+    marked = h.runner.enqueue("Watch W1 (x) fired.", principal="justin", tools=True,
+                              follow_up="watch/1/1")  # fmt: skip
     assert isinstance(plain, Queued) and isinstance(marked, Queued)
     assert FOLLOW_UP_KEY not in h.task(plain.task_id).checkpoint
     assert h.task(marked.task_id).checkpoint[FOLLOW_UP_KEY] == "watch/1/1"

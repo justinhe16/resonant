@@ -269,7 +269,8 @@ class WatchRunner:
                 store.follow_up_prompt(w, detail),
                 kind="general",
                 principal=w.principal,
-                channel_ref=w.channel_ref,
+                # only the principal's own thread (as for notices), else their conversation
+                channel_ref=w.channel_ref if store.origin_thread(w) is not None else None,
                 tools=True,
                 tainted=True,  # the check's result is outside data
                 taint_hops=0,

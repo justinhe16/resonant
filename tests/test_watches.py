@@ -1003,3 +1003,16 @@ def test_migration_037_keeps_old_watches_and_their_ids(tmp_path: Any) -> None:
                        interval_s=3600, now=NOW, expires_at=NOW, question="q?",
                        then="follow_up", follow_up="do it")  # fmt: skip
     assert new.id == 3 and new.then == "follow_up" and new.follow_up == "do it"
+
+
+async def test_a_follow_up_never_uses_someone_elses_thread(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    asks = FollowUps(db)
+    w = runner(components, db, settings, Recorder(), clock, asks=asks)
+    other = {**THREAD_REF, "principal": "someone"}
+    await create_in(components, db, {**PR_WATCH, "follow_up": "merge it"}, other)
+    await call(components, "add_note", {"text": "green"})
+    await run_due(db, w, clock)
+    (q,) = asks.calls
+    assert q["channel_ref"] is None and q["principal"] == "justin"
