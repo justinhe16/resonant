@@ -42,7 +42,8 @@ in dry run (which comes first). The slash-only control commands (``/kill``, ``/r
 ``/approvals``, ``/ext``) aren't tools the model can call, so a rule can't touch them.
 PER-335: on an instance with ``gate.tainted_writes: allow`` the gate also asks
 ``tainted_allows`` for an owner's or approver's tainted L2/L3 write: the same scope and
-``ask`` rules decide, so an ``ask`` rule (or a ``stands`` hook) still makes it ask.
+``ask`` rules decide, so an ``ask`` rule (or a ``stands`` hook) still makes it ask. PER-348:
+it asks the same for an owner's or approver's untainted (``inferred``) L2 write there.
 A rule is made only by the owner's own ``yes always`` reply or ``/rules allow`` (or an
 approved ``allow_trust_rule``), never by extension output.
 """

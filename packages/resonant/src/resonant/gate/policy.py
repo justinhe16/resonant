@@ -36,12 +36,19 @@ default) changes nothing. With ``allow``, a ``tainted`` call is weighed as ``inf
 when all of these hold: autonomy on; the owner's or an approver's call (never a member's or
 the workspace default's); a registered L2 or L3 ``write`` (never L1, pay or a read), still L2
 or L3 after ``levels``; an extension's tool, or a builtin in ``TAINT_LIFTABLE_BUILTINS`` (the
-run tools; never ``OWNER_TOOLS``, jobs, watches, repos or CI); and
+run tools and ``cancel_watch``; never ``OWNER_TOOLS``, jobs, ``create_watch``, repos or CI); and
 ``Standing.tainted_allows`` (the call can be scoped, its tool's ``stands`` hook passes:
 ``merge_run`` only for a ``merge_standable`` run; and no ``ask`` trust rule decides it). It
 runs unattended (``Allow.unattended``) and the ``gate.evaluate`` row carries
 ``tainted_allowed: true`` when it ran. Its prompt, when it still asks (capped, rejected
-before), offers no ``yes always``.
+before), offers no ``yes always``. PER-348: with ``allow``, an ``inferred`` call that meets
+the same conditions and is still L2 (after ``levels`` and standing allows) runs the same way,
+so a fresh ask never asks where a tainted one runs (approvers have no standing allows), and
+staff L2 writes on such an instance never ask or offer ``yes always``; ``create_watch`` too
+(``STAFF_LIFTABLE_BUILTINS``). Its row carries ``staff_allowed: true``, and ``owner_asked:
+"lifted"`` for an owner's direct ask (the lift comes first: no ``owner_asked`` approval, no
+one-change-per-message limit; ``MAX_SIDE_EFFECTS`` still caps it). An untainted L3 already
+runs and is not marked; ``explicit`` and ``scheduled`` calls are never lifted.
 
 Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (missing or
 garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
@@ -158,16 +165,31 @@ BATCH_SUMMARY_CHARS = 200  # a batch as one line (``pending_for``: /approvals, r
 
 Rule = Literal["allow", "ask", "ask_code"]
 # PER-335: whether a tainted L2/L3 write asks (the default) or runs as an untainted L3 would.
+# PER-348: ``allow`` also runs the same writes when untainted (``inferred``) at L2.
 TaintedWrites = Literal["ask", "allow"]
 # PER-335: the only builtins ``tainted_writes: allow`` may lift (an allowlist, so a new builtin
 # asks until it is named here): the run tools, whose work is bounded by the run and reported in
-# its thread. Never what outlives the turn untainted (``add_job``, ``create_watch``: a stored
-# prompt later fires as ``scheduled``), what bypasses a run's flagged paths (``add_ci``,
-# ``merge_ci_pr``), the repo set the trust scopes name, restarts, or deletions of the owner's
-# notes and reminders. A pinned test lists every builtin L2/L3 write.
+# its thread, and (PER-348) ``cancel_watch``, which only stops one. Never what outlives the
+# turn untainted (the job tools and ``create_watch``: a stored prompt later fires as
+# ``scheduled``, and an ``ask`` watch's question runs as an untainted research ask), what
+# bypasses a run's flagged paths (``add_ci``, ``merge_ci_pr``), the repo set the trust scopes
+# name, restarts, or deletions of the owner's notes and reminders. A pinned test lists every
+# builtin L2/L3 write.
 TAINT_LIFTABLE_BUILTINS: frozenset[str] = frozenset(
-    {"start_run", "cancel_run", "continue_run", "merge_run", "answer_worker", "message_worker"}
+    {
+        "start_run",
+        "cancel_run",
+        "continue_run",
+        "merge_run",
+        "answer_worker",
+        "message_worker",
+        "cancel_watch",
+    }
 )
+# PER-348: the builtins an untainted (``inferred``) staff call may be lifted for: those, plus
+# ``create_watch``. Untainted, its prompt or question is what the owner or approver asked for,
+# as a ``yes`` would have let it run; tainted, outside text could plant it, so it asks.
+STAFF_LIFTABLE_BUILTINS: frozenset[str] = TAINT_LIFTABLE_BUILTINS | {"create_watch"}
 
 # A code-built heading for a tool's approval summary (e.g. "delete all 4 notes"). It must
 # never come from a model; ``summarize`` cleans it anyway.
@@ -317,8 +339,10 @@ class PolicyGate:
                 intent, now, autonomy, capped=capped, lifted=lifted
             )
             # PER-335: only when the setting made the call run, so the default's rows are as before
+            # (PER-348: ``staff_allowed`` for an untainted call it lifted)
             ran = bool(lifted) and isinstance(decision, Allow)
-            extra: dict[str, Any] = {"tainted_allowed": True} if ran else {}
+            key = "tainted_allowed" if intent.origin == "tainted" else "staff_allowed"
+            extra: dict[str, Any] = {key: True} if ran else {}
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -363,7 +387,7 @@ class PolicyGate:
             intent, now, autonomy, capped=capped, lifted=lifted
         )
         if asked is None and intent.asked is not None:
-            asked = "not reached"
+            asked = "lifted" if lifted else "not reached"  # PER-348: ran as a lifted call
         return decision, standing, asked
 
     def _decide_inner(
@@ -399,7 +423,7 @@ class PolicyGate:
                 level = Level.L3
         origin: Origin = intent.origin
         if self._tainted_lifted(intent, level, autonomy):
-            # PER-335: weighed as an untainted L3 (L3 runs, L2 runs as L3); unattended below
+            # PER-335/348: weighed as an untainted L3 (L3 runs, L2 runs as L3); unattended below
             origin, level = "inferred", Level.L3
             if lifted is not None:
                 lifted.append(True)
@@ -534,17 +558,25 @@ class PolicyGate:
         return row is not None
 
     def _tainted_lifted(self, intent: Intent, level: Level, autonomy: bool) -> bool:
-        """PER-335: ``tainted_writes: allow`` lifts this call (see the module doc). Every
-        condition is checked here, so ``ask`` (the default) never reaches the hook."""
-        if self.tainted_writes != "allow" or intent.origin != "tainted" or not autonomy:
+        """PER-335: ``tainted_writes: allow`` lifts this call (see the module doc): a tainted
+        one, or (PER-348) an ``inferred`` one still at L2 here, so the setting never runs a
+        fresh ask less freely than a tainted one. Every condition is checked here, so ``ask``
+        (the default) never reaches the hook."""
+        if self.tainted_writes != "allow" or not autonomy:
             return False
+        if intent.origin == "inferred":
+            if level is not Level.L2:
+                return False  # an untainted L3 already runs; a standing allow already lifted
+        elif intent.origin != "tainted":
+            return False  # explicit needs no lift; scheduled (a stored prompt) never gets one
         if intent.effect is not Effect.WRITE:
             return False  # never pay (always L1 anyway), never a read
         if intent.level not in (Level.L2, Level.L3) or level not in (Level.L2, Level.L3):
             return False  # never L1, whatever a hook says
-        if intent.extension is None and (
-            intent.tool in OWNER_TOOLS or intent.tool not in TAINT_LIFTABLE_BUILTINS
-        ):
+        liftable = (
+            TAINT_LIFTABLE_BUILTINS if intent.origin == "tainted" else STAFF_LIFTABLE_BUILTINS
+        )
+        if intent.extension is None and (intent.tool in OWNER_TOOLS or intent.tool not in liftable):
             return False  # admin, shell, trust, and any builtin not named stay asking
         if not self._staff(intent.principal):
             return False  # a member's (or the workspace default's) tainted call still asks
