@@ -22,6 +22,7 @@ from test_e2e_claude_session import CLAUDE, World, start
 
 from resonant.e2e import wait_until
 from resonant.gateway.imessage.fixtures import FakeChatDB
+from resonant.runners.ask import AskRefused, AskRunner
 from resonant.store import trust as trust_store
 from resonant.store.claude_brain import GRANTS_KV, recent_tools
 from resonant.store.db import atomic, kv_get, utcnow
@@ -201,6 +202,70 @@ async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
         assert decisions == ["asked", "granted"]
         assert kv_get(w.conn, GRANTS_KV) == {}  # spent
         assert len(w.audits("brain.shell_approved")) == 1
+
+
+async def test_in_a_thread_the_approved_turn_answers_in_that_thread(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    # PER-349: the approved turn keeps the asking thread (and its conversation): its answer
+    # lands there, never in the owner's DM
+    repo, remote = scratch_repo(tmp_path)
+    git(repo, "checkout", "-q", "main")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "three")
+    push = f"cd {repo} && git push -q origin main"
+    thread = "C0TEAM:1700000000.000100"
+    async with start(resonant_home, chat, tmp_path, slack=True) as w:
+        fake = w.slack
+        assert fake is not None
+        w.model.triage = CLAUDE
+        w.claude(
+            turns=[{"when": "Bash, from", "shell": [{"tool": "Bash", "command": push}],
+                    "answer": "Pushed main: {r0}"}],  # the approved turn (fmt: skip)
+            shell=[{"tool": "Bash", "command": push}],
+            answer="{r0}",
+        )  # fmt: skip
+        assert fake.inject("U1", "push main", thread=thread)
+        await wait_until(lambda: any("Reply yes" in m.text for m in fake.sent), 20)
+        await prompt_recorded(w)
+        assert fake.inject("U1", "yes", thread=thread)
+        await wait_until(lambda: any(m.text.startswith("Pushed main") for m in fake.sent), 20)
+        await w.settled()
+        assert remote_head(remote, "main") == git(repo, "rev-parse", "main")
+        (answer,) = [m for m in fake.sent if m.text.startswith("Pushed main")]
+        assert answer.thread == thread
+        approved = [r for r in w.ask_tasks() if json.loads(r["checkpoint"]).get("approved")]
+        assert len(approved) == 1 and approved[0]["conversation"] == thread
+        assert json.loads(approved[0]["channel_ref"])["thread"] == thread
+        assert f"Thread: {thread}" in w.session()["prompt"]  # the thread's own conversation
+        assert len(w.audits("brain.shell_approved")) == 1
+
+
+async def test_in_a_thread_an_approved_turn_that_cant_run_says_so_in_that_thread(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PER-349: APPROVED_NOT_RUN goes to the thread the approval was asked in
+    push = "cd /nowhere && git push -q origin main"
+    thread = "C0TEAM:1700000000.000200"
+    async with start(resonant_home, chat, tmp_path, slack=True) as w:
+        fake = w.slack
+        assert fake is not None
+        real = AskRunner.enqueue
+
+        def refuse_approved(self: AskRunner, question: str, **kw: Any) -> Any:
+            if kw.get("approved"):
+                return AskRefused("Claude is busy", "busy")
+            return real(self, question, **kw)
+
+        monkeypatch.setattr(AskRunner, "enqueue", refuse_approved)
+        w.model.triage = CLAUDE
+        w.claude(shell=[{"tool": "Bash", "command": push}], answer="{r0}")
+        assert fake.inject("U1", "push main", thread=thread)
+        await wait_until(lambda: any("Reply yes" in m.text for m in fake.sent), 20)
+        await prompt_recorded(w)
+        assert fake.inject("U1", "yes", thread=thread)
+        await wait_until(lambda: any(m.text.startswith("Approved, but") for m in fake.sent), 20)
+        (notice,) = [m for m in fake.sent if m.text.startswith("Approved, but")]
+        assert notice.thread == thread and notice.principal == "justin"
 
 
 async def test_no_means_it_never_runs(

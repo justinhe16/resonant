@@ -325,6 +325,10 @@ class SlackConfig(_Section):
     # refused: a room is the one destination that isn't a principal.
     rooms: dict[str, str] = Field(default_factory=dict[str, str])
     follow_idle_days: int = Field(default=14, ge=1, le=365)  # a tagged thread is followed so long
+    # PER-349: where a send with no thread goes (no thread given, or one no longer followed).
+    # ``dm`` (default): the principal's DM. ``room:<rooms key>``: that room, tagging the
+    # principal (``<@U…>``); a conversation that started in a DM still answers in the DM.
+    unthreaded: str = "dm"
     inbound_per_minute: int = Field(default=30, ge=1)  # per principal; excess is dropped
     max_body_chars: int = Field(default=4000, ge=1)  # longer messages are dropped, never answered
     # Where run codes link (``<link_base>#/runs/R12``): the dashboard's URL. None: plain text.
@@ -365,6 +369,20 @@ class SlackConfig(_Section):
                 )
         return v
 
+    @field_validator("unthreaded")
+    @classmethod
+    def _unthreaded(cls, v: str) -> str:
+        if v != "dm" and not (v.startswith("room:") and _ROOM_KEY.match(v[5:])):
+            raise ValueError(
+                "channels.slack.unthreaded must be dm or room:<channels.slack.rooms key>"
+            )
+        return v
+
+    @property
+    def unthreaded_room(self) -> str | None:
+        """The ``rooms`` key a send with no thread goes to (PER-349); None: the DM."""
+        return self.unthreaded[5:] if self.unthreaded.startswith("room:") else None
+
     @field_validator("link_base")
     @classmethod
     def _link(cls, v: str | None) -> str | None:
@@ -376,6 +394,10 @@ class SlackConfig(_Section):
     def _complete(self) -> Self:
         if self.enabled and (self.team_id is None or self.bot_user_id is None):
             raise ValueError("channels.slack.enabled needs team_id and bot_user_id")
+        if (key := self.unthreaded_room) is not None and key not in self.rooms:
+            raise ValueError(
+                f"channels.slack.unthreaded: {key!r} is not a channels.slack.rooms key"
+            )
         return self
 
 

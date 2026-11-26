@@ -147,6 +147,7 @@ from resonant.gateway.channel import (
     Channel,
     ChannelError,
     ChannelRefused,
+    MessageRef,
     shared_thread,
     thread_of,
 )
@@ -1302,9 +1303,10 @@ class AskRunner:
             return AskRefused(RUNAWAY_REFUSED.format(cap=hourly), "runaway")
         return None
 
-    def _notice(self, text: str, key: str) -> None:
+    def _notice(self, text: str, key: str, *, thread: MessageRef | None = None) -> None:
         """Tell the owner once (the channel's dedupe key, and once per process here), in
-        the background: ``enqueue`` is called from a tool, which must not wait on a send."""
+        the background: ``enqueue`` is called from a tool, which must not wait on a send.
+        ``thread``: the owner's thread it is about (PER-349), else unthreaded."""
         if key in self._noticed:
             return
         self._noticed.add(key)
@@ -1315,7 +1317,7 @@ class AskRunner:
 
         async def send() -> None:
             try:
-                await self.channel.send(self.owner, text, dedupe_key=key)
+                await self.channel.send(self.owner, text, thread=thread, dedupe_key=key)
             except ChannelError as e:
                 log.warning("ask: notice not sent (%s)", type(e).__name__)
                 self._noticed.discard(key)
@@ -2567,8 +2569,10 @@ class AskRunner:
         if task.id in seen:
             return
         lines = [approved_line(n, p.args) for n, p in enumerate(ran, 1)]
+        asker = cp.get("requested_by")  # PER-349: the same thread and conversation
         queued = self.enqueue("\n".join(lines), principal=principal, tools=True, approved=True,
-                              trace_id=task.trace_id)  # fmt: skip
+                              requested_by=asker if isinstance(asker, str) else None,
+                              channel_ref=task.channel_ref, trace_id=task.trace_id)  # fmt: skip
         with atomic(self.conn):  # the grants are for that turn alone
             kv_set(self.conn, FOLLOWUPS_KV, [*seen, task.id][-FOLLOWUPS_KEEP:])
             if isinstance(queued, Queued):
@@ -2577,7 +2581,8 @@ class AskRunner:
             audit(self.conn, "brain.shell_approved", task_id=task.id, trace_id=task.trace_id,
                   changes=len(ran), queued=isinstance(queued, Queued))  # fmt: skip
         if isinstance(queued, AskRefused):
-            self._notice(APPROVED_NOT_RUN.format(why=queued.text), f"ask:approved:{task.id}")
+            self._notice(APPROVED_NOT_RUN.format(why=queued.text), f"ask:approved:{task.id}",
+                         thread=thread_of(task, to=self.owner))  # fmt: skip
 
     # -- continuations (PER-321) --
 

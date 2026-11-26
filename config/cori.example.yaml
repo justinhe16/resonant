@@ -37,6 +37,10 @@ channels:
     bot_user_id: U00000000              # Cori's bot user (auth.test must answer both)
     rooms: {}                           # post_room keys -> channel ids, e.g. {digest: C0123, pulse: C0456}
     follow_idle_days: 14                # a tagged thread is followed until idle this long
+    # PER-349: where a send with no thread goes (no thread, or one no longer followed): dm (the
+    # default: the principal's DM) or room:<rooms key> (that room, tagging the principal; a
+    # conversation that started in a DM still answers in the DM). Cori: no unprompted DMs.
+    # unthreaded: room:pulse            # needs pulse in rooms above
     # link_base: https://resonant-relay-jhe.fly.dev   # run codes link to <link_base>#/runs/R12
 
 # PER-299: channel watchers ("@cori whenever someone posts a bug in #support, triage it").

@@ -381,6 +381,91 @@ async def test_send_in_a_followed_thread_or_else_a_dm(w: World) -> None:
     assert w.web.method_calls("conversations.open") == [{"users": BRIAN}]  # cached
 
 
+def test_unthreaded_defaults_to_dm_and_needs_a_configured_room() -> None:
+    # PER-349: channels.slack.unthreaded: dm (default, unchanged) | room:<rooms key>
+    assert config().unthreaded == "dm" and config().unthreaded_room is None
+    assert config(unthreaded="room:pulse").unthreaded_room == "pulse"
+    with pytest.raises(ValidationError, match=r"not a channels\.slack\.rooms key"):
+        config(unthreaded="room:general")
+    for bad in ("room", "room:", "channel:pulse", "room:Pulse", "DM"):
+        with pytest.raises(ValidationError, match="dm or room"):
+            config(unthreaded=bad)
+
+
+@pytest.fixture
+async def roomy(db: sqlite3.Connection) -> AsyncIterator[World]:
+    world = make(db, unthreaded="room:pulse")
+    await world.slack.start(submitter(world))
+    yield world
+    await world.slack.stop()
+
+
+async def test_unthreaded_room_takes_sends_with_no_thread_tagging_the_principal(
+    roomy: World, db: sqlite3.Connection
+) -> None:
+    w = roomy
+    ref = await w.slack.send("justin", "btw: the deploy finished")
+    post = w.web.posts[-1]
+    assert (post.channel, post.thread_ts) == ("C0PULSE", None)
+    assert post.text == f"<@{JUSTIN}> btw: the deploy finished"
+    assert ref == MessageRef("slack", f"C0PULSE:{post.ts}", None)
+    # a thread Cori doesn't follow (or another channel's ref) also goes to the room
+    stray = MessageRef("slack", "C0RANDOM:1.000001", "C0RANDOM:1.000001")
+    await w.slack.send("brian", "hello", thread=stray)
+    await w.slack.send("brian", "again", thread=MessageRef("imessage", "x", None))
+    assert [(p.channel, p.thread_ts, p.text) for p in w.web.posts[-2:]] == [
+        ("C0PULSE", None, f"<@{BRIAN}> hello"),
+        ("C0PULSE", None, f"<@{BRIAN}> again"),
+    ]
+    assert w.web.method_calls("conversations.open") == []  # never a DM
+    rooms = [
+        r[0]
+        for r in db.execute(
+            "SELECT json_extract(detail, '$.room') FROM audit_log WHERE action = 'slack.sent'"
+        )
+    ]
+    assert rooms == ["pulse"] * 3
+
+
+async def test_unthreaded_room_keeps_followed_threads_and_dm_conversations(roomy: World) -> None:
+    w = roomy
+    await w.socket.deliver(mention(BRIAN, f"<@{BOT}> hi", ts="1700000000.000100"))
+    thread = MessageRef("slack", "C0GENERAL:1700000000.000100", "C0GENERAL:1700000000.000100")
+    await w.slack.send("brian", "On it", thread=thread)
+    post = w.web.posts[-1]
+    assert (post.channel, post.thread_ts, post.text) == ("C0GENERAL", "1700000000.000100", "On it")
+    # a conversation that started in a DM answers in the DM: its thread while followed...
+    await w.socket.deliver(
+        message(JUSTIN, "status?", channel="D1JUSTIN", channel_type="im", ts="1700000000.000200")
+    )
+    dm = MessageRef("slack", "D1JUSTIN:1700000000.000200", "D1JUSTIN:1700000000.000200")
+    await w.slack.send("justin", "All green", thread=dm)
+    post = w.web.posts[-1]
+    assert (post.channel, post.thread_ts) == ("D1JUSTIN", "1700000000.000200")
+    assert post.text == "All green"
+    # ...and the DM itself once it is no longer followed (never the room)
+    old = MessageRef("slack", "D1JUSTIN:1600000000.000100", "D1JUSTIN:1600000000.000100")
+    await w.slack.send("justin", "Later", thread=old)
+    post = w.web.posts[-1]
+    assert (post.channel, post.thread_ts, post.text) == ("D1JUSTIN", None, "Later")
+
+
+async def test_unthreaded_room_takes_approval_prompts_with_no_thread(
+    db: sqlite3.Connection,
+) -> None:
+    gate = team_gate(db)
+    w = make(db, gate=gate, unthreaded="room:pulse")
+    await w.slack.start(submitter(w))
+    try:
+        await ask(w, gate, ADD)  # no thread: each approver's copy, in the room, tagged
+        prompts = [p for p in w.web.posts if p.buttons]
+        assert {p.channel for p in prompts} == {"C0PULSE"} and len(prompts) == 2
+        assert {p.text.split(" ", 1)[0] for p in prompts} == {f"<@{JUSTIN}>", f"<@{BRIAN}>"}
+        assert w.web.method_calls("conversations.open") == []
+    finally:
+        await w.slack.stop()
+
+
 async def test_send_refuses_unknown_principals_and_those_without_slack(w: World) -> None:
     with pytest.raises(ChannelRefused):
         await w.slack.send("nobody", "x")
