@@ -521,6 +521,7 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "anything with no repo\n"
         "/runs [R3]: Claude runs, active first; a code shows one\n"
         "/cancel <R3>: stop a run and discard its work\n"
+        "/continue <R3>: pick up a run the time or disk limit stopped, from its kept work\n"
         "/merge <R3>: squash-merge a finished run's PR (CI must be green)\n"
         "/repos: the repos Claude runs work in\n"
         "/repo add|forget|new|ci: add <x> [as <name>]; forget <x>; new <name> [public]; "

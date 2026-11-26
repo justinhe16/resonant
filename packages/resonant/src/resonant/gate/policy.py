@@ -166,7 +166,7 @@ TaintedWrites = Literal["ask", "allow"]
 # ``merge_ci_pr``), the repo set the trust scopes name, restarts, or deletions of the owner's
 # notes and reminders. A pinned test lists every builtin L2/L3 write.
 TAINT_LIFTABLE_BUILTINS: frozenset[str] = frozenset(
-    {"start_run", "cancel_run", "merge_run", "answer_worker", "message_worker"}
+    {"start_run", "cancel_run", "continue_run", "merge_run", "answer_worker", "message_worker"}
 )
 
 # A code-built heading for a tool's approval summary (e.g. "delete all 4 notes"). It must

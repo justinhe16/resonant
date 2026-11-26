@@ -38,7 +38,7 @@ _COLUMNS = frozenset(
         "wait_seconds", "waiting_since", "cost_usd", "tokens_in", "tokens_out", "exit_code",
         "pr_number", "pr_url", "files_changed", "flagged_paths", "summary", "failure",
         "started_at", "ended_at", "workspace", "checkout", "wait_reason", "last_note",
-        "resume_prompt", "remote_url",
+        "resume_prompt", "remote_url", "max_seconds",
     }
 )  # fmt: skip
 
@@ -322,6 +322,22 @@ def finish(
             wait_reason=None,
             **fields,
         )
+
+
+def reopen(conn: sqlite3.Connection, code: str, *, max_seconds: int, resume_prompt: str) -> bool:
+    """PER-344: a failed run goes back to ``queued`` at step ``session``, to resume its Claude
+    session in the same worktree (``ClaudeRunner.continue_run``; the caller then gives it a
+    new task). Its failure and end are cleared, ``max_seconds`` is its new time budget (the
+    time used plus a fresh one) and ``resume_prompt`` the first turn's prompt (resent after a
+    crash, like any turn's). The code, session id, branch and counters stay. False when the
+    run isn't ``failed``: a second continue, or a run that ended otherwise, never reopens it."""
+    sql = (
+        "UPDATE runs SET status = 'queued', step = 'session', failure = NULL, ended_at = NULL,"
+        " exit_code = NULL, pgid = NULL, leader_pid = NULL, leader_started_at = NULL,"
+        " wait_reason = NULL, waiting_since = NULL, max_seconds = ?, resume_prompt = ?,"
+        " updated_at = ? WHERE code = ? AND status = 'failed'"
+    )
+    return conn.execute(sql, (max_seconds, resume_prompt, now_iso(), code)).rowcount == 1
 
 
 def cancel(conn: sqlite3.Connection, code: str, reason: str) -> bool:

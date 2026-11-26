@@ -1,7 +1,7 @@
-"""Claude runner tools: ``start_run`` (L3), ``list_runs`` (L0), ``cancel_run`` (L3) and
-``merge_run`` (L2). The slash commands ``/run [<repo>] <ask> [--merge]``, ``/runs``,
-``/cancel`` and ``/merge`` and the ``run_project`` intent reach the same tools (the repo tools
-are ``tools/repos.py``).
+"""Claude runner tools: ``start_run`` (L3), ``list_runs`` (L0), ``cancel_run`` (L3),
+``continue_run`` (L3) and ``merge_run`` (L2). The slash commands ``/run [<repo>] <ask>
+[--merge]``, ``/runs``, ``/cancel``, ``/continue`` and ``/merge`` and the ``run_project`` intent
+reach the same tools (the repo tools are ``tools/repos.py``).
 
 They are global builtins, so the gate lets only principals who can request global tools (the
 owner) call them. The handlers call ``ClaudeRunner`` (``components.runners["claude"]``, found
@@ -29,6 +29,12 @@ at call time: the runner is built after the tools are registered) and return cod
   recent (several active: "Which run? R4 dori, R6 trading."). ``/runs R4`` carries the same
   ``activity`` on ``list_runs``. No model is involved.
 - ``cancel_run{code}``: L3.
+- ``continue_run{code}``: L3 (PER-344). A failed run that a limit stopped (the time limit, the
+  per-run disk cap, the disk nearly full) and whose work is still on disk resumes its Claude
+  session in the same worktree with a fresh budget (``ClaudeRunner.continue_run``); anything
+  else is a refusal (``continued: false`` and the reason as ``text``). The owner and approvers
+  only: a global builtin with no member grant, and the handler checks the asker again. Chosen
+  by the brain, the run says ``Continuing R5 (…)`` in its thread itself (``announced``).
 - ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
   the trust rules (``merge_level``, docs/employee-plan.md D4): it runs without asking when
   ``merge_decision`` is ok and the run flagged no sensitive paths, else it asks a plain yes.
@@ -68,7 +74,14 @@ from resonant.trust import merge_decision
 from resonant_sdk import Effect, Level, ToolSpec
 
 if TYPE_CHECKING:
-    from resonant.runners.claude import Cancelled, Merged, MergeQueued, Refused, Started
+    from resonant.runners.claude import (
+        Cancelled,
+        Continued,
+        Merged,
+        MergeQueued,
+        Refused,
+        Started,
+    )
     from resonant.runners.worker_desk import OpenQuestion, Relayed
     from resonant.store.runs import Run
 
@@ -117,6 +130,8 @@ class RunnerApi(Protocol):
     def get_run(self, code: str) -> Run | None: ...
 
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
+
+    async def continue_run(self, code: str, *, announce: bool = False) -> Continued | Refused: ...
 
     async def merge_run(
         self, code: str, *, unattended: bool = False
@@ -222,6 +237,25 @@ CANCEL_RUN = ToolSpec(
     timeout_s=30.0,
     approval_summary="cancel {code}",
 )
+CONTINUE_RUN = ToolSpec(
+    name="continue_run",
+    description=(
+        "Continue a failed Claude run that hit the time limit or the disk limit, from the work "
+        "it kept: the same worker session and branch, with a fresh time budget; it finishes "
+        "the original ask (commit, push, PR). For 'continue R12', 'pick R12 back up'. Refuses "
+        "a run that failed for another reason or whose work was cleaned up."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {"code": _code_schema()},
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L3,
+    timeout_s=30.0,
+    approval_summary="continue {code}",
+)
 MERGE_RUN = ToolSpec(
     name="merge_run",
     description=(
@@ -281,6 +315,7 @@ MESSAGE_WORKER = ToolSpec(
 
 SPECS: tuple[ToolSpec, ...] = (
     START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN, ANSWER_WORKER, MESSAGE_WORKER, RUN_ACTIVITY,
+    CONTINUE_RUN,
 )  # fmt: skip
 
 
@@ -580,6 +615,31 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"cancelled": False, "code": code, "text": reason}
         return {"cancelled": True, "code": code, "text": cast("Cancelled", result).text}
 
+    async def _continue_run(
+        args: dict[str, Any], call: CallContext | None = None
+    ) -> dict[str, Any]:
+        code = _need_code("continue_run", args)
+        # PER-344: the owner and approvers only (the gate denies members every global
+        # builtin; this says it again in words, whatever path reached the tool)
+        task = task_store.get_task(ctx.conn, call.task_id) if call is not None else None
+        asker = None if task is None else task.principal
+        owner = ctx.principals.owner
+        if asker is not None and asker != owner and not ctx.principals.is_approver(asker):
+            text = "Only the owner or an approver can continue a run."
+            return {"continued": False, "code": code, "text": text}
+        claude = runner()
+        if claude is None:
+            return {"continued": False, "code": code, "text": missing()}
+        announce = call is not None and call.origin != "explicit"  # as start_run's (PER-319)
+        result = await claude.continue_run(code, announce=announce)
+        if (reason := _refusal(result)) is not None:
+            return {"continued": False, "code": code, "text": reason}
+        out: dict[str, Any] = {"continued": True, "code": code,
+                               "text": cast("Continued", result).text}  # fmt: skip
+        if announce:  # the run posts its own ``Continuing R5 …``: the reply must not repeat it
+            out["announced"] = True
+        return out
+
     async def _merge_run(args: dict[str, Any], ctx: CallContext | None = None) -> dict[str, Any]:
         code = _need_code("merge_run", args)
         claude = runner()
@@ -657,6 +717,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         LIST_RUNS.name: _list_runs,
         RUN_ACTIVITY.name: _run_activity,
         CANCEL_RUN.name: _cancel_run,
+        CONTINUE_RUN.name: cast(ToolHandler, _WithContext(_continue_run)),
         MERGE_RUN.name: cast(ToolHandler, _WithContext(_merge_run)),
     }
 

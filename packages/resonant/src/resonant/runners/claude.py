@@ -37,7 +37,10 @@ time limit, the disk limit, the turn or dollar limit and a Claude error fail the
 dir and worktree ("work kept"); what the session already pushed stays on GitHub. ``/cancel`` and
 ``/kill`` end the whole process tree, revoke the token and delete the run dir and the worktree
 (or scratch dir); a merge deletes them too, and the daily job ``runner.keep_days`` after the run
-ended. The owner's checkout is never deleted.
+ended. The owner's checkout is never deleted. PER-344: a run the time limit, the disk cap or a
+nearly full disk stopped can be continued (``continue_run``) while its work is kept: the same
+run goes back to ``queued`` under a new task and resumes its session (``--resume``) in its
+worktree with a fresh budget and a prompt that says what stopped it.
 
 Worker CLI (EM-3, ``worker_cli``/``worker_desk``). A session reaches the daemon with
 ``resonant ask|note|check`` over its run's socket, open only while a session runs. A turn that
@@ -60,9 +63,10 @@ the run (``runs.remote_url``) and texted once per run; an error or no answer wit
 
 Public API for the tools and slash commands: :meth:`ClaudeRunner.start_run`,
 :meth:`~ClaudeRunner.list_runs`, :meth:`~ClaudeRunner.cancel_run`,
-:meth:`~ClaudeRunner.merge_run`. Their results are plain dataclasses; every reply text is built
-here, from code, never from model output: Claude's closing summary is cleaned, redacted,
-clipped, and only shown after a code-built ``R3:`` prefix.
+:meth:`~ClaudeRunner.continue_run`, :meth:`~ClaudeRunner.merge_run`. Their results are
+plain dataclasses; every reply text is built here, from code, never from model output:
+Claude's closing summary is cleaned, redacted, clipped, and only shown after a code-built
+``R3:`` prefix.
 """
 
 from __future__ import annotations
@@ -311,6 +315,30 @@ LOCK_POLL_S = 0.25
 # a push run's session left commits it couldn't push: the run fails with this reason, and
 # the reply leads with it (PER-271: not "made no changes")
 COULDNT_PUSH = "couldn't push: "
+# PER-344: how a limit's failure reason starts (code-built, the head of ``runs.failure``): a run
+# stopped by one keeps its work and can be continued (``continue_run``). The cache cap and the
+# turn and dollar limits aren't among them: a fresh session would hit the same wall.
+TIMED_OUT = "timed out at "
+DISK_CAP = "used over "
+DISK_CAP_TAIL = " folder cap"
+LOW_DISK = "the disk is nearly full"
+Limit = Literal["time", "disk", "low_disk"]
+LIMIT_WORDS: dict[Limit, str] = {
+    "time": "the time limit",
+    "disk": "the per-run disk cap",
+    "low_disk": "the disk running nearly full",
+}
+CONTINUE_HEAD = "Resonant stopped your last session"
+CONTINUE_PROMPT = (
+    CONTINUE_HEAD + ": it hit {why}. Your work is kept as you left it, in this directory, and "
+    "you have a fresh time and disk budget.{tidy} Finish the task you were given, the way your "
+    "instructions say (for a repo you can push: commit, push, open the pull request and check "
+    "its CI). If it is already done, make sure that is so, then give the closing summary."
+)
+CONTINUE_TIDY = (
+    " First delete build outputs, caches and downloads you don't need, so the disk isn't the "
+    "wall again."
+)
 # PER-341: a milestone as the voice's update outcome (``brain.voice.update_facts``)
 MILESTONE_OUTCOME: dict[milestones.Kind, UpdateOutcome] = {
     "pr_opened": "opened_pr",
@@ -492,6 +520,54 @@ class Refused:
 
     reason: str
     gap: SetupGap | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class Continued:
+    """PER-344: a run stopped by a limit, queued again on its kept work."""
+
+    code: str
+    repo: str
+    why: str  # the limit in words (``LIMIT_WORDS``)
+    max_minutes: int  # the fresh time budget
+
+    @property
+    def text(self) -> str:
+        where = self.repo or "no repo (scratch dir)"
+        return (
+            f"Continuing {self.code} · {where}: it was stopped by {self.why}; picking up its "
+            f"kept work. Up to {self.max_minutes}m more. /runs to check, /cancel {self.code} "
+            "to stop."
+        )
+
+
+def limit_of(failure: str | None) -> Limit | None:
+    """PER-344: the limit that ended a failed run, from its code-built failure reason, or None
+    (it failed for another reason, which ``continue_run`` refuses)."""
+    if not failure:
+        return None
+    if failure.startswith(TIMED_OUT):
+        return "time"
+    if failure.startswith(DISK_CAP) and DISK_CAP_TAIL in failure:
+        return "disk"
+    if failure.startswith(LOW_DISK):
+        return "low_disk"
+    return None
+
+
+def continuations(checkpoint: Mapping[str, Any]) -> int:
+    """PER-344: how many times the run of this task checkpoint was continued (0: never)."""
+    n = checkpoint.get("continued")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0
+
+
+def end_ref(conn: sqlite3.Connection, run: Run) -> str:
+    """``run:<code>:<status>``: an end text's dedupe key, and its voice and history ref.
+    PER-344: a continued run's adds its continuation (``:c1``), so the outcome of the
+    continuation isn't taken for the one before it."""
+    task = task_store.get_task(conn, run.task_id) if run.task_id else None
+    n = 0 if task is None else continuations(task.checkpoint)
+    return f"run:{run.code}:{run.status}" + (f":c{n}" if n else "")
 
 
 SLACK_DONE = "I'll post here when it's done."
@@ -1878,6 +1954,105 @@ class ClaudeRunner:
             await self._finish_cancelled(run.code)
         return Cancelled(run.code)
 
+    async def continue_run(self, code: str, *, announce: bool = False) -> Continued | Refused:
+        """PER-344: pick up a run that a limit stopped (the time limit, the per-run disk cap or
+        the disk running nearly full), from its kept work: the same run code, Claude session
+        (``--resume``), worktree and branch, with a fresh time budget (the time used plus
+        ``max_minutes``) and disk budget (``_disk_cap``), and a first prompt that says what
+        stopped it and to finish the task (``CONTINUE_PROMPT``, in ``resume_prompt`` like any
+        turn's). The run goes back to ``queued`` under a new task (checkpoint ``continued``:
+        how many times; the original task's ``merge``, ``local`` and ``job`` carry over), and
+        its end is texted when it ends.
+
+        Refuses, with a sentence, when the runner isn't set up or Resonant is paused; the run
+        doesn't exist, is still going or still wrapping up; it ended any other way than
+        failed, or failed for another reason (``limit_of``); its worktree or run dir is gone
+        (cleaned up after ``runner.keep_days``); or the disk is still under the free-space
+        floor. Who may continue a run is the caller's (the gate: an L3 global builtin, the
+        owner and approvers only). ``announce``: the run says ``Continuing R5 (…)`` in its
+        thread itself (the brain continued it, not ``/continue``)."""
+        if (text := await self.setup_missing()) is not None:
+            return Refused(text)
+        if self._paused():
+            return Refused("Resonant is paused. /resume first.")
+        run = runs.get(self.conn, code)
+        if run is None:
+            return Refused(f"No run {code}.")
+        if run.active:
+            return Refused(f"{run.code} is still going ({run.status}); nothing to continue.")
+        if run.status == "cancelled":
+            return Refused(f"{run.code} was cancelled and its work discarded. /run to start over.")
+        if run.status != "failed":
+            ended = run.status.replace("_", " ")
+            return Refused(f"{run.code} ended {ended}, not on a limit: nothing to continue.")
+        limit = limit_of(run.failure)
+        if limit is None:
+            return Refused(
+                f"{run.code} failed for another reason, not the time or disk limit, so it "
+                "can't be continued. /run to start it again."
+            )
+        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
+        if task is not None and task.status in ("queued", "running", "waiting"):
+            return Refused(f"{run.code} is still wrapping up; try again in a moment.")
+        if not await asyncio.to_thread(self._work_kept, run):
+            return Refused(
+                f"{run.code}'s work is gone (its worktree was cleaned up), so it can't be "
+                "continued. /run to start it again."
+            )
+        free = await asyncio.to_thread(self._disk_free, self.cfg.work_dir)
+        if free is not None and free < self.min_free_bytes:
+            return Refused(
+                f"The disk is still nearly full ({_size(free)} free, under the "
+                f"{_size(self.min_free_bytes)} floor). Free some space, then continue {run.code}."
+            )
+        old = {} if task is None else task.checkpoint
+        n = continuations(old) + 1
+        why = LIMIT_WORDS[limit]
+        prompt = CONTINUE_PROMPT.format(why=why, tidy=CONTINUE_TIDY if limit != "time" else "")
+        budget = int(run.session_seconds) + self.max_session_s
+        with atomic(self.conn):
+            if not runs.reopen(self.conn, run.code, max_seconds=budget, resume_prompt=prompt):
+                return Refused(f"{run.code} isn't failed any more; nothing to continue.")
+        spec = NewTask(
+            kind=TASK_KIND,
+            runner=RUNNER_NAME,
+            priority=PRIORITY_OWNER,
+            principal=run.principal,
+            channel_ref=None if task is None else task.channel_ref,  # the run's thread
+            checkpoint={
+                "run": run.code,
+                "title": f"continue {run.code} · {run.repo or 'no repo'}",
+                **{k: old[k] for k in ("merge", "local", "job", "origin") if k in old},
+                "continued": n,
+                "limit_words": why,
+                **({"announce": True} if announce else {}),
+            },
+        )
+        try:
+            task_id = self._create_task(spec)
+        except Exception:  # as it was: failed on its limit, still continuable
+            runs.finish(self.conn, run.code, "failed", failure=run.failure, step="reply",
+                        max_seconds=run.max_seconds, resume_prompt=run.resume_prompt)  # fmt: skip
+            raise
+        runs.update(self.conn, run.code, task_id=task_id)
+        self.reports.set_report(run.code, "now")  # asked for by name: its end is texted
+        with atomic(self.conn):
+            audit(self.conn, "run.continued", run=run.code, task_id=task_id, limit=limit,
+                  continued=n)  # fmt: skip
+        return Continued(run.code, run.repo, why, max(1, self.max_session_s // 60))
+
+    def _work_kept(self, run: Run) -> bool:
+        """PER-344: the run's worktree (or scratch dir) and run dir are still on disk, with
+        what a session needs to resume (a repo run's branch and base)."""
+        if not run.scratch and not (run.branch and run.base_branch and run.base_sha):
+            return False
+        workspace = run.workspace
+        if workspace is None and run.scratch:
+            workspace = str(self.workspace.scratch_path(run.code))
+        if workspace is None:
+            return False
+        return Path(workspace).is_dir() and (self.cfg.work_dir / run.code).is_dir()
+
     def _stop_watch(self, run: Run) -> bool:
         """``/cancel`` on a ready run that is waiting to merge itself: the watch ends (its
         task is cancelled), the PR stays. False when nothing was watching."""
@@ -1980,6 +2155,8 @@ class ClaudeRunner:
                 "by": "owner",
                 "since": self.clock().isoformat(),
                 **({"unattended": True} if unattended else {}),
+                # PER-344: the run's continuations stay with it (``end_ref``)
+                **({"continued": n} if task and (n := continuations(task.checkpoint)) else {}),
             },
         )
         task_id = self._create_task(spec)
@@ -2336,10 +2513,18 @@ class ClaudeRunner:
         A run with no thread (iMessage) stays as quiet as before."""
         if run_thread(self.conn, run) is None:
             return
-        text = status.start_line(run.code, run.ask)
-        if self._brain_words():  # PER-341
-            facts = update_facts(run, "started", audience=self._audience(run))
-            text = await self._worded(facts, text, ref=f"run:{run.code}:{status.STARTED}")
+        n = continuations(task.checkpoint)
+        why = task.checkpoint.get("limit_words")
+        if n and isinstance(why, str):  # PER-344: ``Continuing R5 (…): it was stopped by …``
+            text = status.continue_line(run.code, run.ask, why)
+            if self._brain_words():
+                facts = update_facts(run, "continued", failure=why, audience=self._audience(run))
+                text = await self._worded(facts, text, ref=f"run:{run.code}:continued:{n}")
+        else:
+            text = status.start_line(run.code, run.ask)
+            if self._brain_words():  # PER-341
+                facts = update_facts(run, "started", audience=self._audience(run))
+                text = await self._worded(facts, text, ref=f"run:{run.code}:{status.STARTED}")
         try:
             await self._send_run(run, text, dedupe_key=status.status_key(task.id, status.STARTED))
         except ChannelError as e:
@@ -2449,6 +2634,11 @@ class ClaudeRunner:
                     return await self._fail(run, "usage limit didn't reset within 24h", w.redactor)
             if run.step == "prepare":
                 run = await self._prepare(w, run)
+            elif run.status == "queued" and run.step == "session":
+                # PER-344: a continued run, prepared long ago: it goes on from its session
+                runs.update(self.conn, run.code, status="running")
+                run = self._must_get(run.code)
+                self._pulse_open(run)
             p = self._prepared(run)
             while run.step == "session":  # one -p turn each; answers and messages resume it
                 outcome = await self._session(w, run, p)
@@ -2846,6 +3036,8 @@ class ClaudeRunner:
             return head + (f"\n\n{saved}" if saved else "")
         if fresh is not None:
             return f"{saved}\n\nCarry on with the task."
+        if saved and saved.startswith(CONTINUE_HEAD):  # PER-344: a continued run's first turn
+            return saved
         if run.scratch:
             prompt = SCRATCH_RESUME_PROMPT
         else:
@@ -2943,22 +3135,32 @@ class ClaudeRunner:
         if stop == "timeout":
             return await self._timed_out(run, w)
         if stop in ("disk", "cache"):
-            why, which = self._disk_text(stop, *disk_hit)
+            why, which = self._disk_text(stop, *disk_hit, cap=self._disk_cap(w.task))
             text = f"{why} ({which}; work kept: /runs {run.code})"
             return await self._fail(run, text, w.redactor)
         if result is not None and (hit := usage_limit(result)) is not None:
             return self._wait_for_limit(w, run, hit)
         return await self._after_exit(w, run, proc.returncode, result, ended=state.ended)
 
-    def _disk_text(self, stop: str, limit: DiskLimit, value: int) -> tuple[str, str]:
-        """Why the disk watchdog stopped a run, and which limit it hit."""
+    def _disk_text(
+        self, stop: str, limit: DiskLimit, value: int, cap: int | None = None
+    ) -> tuple[str, str]:
+        """Why the disk watchdog stopped a run, and which limit it hit. ``cap``: the run's
+        folder cap (``_disk_cap``), else the configured one."""
         if limit == "free":
             floor = _size(self.min_free_bytes)
-            return "the disk is nearly full", f"{_size(value)} free, under the {floor} floor"
+            return LOW_DISK, f"{_size(value)} free, under the {floor} floor"
         if stop == "cache":
             return f"the runner cache grew over {_size(self.cache_limit_bytes)}", "the cache cap"
-        mib = f"{round(self.disk_limit_bytes / 1024**2, 1):g} MiB"
-        return f"used over {_size(self.disk_limit_bytes)} of disk", f"{mib} folder cap"
+        cap = cap or self.disk_limit_bytes
+        mib = f"{round(cap / 1024**2, 1):g} MiB"
+        return f"{DISK_CAP}{_size(cap)} of disk", f"{mib}{DISK_CAP_TAIL}"
+
+    def _disk_cap(self, task: Task) -> int:
+        """PER-344: the run's folder cap. Each continuation adds one more ``max_run_dir_mb``:
+        the folder already holds what the stopped session wrote, and the new one gets a fresh
+        cap's worth on top."""
+        return self.disk_limit_bytes * (1 + continuations(task.checkpoint))
 
     async def _supervise(
         self,
@@ -3070,9 +3272,10 @@ class ClaudeRunner:
 
         runs.update(self.conn, run.code, remote_url=None)  # an earlier session's URL is gone
         pumps = [asyncio.create_task(c) for c in (feed(), pump_out(), pump_err())]
-        disk = watch(p.run_dir, "run folder", self.disk_limit_bytes, "disk")
+        cap = self._disk_cap(w.task)  # PER-344: a continued run's is larger
+        disk = watch(p.run_dir, "run folder", cap, "disk")
         # The worktree or scratch dir, on the same cap.
-        work_disk = watch(p.workspace, "worktree", self.disk_limit_bytes, "disk")
+        work_disk = watch(p.workspace, "worktree", cap, "disk")
         cache = watch(self.cfg.cache_dir, "runner cache", self.cache_limit_bytes, "cache")
         exited = asyncio.create_task(proc.wait())
         began = time.monotonic()
@@ -3333,7 +3536,7 @@ class ClaudeRunner:
     async def _timed_out(self, run: Run, w: _Work) -> StepOutcome:
         return await self._fail(
             run,
-            f"timed out at {fmt_duration(run.max_seconds)} (work kept: /runs {run.code})",
+            f"{TIMED_OUT}{fmt_duration(run.max_seconds)} (work kept: /runs {run.code})",
             w.redactor,
         )
 
@@ -3971,7 +4174,7 @@ class ClaudeRunner:
                                   audience=self._audience(run),
                                   plain=self._brain_words())  # fmt: skip
             if facts is not None:
-                voiced = await self.voice.write(facts, text, ref=f"run:{run.code}:{run.status}")
+                voiced = await self.voice.write(facts, text, ref=end_ref(self.conn, run))
                 if voiced.used:
                     text = voiced.text
         try:
@@ -3997,7 +4200,7 @@ class ClaudeRunner:
             said = end_text(bare[0], [*warn, *setup, *([note] if note else []), *bare[1]])
             if voiced is not None and voiced.used:
                 said = record_text(text)  # PER-273: what the owner read
-            ref = f"run:{run.code}:{run.status}"
+            ref = end_ref(self.conn, run)
             system_texts.record(self.conn, run.requester, "run", said, ref=ref,
                                 task_id=run.task_id, outside=True)  # fmt: skip
         return voiced is not None and voiced.used
@@ -4006,7 +4209,7 @@ class ClaudeRunner:
         """The end text: to the run's thread (else the principal), or, for a registered
         job's run with a room output (PER-298), to that room; a room that refuses falls back
         to the principal. Raises ``ChannelRefused`` when nobody took it."""
-        key = f"run:{run.code}:{run.status}"
+        key = end_ref(self.conn, run)
         link = jobs_store.run_link(self.conn, run.code)
         poster: Any = getattr(self.channel, "post_room", None)
         if link is not None and link.room is not None and poster is not None:

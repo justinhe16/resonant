@@ -62,6 +62,7 @@ Outcome = Literal[
     "pr_stalled",
     "pr_waiting_merge",
     "started",
+    "continued",
     "ci_failed",
     "changes_requested",
     "deployed",
@@ -69,8 +70,8 @@ Outcome = Literal[
 OUTCOMES: tuple[str, ...] = (
     "opened_pr", "upstream_pr", "merged", "merged_onto_base", "no_changes", "finished",
     "local_branch", "couldnt_push", "failed", "running", "stalled", "waiting_merge", "queued",
-    "pr_merged", "review_requested", "pr_stalled", "pr_waiting_merge", "started", "ci_failed",
-    "changes_requested", "deployed",
+    "pr_merged", "review_requested", "pr_stalled", "pr_waiting_merge", "started", "continued",
+    "ci_failed", "changes_requested", "deployed",
 )  # fmt: skip
 
 # The code-built section headers: a voiced text has none of them (the guard's format rule).
@@ -112,6 +113,7 @@ OUTCOME_VERBS: dict[Outcome, frozenset[str]] = {
     "pr_stalled": frozenset(),
     "pr_waiting_merge": frozenset(),
     "started": frozenset(),
+    "continued": frozenset(),
     "ci_failed": _FAILED,
     "changes_requested": frozenset(),
     "deployed": frozenset({"deployed"}),
@@ -119,7 +121,7 @@ OUTCOME_VERBS: dict[Outcome, frozenset[str]] = {
 # Resonant's run tools: a reply that is the text of a call to one is never sent.
 CALL_TOOLS = (
     "start_run", "list_runs", "run_activity", "cancel_run", "merge_run", "answer_worker",
-    "message_worker",
+    "message_worker", "continue_run",
 )  # fmt: skip
 ASK_MAX = 300
 TITLE_MAX = 160
@@ -468,10 +470,11 @@ KIND_LINES: dict[TextKind, str] = {
     "update": (
         "This is a progress update on one run that is still going, in its work thread: say "
         "what just happened in one short sentence, present tense is fine. The outcome says "
-        "which step: started (the run is starting on its ask now), opened_pr (it opened the "
-        "PR), ci_failed (CI failed on its PR and it is fixing it), changes_requested (the "
-        "review asked for changes and it is working on them), merged (it merged its PR), "
-        "deployed (it deployed to env)."
+        "which step: started (the run is starting on its ask now), continued (a limit stopped "
+        "it, the failure says which, and it is picking up its kept work now), opened_pr (it "
+        "opened the PR), ci_failed (CI failed on its PR and it is fixing it), "
+        "changes_requested (the review asked for changes and it is working on them), merged "
+        "(it merged its PR), deployed (it deployed to env)."
     ),
 }
 
@@ -871,8 +874,8 @@ def merged_facts(
     return Facts("outcome", (item,), tail=tuple(tail), audience=audience, plain=plain)
 
 
-UpdateOutcome = Literal["started", "opened_pr", "ci_failed", "changes_requested", "merged",
-                        "deployed"]  # fmt: skip
+UpdateOutcome = Literal["started", "continued", "opened_pr", "ci_failed", "changes_requested",
+                        "merged", "deployed"]  # fmt: skip
 
 
 def update_facts(
@@ -882,11 +885,14 @@ def update_facts(
     pr: int | None = None,
     pr_url: str | None = None,
     env: str | None = None,
+    failure: str | None = None,
     audience: Audience = "owner",
 ) -> Facts:
     """PER-341: the facts of one progress update of a running run (``runner.update_voice:
     brain``): its start or one milestone (``runners/milestones.py``). The run's code, repo
-    and ask, and the milestone's PR and target, all code-built; nothing to add after it."""
+    and ask, and the milestone's PR and target, all code-built; nothing to add after it.
+    PER-344: a continuation (``continued``) carries the limit that stopped it as
+    ``failure``."""
     item = Item(
         ref=run.code,
         outcome=outcome,
@@ -895,6 +901,7 @@ def update_facts(
         pr=pr,
         pr_url=pr_url,
         env=env,
+        failure=failure,
     )
     return Facts("update", (item,), audience=audience, plain=True)
 

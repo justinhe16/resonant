@@ -339,7 +339,7 @@ def runs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
 
 
 def run_code_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
-    """``/cancel <code>`` and ``/merge <code>``."""
+    """``/cancel <code>``, ``/continue <code>`` and ``/merge <code>``."""
     return {"code": _run_code(rest)}
 
 
@@ -634,6 +634,16 @@ COMMANDS: tuple[Command, ...] = (
         "stop a run and discard its work",
         "run_project",
         tool="cancel_run",
+        parse=run_code_args,
+        owner_only=True,
+        staff=True,
+    ),
+    Command(
+        "/continue",
+        "/continue <R3>",
+        "pick up a run the time or disk limit stopped, from its kept work",
+        "run_project",
+        tool="continue_run",
         parse=run_code_args,
         owner_only=True,
         staff=True,
