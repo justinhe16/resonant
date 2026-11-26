@@ -337,6 +337,7 @@ def test_cori_example_sets_her_scope(resonant_home: Path) -> None:
     home = Path.home()
     assert s.runner.instructions_file == home / "resonant/config/cori/worker-rules.md"
     assert s.brain.instructions_file == home / "resonant/config/cori/brain-rules.md"
+    assert s.brain.reply_guard == "lenient"  # PER-340
     assert s.runner.claude_config_dir == home / "cori/claude"
     assert s.runner.session_env["FLY_API_TOKEN"] == "dori/fly_staging_token"
     assert len(s.runner.session_env) == 8

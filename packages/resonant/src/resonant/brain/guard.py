@@ -16,6 +16,12 @@ redo still fails a short code-built fallback goes out instead (``FALLBACKS``).
 - **Tool-call text.** A reply that is the text of a tool call (``merge_run(code="R1")``) is
   never sent.
 
+``brain.reply_guard`` (PER-340, ``ReplyGuard``): ``strict`` (the default) is the above.
+``lenient`` keeps the checks and the one redo, but a reply still flagged after it (or flagged
+in a turn that ran a change or waits on the owner, which is never redone) goes out as Claude
+wrote it, with the flag on the span (``sends_anyway``): a team thread reads a canned line as
+confusion. Tool-call text is never sent in either mode.
+
 Spans carry kinds and counts only, never the text.
 """
 
@@ -278,6 +284,7 @@ def is_call_text(reply: str, tools: Collection[str]) -> bool:
 # --- the checks ------------------------------------------------------------------------------
 
 Kind = Literal["numbers", "claim", "allow", "call"]
+ReplyGuard = Literal["strict", "lenient"]
 
 
 @dataclass(frozen=True)
@@ -345,6 +352,13 @@ def fallback(problem: Problem, *, changed: bool) -> str:
     return FALLBACKS[problem.kind]
 
 
+def sends_anyway(problem: Problem, mode: str) -> bool:
+    """PER-340: whether a reply flagged with ``problem`` goes out as Claude wrote it instead of
+    the fallback: only with ``brain.reply_guard: lenient`` (anything else is ``strict``), and
+    never for tool-call text."""
+    return mode == "lenient" and problem.kind != "call"
+
+
 def check(
     reply: str,
     *,
@@ -394,6 +408,7 @@ __all__ = [
     "NUMBER_FALLBACK",
     "NUMBER_REDO",
     "Problem",
+    "ReplyGuard",
     "asks_change",
     "asks_standing_allow",
     "calendar_text",
@@ -405,6 +420,7 @@ __all__ = [
     "is_call_text",
     "numbers_in",
     "redo",
+    "sends_anyway",
     "unsourced",
     "unsupported_numbers",
 ]

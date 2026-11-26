@@ -637,6 +637,7 @@ def build_stack(
         tools=tool_access(components, brain, settings),  # BR-10: the brain's asks
         session=settings.brain.claude_session,  # BR-11: the Claude brain
         taint_hops=settings.brain.taint_hops,
+        reply_guard=settings.brain.reply_guard,  # PER-340
         # PER-291: the instance's Claude config dir and the brain's instructions file
         claude_config_dir=settings.runner.claude_config_dir,
         instructions_file=settings.brain.instructions_file,

@@ -384,6 +384,101 @@ async def test_a_literal_tool_call_reply_is_never_sent(
         assert w.executions("merge_run") == []
 
 
+# --- PER-340: brain.reply_guard: lenient (a team instance) -----------------------------------
+
+LENIENT: dict[str, Any] = {"reply_guard": "lenient"}
+
+
+def guard_spans(w: World) -> list[dict[str, Any]]:
+    rows = w.rows("SELECT attrs FROM spans WHERE name = 'runner.ask.guard' ORDER BY rowid")
+    return [json.loads(r["attrs"]) for r in rows]
+
+
+async def test_lenient_sends_a_claim_flagged_twice_as_claude_wrote_it(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, asks_kw=LENIENT) as w:
+        texts = await ask_claude(w, "close PER-301", answer="PER-301 has been closed.")
+        assert texts == ["PER-301 has been closed."]  # never a canned line
+        assert len(w.session()["messages"]) == 2  # the one redo, as in strict
+        attrs = guard_spans(w)
+        assert [(a["kind"], a["redone"], a["fallback"]) for a in attrs] == [
+            ("claim", False, False),
+            ("claim", True, False),
+        ]
+        assert "sent_flagged" not in attrs[0] and attrs[1]["sent_flagged"] is True
+
+
+async def test_lenient_sends_unsourced_numbers_after_the_redo(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, asks_kw=LENIENT) as w:
+        texts = await ask_claude(
+            w, "how much did i spend last week", answer="You spent $1,247 last week."
+        )
+        assert texts == ["You spent $1,247 last week."]
+        sent = w.session()["messages"]
+        assert len(sent) == 2 and REDO in sent[1].splitlines()[-1] and "1247" in sent[1]
+        assert guard_spans(w)[-1]["sent_flagged"] is True
+        assert all("1247" not in json.dumps(a) for a in guard_spans(w))  # counts, never text
+
+
+async def test_lenient_sends_the_reply_and_its_report_after_a_change(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, asks_kw=LENIENT) as w:
+        texts = await ask_claude(
+            w,
+            "add a note: buy oat milk",
+            calls=[{"name": "add_note", "args": {"text": "buy oat milk"}}],
+            answer="Saved. You now have 4817 notes.",
+        )
+        assert len(w.session()["messages"]) == 1  # still never redone
+        assert texts == ['Saved. You now have 4817 notes.\nSaved note 1: "buy oat milk"']
+        assert len(w.executions("add_note")) == 1
+        (attrs,) = guard_spans(w)
+        assert attrs["kind"] == "numbers" and attrs["sent_flagged"] is True
+
+
+async def test_lenient_keeps_the_prompt_after_a_flagged_reply_that_waits_on_the_owner(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, asks_kw=LENIENT) as w:
+        w.model.triage = CLAUDE
+        w.claude(
+            calls=[{"name": "allow_tools", "args": {"tools": ["create_watch"]}}],
+            answer="Asked you. That saves you 4817 prompts a week.",
+        )
+        answer, prompt = await w.say("don't ask me before creating watches", replies=2)
+        assert answer == "Asked you. That saves you 4817 prompts a week."
+        assert "create_watch" in prompt and len(w.session()["messages"]) == 1
+        assert w.executions("allow_tools") == []
+
+
+async def test_lenient_still_never_sends_tool_call_text(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, asks_kw=LENIENT) as w:
+        texts = await ask_claude(w, "merge R1", answer='merge_run(code="R1")')
+        assert texts == [guard.CALL_FALLBACK]
+        assert w.executions("merge_run") == []
+        attrs = guard_spans(w)
+        assert attrs[-1]["fallback"] is True and "sent_flagged" not in attrs[-1]
+
+
+async def test_lenient_sends_a_bare_got_it_rather_than_the_fallback(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, asks_kw=LENIENT) as w:
+        texts = await ask_claude(
+            w,
+            "don't ask me before creating watches",
+            answer="Got it, no more permission prompts.",
+        )
+        assert texts == ["Got it, no more permission prompts."]
+        assert w.rows("SELECT 1 FROM trust_rules") == []  # still nothing saved
+
+
 async def test_dont_ask_me_calls_allow_tools_and_says_it_waits_on_the_yes(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
