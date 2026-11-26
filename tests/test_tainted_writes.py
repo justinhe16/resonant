@@ -2,7 +2,9 @@
 turn read outside content asks at L2 and L3. ``allow`` (a self-sufficient team instance) runs
 the owner's and an approver's tainted L2/L3 writes as an untainted L3 would; L1 and pay still
 ask with the code, an ``ask`` trust rule still asks, a member's call is unchanged, the kill
-switch still asks for everything, and ``merge_run`` runs only for a ``merge_standable`` run."""
+switch still asks for everything, and ``merge_run`` runs only for a ``merge_standable`` run.
+PER-348: ``allow`` also runs the same writes untainted (``inferred``, still L2), audited
+``staff_allowed``, and lifts the watch tools."""
 
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ from resonant.store.db import kv_set
 from resonant.tools import ToolRegistry
 from resonant.tools import runs as runs_tools
 from resonant.tools import trust as trust_tools
+from resonant.tools import watches as watch_tools
 from resonant.tools.builtin import BUILTIN_MODULES
 from resonant.trust.tools import StandingAllows
 from resonant_sdk import Effect, Level, ToolSpec
@@ -57,7 +60,7 @@ def principals() -> Principals:
             "principals": {
                 OWNER: {"role": "owner"},
                 APPROVER: {"role": "approver"},
-                MEMBER: {"grants": {"ops": {"request": ["file_ticket"]}}},
+                MEMBER: {"grants": {"ops": {"request": ["file_ticket", "sync"]}}},
                 OUTSIDER: {"grants": {"elsewhere": ["request"]}},
             }
         }
@@ -70,7 +73,7 @@ def make_gate(
 ) -> PolicyGate:  # fmt: skip
     kv_set(db, "autonomy", "on")
     reg = ToolRegistry()
-    for spec in (*trust_tools.SPECS, *runs_tools.SPECS, *EXT_SPECS):
+    for spec in (*trust_tools.SPECS, *runs_tools.SPECS, *watch_tools.SPECS, *EXT_SPECS):
         reg.register(spec)
     return PolicyGate(
         db,
@@ -197,11 +200,126 @@ def test_without_the_rules_view_it_asks(db: sqlite3.Connection) -> None:
     assert asks(evaluate(db, gate, STAGING))
 
 
-def test_an_untainted_call_is_unchanged(db: sqlite3.Connection, gate: PolicyGate) -> None:
-    assert asks(evaluate(db, gate, SYNC, origin="inferred")) is False  # it offers yes always
-    assert isinstance(evaluate(db, gate, SYNC, origin="inferred"), NeedsApproval)
+def test_a_scheduled_call_is_unchanged(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """A job's stored prompt (``scheduled``) is never lifted, tainted or not."""
     assert isinstance(evaluate(db, gate, SYNC, origin="scheduled"), NeedsApproval)
-    assert all("tainted_allowed" not in r["detail"] for r in evaluated(db))
+    assert isinstance(evaluate(db, gate, SYNC, origin="scheduled", principal=APPROVER),
+                      NeedsApproval)  # fmt: skip
+    rows = evaluated(db)
+    assert all("tainted_allowed" not in r["detail"] for r in rows)
+    assert all("staff_allowed" not in r["detail"] for r in rows)
+
+
+# --- untainted staff writes (PER-348) --------------------------------------------------------
+
+MERGE_PR = ToolSpec(name="merge_pr", effect=Effect.WRITE, level=Level.L2, source="ext:github",
+                    extension="github")  # fmt: skip
+SAVE_ISSUE = ToolSpec(name="save_issue", effect=Effect.WRITE, level=Level.L2,
+                      source="ext:linear", extension="linear")  # fmt: skip
+
+
+def _staff_gate(db: sqlite3.Connection, tainted_writes: Any = "allow") -> PolicyGate:
+    gate = make_gate(db, tainted_writes=tainted_writes)
+    gate.registry.register(MERGE_PR)
+    gate.registry.register(SAVE_ISSUE)
+    return gate
+
+
+def staff_allowed(db: sqlite3.Connection) -> list[bool | None]:
+    return [r["detail"].get("staff_allowed") for r in evaluated(db)]
+
+
+@pytest.mark.parametrize("principal", [OWNER, APPROVER])
+def test_allow_runs_an_untainted_staff_l2_write(db: sqlite3.Connection, principal: str) -> None:
+    """Brian's fresh "merge #159" and "move DORI-1 to In Review" run with no prompt."""
+    gate = _staff_gate(db)
+    merge = evaluate(db, gate, MERGE_PR, {"repo": "jhe/dori", "number": 159},
+                     origin="inferred", principal=principal)  # fmt: skip
+    assert isinstance(merge, Allow) and merge.unattended and merge.approval_id is None
+    save = evaluate(db, gate, SAVE_ISSUE, {"id": "DORI-1", "state": "In Review"},
+                    origin="inferred", principal=principal)  # fmt: skip
+    assert isinstance(save, Allow) and save.unattended
+    rows = evaluated(db)
+    assert [(r["decision"], r["detail"]["origin"], r["level"]) for r in rows] == [
+        ("Allow", "inferred", "L2")
+    ] * 2
+    assert staff_allowed(db) == [True, True]
+    assert all("tainted_allowed" not in r["detail"] for r in rows)
+
+
+def test_ask_keeps_an_untainted_staff_l2_write_asking(db: sqlite3.Connection) -> None:
+    """The default: the owner's fresh L2 asks and offers yes always, the audit row as before."""
+    gate = _staff_gate(db, tainted_writes="ask")
+    d = evaluate(db, gate, MERGE_PR, {"repo": "jhe/dori", "number": 159}, origin="inferred")
+    assert isinstance(d, NeedsApproval) and d.allow_always and not d.require_code
+    assert asks(evaluate(db, gate, SAVE_ISSUE, {"id": "DORI-1"}, origin="inferred",
+                         principal=APPROVER))  # fmt: skip
+    rows = evaluated(db)
+    assert all("staff_allowed" not in r["detail"] and "tainted_allowed" not in r["detail"]
+               for r in rows)  # fmt: skip
+
+
+def test_an_untainted_member_write_still_asks(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    assert asks(evaluate(db, gate, SYNC, origin="inferred", principal=MEMBER))
+    assert staff_allowed(db) == [None]
+
+
+def test_an_untainted_l1_still_asks_with_the_code(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    for principal in (OWNER, APPROVER):
+        assert asks(evaluate(db, gate, PROD, origin="inferred", principal=principal), code=True)
+    assert staff_allowed(db) == [None, None]
+
+
+def test_untainted_owner_tools_still_ask(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    for tool in (trust_tools.ALLOW_TOOLS, trust_tools.ALLOW_TRUST_RULE):
+        d = evaluate(db, gate, tool, {"tools": ["deploy_staging"]}, origin="inferred")
+        assert isinstance(d, NeedsApproval), tool.name
+    assert trust_store.list_rules(db) == []
+    assert all(v is None for v in staff_allowed(db))
+
+
+def test_untainted_kill_switch_dry_run_cap_and_ask_rule(
+    db: sqlite3.Connection, gate: PolicyGate
+) -> None:
+    assert isinstance(evaluate(db, gate, SYNC, origin="inferred", capped=True), NeedsApproval)
+    trust_store.add_rule(db, scope="ops", action="*", effect="ask", created_from="chat", now=NOW)
+    assert isinstance(evaluate(db, gate, SYNC, origin="inferred"), NeedsApproval)
+    assert isinstance(evaluate(db, gate, SYNC, origin="inferred", principal=APPROVER),
+                      NeedsApproval)  # fmt: skip
+    trust_store.remove_rule(db, trust_store.list_rules(db)[0].id)
+    kv_set(db, "autonomy", "off")
+    assert asks(evaluate(db, gate, SYNC, origin="inferred"))
+    dry = make_gate(db, dry_run=True)
+    assert isinstance(evaluate(db, dry, SYNC, origin="inferred"), DryRun)
+    assert all(v is None for v in staff_allowed(db))
+
+
+def test_an_untainted_l3_and_a_standing_allow_are_not_marked(
+    db: sqlite3.Connection, gate: PolicyGate
+) -> None:
+    """Both already ran before PER-348: the row says so as before."""
+    assert isinstance(evaluate(db, gate, STAGING, origin="inferred"), Allow)
+    trust_store.add_rule(db, scope="ops", action="tool:ops.sync", effect="allow",
+                         created_from="yes always", now=NOW)  # fmt: skip
+    assert isinstance(evaluate(db, gate, SYNC, origin="inferred"), Allow)
+    rows = evaluated(db)
+    assert staff_allowed(db) == [None, None]
+    assert [r["detail"].get("standing") for r in rows] == [None, True]
+
+
+def test_an_untainted_merge_run_follows_merge_standable(
+    db: sqlite3.Connection, gate: PolicyGate
+) -> None:
+    clean = _run(db, 51)
+    d = evaluate(db, gate, runs_tools.MERGE_RUN, {"code": clean}, origin="inferred",
+                 principal=APPROVER)  # fmt: skip
+    assert isinstance(d, Allow) and d.unattended
+    flagged = _run(db, 52)
+    runs_store.update(db, flagged, flagged_paths=[".github/workflows/ci.yml"])
+    d = evaluate(db, gate, runs_tools.MERGE_RUN, {"code": flagged}, origin="inferred",
+                 principal=APPROVER)  # fmt: skip
+    assert isinstance(d, NeedsApproval)
+    assert staff_allowed(db) == [True, None]
 
 
 # --- merge_run -------------------------------------------------------------------------------
@@ -257,9 +375,11 @@ def test_start_run_is_lifted_but_an_ask_rule_on_its_repo_asks(
 BUILTIN_WRITES: dict[str, bool] = {
     "start_run": True, "cancel_run": True, "continue_run": True, "merge_run": True,
     "answer_worker": True, "message_worker": True,
+    # a fired watch reports, or follows up as a new tainted turn the gate weighs (PER-348)
+    "create_watch": True, "cancel_watch": True,
     # a stored prompt that later fires as ``scheduled`` (untainted): never lifted
-    "add_job": False, "create_watch": False, "pause_job": False, "resume_job": False,
-    "delete_job": False, "run_job_now": False, "cancel_watch": False,
+    "add_job": False, "pause_job": False, "resume_job": False, "delete_job": False,
+    "run_job_now": False,
     # a CI workflow onto the default branch (no flagged-paths check), the repo set the trust
     # scopes name, restarts, deleting the owner's notes and reminders
     "add_ci": False, "merge_ci_pr": False, "create_repo": False, "add_repo": False,
@@ -284,9 +404,14 @@ def test_the_builtin_allowlist_is_pinned() -> None:
     assert not TAINT_LIFTABLE_BUILTINS & OWNER_TOOLS
 
 
+def _builtin(name: str) -> ToolSpec:
+    (spec,) = [s for m in BUILTIN_MODULES for s in m.SPECS if s.name == name]
+    return spec
+
+
 @pytest.mark.parametrize("name", sorted(n for n, lift in BUILTIN_WRITES.items() if not lift))
 def test_a_builtin_off_the_list_still_asks_when_tainted(db: sqlite3.Connection, name: str) -> None:
-    (spec,) = [s for m in BUILTIN_MODULES for s in m.SPECS if s.name == name]
+    spec = _builtin(name)
     kv_set(db, "autonomy", "on")
     reg = ToolRegistry()
     reg.register(spec)
@@ -295,6 +420,51 @@ def test_a_builtin_off_the_list_still_asks_when_tainted(db: sqlite3.Connection, 
     d = evaluate(db, gate, spec, {"x": 1})
     assert isinstance(d, NeedsApproval), name
     assert all("tainted_allowed" not in r["detail"] for r in evaluated(db))
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(n for n, lift in BUILTIN_WRITES.items() if not lift and _builtin(n).level is Level.L2),
+)
+def test_a_builtin_off_the_list_still_asks_when_untainted(
+    db: sqlite3.Connection, name: str
+) -> None:
+    spec = _builtin(name)
+    kv_set(db, "autonomy", "on")
+    reg = ToolRegistry()
+    reg.register(spec)
+    gate = PolicyGate(db, principals(), reg, dry_run=False, approval_ttl_s=1800,
+                      standing=StandingAllows(db), tainted_writes="allow")  # fmt: skip
+    for principal in (OWNER, APPROVER):
+        d = evaluate(db, gate, spec, {"x": 1}, origin="inferred", principal=principal)
+        assert isinstance(d, NeedsApproval), name
+    assert all(v is None for v in staff_allowed(db))
+
+
+@pytest.mark.parametrize("origin", ["tainted", "inferred"])
+def test_watch_tools_run(db: sqlite3.Connection, gate: PolicyGate, origin: Origin) -> None:
+    for principal in (OWNER, APPROVER):
+        made = evaluate(db, gate, watch_tools.CREATE_WATCH,
+                        {"what": "PR 159 merged", "ask": "Is PR 159 merged?"},
+                        origin=origin, principal=principal)  # fmt: skip
+        assert isinstance(made, Allow) and made.unattended
+        gone = evaluate(db, gate, watch_tools.CANCEL_WATCH, {"id": "W3"}, origin=origin,
+                        principal=principal)  # fmt: skip
+        assert isinstance(gone, Allow) and gone.unattended
+    key = "tainted_allowed" if origin == "tainted" else "staff_allowed"
+    # cancel_watch is L3: untainted it already ran, so only its tainted call is marked
+    marks = [True, True] * 2 if origin == "tainted" else [True, None] * 2
+    assert [r["detail"].get(key) for r in evaluated(db)] == marks
+
+
+def test_watch_tools_scope_for_an_ask_rule(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """``Standing.tainted_allows`` scopes a watch tool at ``*``: an ask rule there asks."""
+    trust_store.add_rule(db, scope="*", action="tool:create_watch", effect="ask",
+                         created_from="chat", now=NOW)  # fmt: skip
+    for origin in ("tainted", "inferred"):
+        d = evaluate(db, gate, watch_tools.CREATE_WATCH, {"what": "x", "ask": "y?"},
+                     origin=origin)  # fmt: skip
+        assert isinstance(d, NeedsApproval), origin
 
 
 def test_the_audit_says_tainted_allowed_only_when_it_ran(
