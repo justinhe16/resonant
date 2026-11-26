@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""github extension CLI: PRs, a stateless CI/review watch, a digest, and two gated writes.
+"""github extension CLI: PRs, a stateless CI/review watch, a digest, and three gated writes.
 
 Stdlib only and a single file: Resonant runs it as ``python -I -S cli.py``, so nothing next to
 it is importable. Every GitHub call goes through the ``gh`` CLI. The Keychain token arrives
@@ -7,9 +7,16 @@ on the secrets pipe (``RESONANT_SECRETS_FD``) and is never in any environment or
 gets it from a ``hosts.yml`` in a private 0700 ``GH_CONFIG_DIR`` that is removed on exit.
 
 Tools print one JSON object on stdout and exit 0. Any failure prints one line to stderr and
-exits 1, and a failed run changed nothing: the writes (``rerun_failed``, ``merge_pr``) check
-everything before their first mutating ``gh`` call, and once one has gone through they report
-success with what happened rather than exit 1.
+exits 1, and a failed run changed nothing: the writes (``rerun_failed``, ``merge_pr``,
+``comment_pr``) check everything before their first mutating ``gh`` call, and once one has gone
+through they report success with what happened rather than exit 1.
+
+The token is either a person's (a fine-grained PAT in the Keychain) or, on an instance that
+backs ``github/token`` with its GitHub App (PER-336), an installation token minted for this one
+call (``ghs_…``). Every tool that names a repo and a PR works the same with both, on any repo
+the token can see (an org's too) and any author's PR. An App token has no user of its own, so
+"my PRs" (``prs``, ``watch``, ``digest``) needs ``author`` in config.json there; without it
+``prs`` says so and the two jobs have nothing to watch.
 
 ``watch`` keeps no state. It derives events from GitHub's current state, each with a
 deterministic ``dedupe_key``, and Resonant's events table (UNIQUE on the key) is the memory.
@@ -99,6 +106,26 @@ _UNMERGEABLE_STATES = {
 _SHA = re.compile(r"^[0-9a-f]{7,64}$")
 # A fine-grained token missing a scope gets this from GitHub (REST says it with a 403).
 _DENIED = ("resource not accessible by",)
+APP_TOKEN_PREFIX = "ghs_"  # noqa: S105 - a GitHub App installation token's prefix (PER-336)
+APP_NO_USER = (
+    "prs lists one person's PRs, and this instance's GitHub App token has no person; use "
+    "recent_prs {repo} or pr {repo, number}, or set author in the github extension's config.json"
+)
+PAGE_SIZE = 100
+PAGES_MAX = 3  # 300 files or comments of each kind
+# pr_diff: a file's patch is clipped to PATCH_FILE_MAX characters (and bytes as JSON), all of
+# them to PATCH_TOTAL_MAX bytes; then the result is trimmed (patches from the end, then files)
+# until it fits RESULT_MAX, under Resonant's 32 KB store cap as the executor measures it
+# (``json.dumps`` with ASCII escapes), so a big PR never collapses to a truncated blob.
+PATCH_FILE_MAX = 3000
+PATCH_TOTAL_MAX = 18000
+DIFF_FILES_LISTED = 100
+RESULT_MAX = 30000
+# pr_comments: the newest of each kind, bodies clipped.
+COMMENTS_MAX = 30
+COMMENT_TEXT_MAX = 600
+# comment_pr: Resonant passes a string arg of at most 1000 characters, so that is the cap.
+COMMENT_BODY_MAX = 1000
 
 
 class Failed(Exception):
@@ -200,6 +227,8 @@ class Gh:
             )
         self.path = pinned
         self.token = token
+        # PER-336: minted per call by the instance's GitHub App, not a person's token.
+        self.app_token = token.startswith(APP_TOKEN_PREFIX)
         self.env = {
             "PATH": os.environ.get("PATH") or DEFAULT_PATH,
             "HOME": str(data_dir()),
@@ -266,6 +295,20 @@ class Gh:
     def redact(self, text: str) -> str:
         return text.replace(self.token, "[redacted]")
 
+    def pages(self, path: str, *, pages: int = PAGES_MAX) -> tuple[list[Any], bool]:
+        """``(items, truncated)``: a REST list endpoint, ``PAGE_SIZE`` a page, at most
+        ``pages`` pages. ``path`` has no query string."""
+        items: list[Any] = []
+        for page in range(1, pages + 1):
+            got = self.json("api", f"{path}?per_page={PAGE_SIZE}&page={page}")
+            if not isinstance(got, list):
+                raise Failed(f"gh api {path} returned no list")
+            batch = cast(list[Any], got)
+            items += batch
+            if len(batch) < PAGE_SIZE:
+                return items, False
+        return items, True
+
 
 # --- shaping ---------------------------------------------------------------------------
 
@@ -285,6 +328,16 @@ def _s(v: Any) -> str:
 def clip(text: str, n: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def clip_lines(text: str, n: int) -> str:
+    """``text`` stripped and cut at ``n`` characters, its line breaks kept (a review body)."""
+    text = text.strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def login(v: Any) -> str:
+    return _s(_d(v).get("login"))
 
 
 def checks_of(contexts: list[Any]) -> tuple[str, list[str], list[dict[str, str]]]:
@@ -374,6 +427,10 @@ def _int(v: Any) -> int:
     return v if isinstance(v, int) else 0
 
 
+def _opt_int(v: Any) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
 def ref(pr: dict[str, Any]) -> str:
     """``resonant#40``: the short form people read."""
     return f"{str(pr['repo']).rsplit('/', 1)[-1]}#{pr['number']}"
@@ -400,7 +457,14 @@ def emit(result: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]
 # --- commands --------------------------------------------------------------------------
 
 
+def no_person(gh: Gh) -> bool:
+    """An App token with ``author`` left at ``@me``: there is no "me" to search for."""
+    return gh.app_token and load_config()[0] == "@me"
+
+
 def cmd_prs(gh: Gh) -> dict[str, Any]:
+    if no_person(gh):
+        raise Failed(APP_NO_USER)
     mine, review, truncated = search(gh)
     summary = summary_line(mine, review)
     return {"summary": summary, "prs": mine, "review_requested": review, "truncated": truncated}
@@ -470,6 +534,151 @@ def cmd_pr(gh: Gh, repo: str, number: int) -> dict[str, Any]:
         "changed_files": _int(v.get("changedFiles")),
         "created_at": _s(v.get("createdAt")),
         "updated_at": _s(v.get("updatedAt")),
+    }
+
+
+def cmd_pr_diff(gh: Gh, repo: str, number: int) -> dict[str, Any]:
+    """The PR's changed files with their patches, clipped per file and in total. GitHub
+    leaves out the patch of a binary or very large file (``patch: null``, ``no_patch``)."""
+    check_target(repo, number)
+    files, truncated = gh.pages(f"repos/{repo}/pulls/{number}/files")
+    budget = PATCH_TOTAL_MAX
+    out: list[dict[str, Any]] = []
+    clipped_any = False
+    for f in map(_d, files[:DIFF_FILES_LISTED]):
+        entry: dict[str, Any] = {
+            "file": _s(f.get("filename")),
+            "status": _s(f.get("status")),
+            "additions": _int(f.get("additions")),
+            "deletions": _int(f.get("deletions")),
+        }
+        if previous := _s(f.get("previous_filename")):
+            entry["previous_file"] = previous
+        raw = f.get("patch")
+        if not isinstance(raw, str):
+            entry["no_patch"] = True
+        else:
+            patch, cost = fit(raw[:PATCH_FILE_MAX], min(PATCH_FILE_MAX + 2, budget))
+            budget -= cost
+            if patch:
+                entry["patch"] = patch
+            if len(patch) < len(raw):
+                entry["patch_clipped"] = True
+                clipped_any = True
+        out.append(entry)
+    adds = sum(_int(_d(f).get("additions")) for f in files)
+    dels = sum(_int(_d(f).get("deletions")) for f in files)
+    truncated = truncated or len(files) > DIFF_FILES_LISTED
+
+    def result() -> dict[str, Any]:
+        summary = f"{ref({'repo': repo, 'number': number})}: {len(files)} files, +{adds} -{dels}"
+        if truncated:
+            summary += f"; first {len(out)} files listed"
+        if clipped_any:
+            summary += "; some patches clipped"
+        return {"repo": repo, "number": number, "summary": summary, "files": out,
+                "truncated": truncated}  # fmt: skip
+
+    # Trim to the store cap: the latest patches first, then the latest files.
+    while len(json.dumps(result())) > RESULT_MAX:
+        patched = [e for e in out if "patch" in e]
+        if patched:
+            del patched[-1]["patch"]
+            patched[-1]["patch_clipped"] = clipped_any = True
+        elif out:
+            out.pop()
+            truncated = True
+        else:
+            break
+    return result()
+
+
+def fit(text: str, budget: int) -> tuple[str, int]:
+    """``(prefix, its bytes as JSON)``: the longest prefix of ``text`` whose JSON string
+    (ASCII-escaped, as Resonant measures a result) fits in ``budget`` bytes, by halving."""
+
+    def cost(t: str) -> int:
+        return len(json.dumps(t))
+
+    if budget <= 2:
+        return "", 0
+    if cost(text) <= budget:
+        return text, cost(text)
+    lo, hi = 0, len(text)  # cost(text[:lo]) fits, cost(text[:hi]) doesn't
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if cost(text[:mid]) <= budget else (lo, mid)
+    return text[:lo], cost(text[:lo]) if lo else 0
+
+
+def review_states(reviews: list[dict[str, Any]]) -> dict[str, str]:
+    """Each reviewer's latest deciding review (approved, changes requested, dismissed);
+    a comment-only review doesn't change it."""
+    latest: dict[str, str] = {}
+    for r in sorted(reviews, key=lambda r: _s(r.get("submitted_at"))):
+        state, who = _s(r.get("state")).lower(), login(r.get("user"))
+        if who and state in ("approved", "changes_requested", "dismissed"):
+            latest[who] = state
+    return dict(sorted(latest.items()))
+
+
+def cmd_pr_comments(gh: Gh, repo: str, number: int) -> dict[str, Any]:
+    """The PR's reviews, its inline review comments and its conversation comments, the
+    newest ``COMMENTS_MAX`` of each, bodies clipped."""
+    check_target(repo, number)
+    raw_reviews, t1 = gh.pages(f"repos/{repo}/pulls/{number}/reviews")
+    raw_inline, t2 = gh.pages(f"repos/{repo}/pulls/{number}/comments")
+    raw_talk, t3 = gh.pages(f"repos/{repo}/issues/{number}/comments")
+    reviews = [_d(r) for r in raw_reviews]
+    shown_reviews = [
+        {
+            "author": login(r.get("user")),
+            "state": _s(r.get("state")).lower(),
+            "submitted_at": _s(r.get("submitted_at")),
+            "commit": _s(r.get("commit_id"))[:12],
+            "body": clip_lines(_s(r.get("body")), COMMENT_TEXT_MAX),
+        }
+        for r in reviews
+        if _s(r.get("state")).upper() != "PENDING"
+    ][-COMMENTS_MAX:]
+    inline = [
+        {
+            "author": login(c.get("user")),
+            "file": _s(c.get("path")),
+            "line": _opt_int(c.get("line")),
+            "created_at": _s(c.get("created_at")),
+            "reply_to": _opt_int(c.get("in_reply_to_id")),
+            "id": _opt_int(c.get("id")),
+            "body": clip_lines(_s(c.get("body")), COMMENT_TEXT_MAX),
+        }
+        for c in map(_d, raw_inline)
+    ][-COMMENTS_MAX:]
+    talk = [
+        {
+            "author": login(c.get("user")),
+            "created_at": _s(c.get("created_at")),
+            "body": clip_lines(_s(c.get("body")), COMMENT_TEXT_MAX),
+        }
+        for c in map(_d, raw_talk)
+    ][-COMMENTS_MAX:]
+    states = review_states(reviews)
+    approved = sorted(w for w, st in states.items() if st == "approved")
+    changes = sorted(w for w, st in states.items() if st == "changes_requested")
+    parts = [f"{len(shown_reviews)} reviews", f"{len(raw_inline)} review comments",
+             f"{len(raw_talk)} comments"]  # fmt: skip
+    if approved:
+        parts.append(f"approved by {', '.join(approved)}")
+    if changes:
+        parts.append(f"changes requested by {', '.join(changes)}")
+    return {
+        "repo": repo,
+        "number": number,
+        "summary": f"{ref({'repo': repo, 'number': number})}: {'; '.join(parts)}",
+        "review_states": states,
+        "reviews": shown_reviews,
+        "review_comments": inline,
+        "comments": talk,
+        "truncated": t1 or t2 or t3,
     }
 
 
@@ -572,6 +781,8 @@ def search_closed(gh: Gh) -> list[Any]:
 
 
 def cmd_watch(gh: Gh) -> dict[str, Any]:
+    if no_person(gh):
+        return {"summary": "nothing to watch: an App token has no person (config.json author)"}
     mine, review, _ = search(gh)
     events: list[dict[str, Any]] = []
     for pr in mine:
@@ -630,7 +841,10 @@ def report_event(
 def cmd_digest(gh: Gh) -> dict[str, Any]:
     """Reports ``github/summary`` (low: the 08:00 briefing's Updates section). The state is
     the counts, so an unchanged day is not news. All zero: reported ``quiet``, so the
-    briefing leaves it out instead of saying ``0 open PRs, 0 failing CI, ...``."""
+    briefing leaves it out instead of saying ``0 open PRs, 0 failing CI, ...``. With an App
+    token and no ``author`` there is nobody's summary to report, so it reports nothing."""
+    if no_person(gh):
+        return {"summary": "no summary: an App token has no person (config.json author)"}
     mine, review, _ = search(gh)
     line = summary_line(mine, review)
     state = {
@@ -643,6 +857,11 @@ def cmd_digest(gh: Gh) -> dict[str, Any]:
 
 
 def cmd_health(gh: Gh) -> dict[str, Any]:
+    if gh.app_token:  # an installation token can't read /user; it can list its repos
+        repos = _d(gh.json("api", "installation/repositories?per_page=1"))
+        if not isinstance(repos.get("total_count"), int):
+            raise Failed("gh api installation/repositories returned no count")
+        return {"ok": True, "app": True, "repos": repos["total_count"]}
     user = _d(gh.json("api", "user"))
     if not _s(user.get("login")):
         raise Failed("gh api user returned no login")
@@ -788,23 +1007,55 @@ def cmd_merge_pr(gh: Gh, repo: str, number: int, head_sha: str) -> dict[str, Any
     }
 
 
+def cmd_comment_pr(gh: Gh, repo: str, number: int, body: str) -> dict[str, Any]:
+    """Posts ``body`` as a conversation comment on the PR (never on an issue: the number is
+    checked to be a PR first)."""
+    check_target(repo, number)
+    text = body.strip()
+    if not text:
+        raise Failed("the comment is empty")
+    if len(text) > COMMENT_BODY_MAX:
+        raise Failed(f"the comment is {len(text)} characters; at most {COMMENT_BODY_MAX}")
+    pr = {"repo": repo, "number": number}
+    v = _d(gh.json("pr", "view", str(number), "--repo", repo, "--json", "number,state,url"))
+    if v.get("number") != number:
+        raise Failed(f"{ref(pr)} isn't a pull request")
+    raw = gh.text(
+        "api", f"repos/{repo}/issues/{number}/comments", "--method", "POST", "-f", f"body={text}",
+        need="Pull requests: write",
+    )  # fmt: skip
+    try:
+        url = _s(_d(json.loads(raw)).get("html_url"))
+    except ValueError:
+        url = ""  # posted; GitHub's reply just wasn't JSON
+    return {"summary": f"commented on {ref(pr)}", "repo": repo, "number": number, "url": url}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="github")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("prs", "watch", "digest", "health"):
         sub.add_parser(name)
     sub.add_parser("recent_prs").add_argument("--repo", required=True)
-    for name in ("pr", "rerun_failed", "merge_pr"):
+    for name in ("pr", "pr_diff", "pr_comments", "rerun_failed", "merge_pr", "comment_pr"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
         p.add_argument("--number", required=True, type=int)
         if name == "merge_pr":
             p.add_argument("--head-sha", required=True)
+        if name == "comment_pr":
+            p.add_argument("--body", required=True)
     args = parser.parse_args(argv)
     try:
         gh = Gh()
         if args.cmd == "pr":
             out = cmd_pr(gh, args.repo, args.number)
+        elif args.cmd == "pr_diff":
+            out = cmd_pr_diff(gh, args.repo, args.number)
+        elif args.cmd == "pr_comments":
+            out = cmd_pr_comments(gh, args.repo, args.number)
+        elif args.cmd == "comment_pr":
+            out = cmd_comment_pr(gh, args.repo, args.number, args.body)
         elif args.cmd == "recent_prs":
             out = cmd_recent_prs(gh, args.repo)
         elif args.cmd == "rerun_failed":

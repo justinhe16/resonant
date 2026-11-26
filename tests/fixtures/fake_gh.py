@@ -12,6 +12,11 @@ State keys: ``token``, ``user``, ``mine`` / ``review`` / ``closed`` (GraphQL sea
 fail every call, ``fail_on`` (``"pr merge"`` or ``"run rerun <id>"`` → the same shape) to fail
 one kind of call, and ``garbage`` to print non-JSON with exit 0. ``pr merge`` and ``run rerun``
 print a line of text, like gh does.
+
+PER-336: ``api`` (``"<path>"`` → a REST reply) answers ``gh api <path>[?query]``: a list is
+paged by the query's ``per_page`` and ``page``; ``gh api <path> --method POST`` answers
+``{"html_url": …}`` (the call is in ``calls.jsonl``). ``tokens`` lists more tokens the
+``hosts.yml`` may hold (an App-minted one per call) besides ``token``.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qsl
 
 
 def _opt(args: list[str], flag: str) -> str:
@@ -40,6 +46,8 @@ def answer(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
         return 0, f"✓ Requested rerun (failed jobs) of run {args[2]}\n", ""
     if args[:2] == ["api", "user"]:
         return 0, state.get("user", {"login": "octo"}), ""
+    if args[0] == "api" and len(args) > 1 and args[1] != "graphql":
+        return _rest(state, args)
     if args[:2] == ["api", "graphql"]:
         aliases = ("closed",) if any("is:closed" in a for a in args) else ("mine", "review")
         data = {
@@ -58,6 +66,20 @@ def answer(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
             return 1, None, "GraphQL: Could not resolve to a PullRequest"
         return 0, pr, ""
     return 2, None, f"fake gh: unhandled {args[:2]}"
+
+
+def _rest(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
+    path, _, query = args[1].partition("?")
+    if _opt(args, "--method") == "POST":
+        return 0, {"html_url": f"https://github.com/{path}#issuecomment-1"}, ""
+    reply = state.get("api", {}).get(path)
+    if reply is None:
+        return 1, None, "gh: Not Found (HTTP 404)"
+    if isinstance(reply, list):
+        params = dict(parse_qsl(query))
+        per, page = int(params.get("per_page", "30")), int(params.get("page", "1"))
+        return 0, cast(list[Any], reply)[(page - 1) * per : page * per], ""
+    return 0, reply, ""
 
 
 def _hosts_token() -> str | None:
@@ -82,7 +104,7 @@ def main() -> int:
     call = {
         "argv": args,
         "env": sorted(os.environ),
-        "token_ok": _hosts_token() == state.get("token"),
+        "token_ok": _hosts_token() in [state.get("token"), *state.get("tokens", [])],
         "modes": _modes(),
     }
     with (state_path.parent / "calls.jsonl").open("a") as f:

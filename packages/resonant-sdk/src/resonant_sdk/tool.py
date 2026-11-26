@@ -37,6 +37,11 @@ Invariants, enforced here at registration:
   requester, and the approval is asked in the run's thread. Only extension tools carry it.
 - ``grant`` names a builtin a member may request through ``grants: {"builtin:<grant>":
   [request]}`` (``resonant.principals``). Only global L0 reads can carry one.
+- ``github_app`` (PER-336) says what a GitHub App token minted for this call may cover, when
+  the instance backs one of the call's secrets with its GitHub App
+  (``extensions.secret_sources``): the arg holding the ``owner/name`` repo (None: every repo
+  the installation sees) and the permissions. A static Keychain secret ignores it. It is not
+  part of the intent hash: it never changes what the call is, only the credential's reach.
 """
 
 from __future__ import annotations
@@ -118,6 +123,44 @@ def summary_args(template: str) -> set[str]:
 
 GRANT_PATTERN = r"^[a-z][a-z0-9_-]{0,31}$"
 
+# PER-336: the GitHub App permissions an extension call may ask for. Never administration,
+# so an App-backed extension secret can't delete, rename or reconfigure a repo. ``metadata:
+# read`` is always added by the mint.
+GitHubPermission = Literal["actions", "checks", "contents", "issues", "pull_requests", "statuses"]
+GitHubAccess = Literal["read", "write"]
+APP_READ_DEFAULT: dict[GitHubPermission, GitHubAccess] = {
+    "actions": "read",
+    "checks": "read",
+    "contents": "read",
+    "issues": "read",
+    "pull_requests": "read",
+    "statuses": "read",
+}
+
+
+def _default_app_permissions() -> dict[GitHubPermission, GitHubAccess]:
+    return dict(APP_READ_DEFAULT)
+
+
+class AppToken(BaseModel):
+    """What a GitHub App token minted for one call covers (PER-336). ``repo`` names the call's
+    arg that holds ``owner/name``; None mints for every repo the installation can see.
+    ``permissions`` defaults to read on everything a PR read needs (``APP_READ_DEFAULT``):
+    a write tool lists the write it needs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repo: str | None = Field(default=None, pattern=r"^[a-z_][a-z0-9_]*$")
+    permissions: dict[GitHubPermission, GitHubAccess] = Field(
+        default_factory=_default_app_permissions, min_length=1
+    )
+
+
+def _arg_type(schema: dict[str, Any], arg: str) -> object:
+    props: Any = schema.get("properties")
+    prop: Any = cast(dict[str, Any], props).get(arg) if isinstance(props, dict) else None
+    return cast(dict[str, Any], prop).get("type") if isinstance(prop, dict) else None
+
 
 class ToolSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -140,6 +183,7 @@ class ToolSpec(BaseModel):
     approval_summary: str | None = None
     approval_detail: str | None = Field(default=None, pattern=r"^[a-z_][a-z0-9_]*$")  # PER-300
     worker_requestable: bool = False  # PER-296: ``resonant request`` may name it
+    github_app: AppToken | None = None  # PER-336: an App-minted secret's reach (see above)
 
     @model_validator(mode="after")
     def _invariants(self) -> Self:
@@ -171,6 +215,13 @@ class ToolSpec(BaseModel):
                 raise ValueError(f"{self.name}: approval_detail must name a string arg")
         if self.worker_requestable and self.extension is None:
             raise ValueError(f"{self.name}: only extension tools can be worker requestable")
+        if self.github_app is not None:
+            if not self.secrets:
+                raise ValueError(f"{self.name}: github_app needs a declared secret to back")
+            if (arg := self.github_app.repo) is not None and _arg_type(self.args_schema, arg) != (
+                "string"
+            ):
+                raise ValueError(f"{self.name}: github_app.repo must name a string arg")
         return self
 
     @property

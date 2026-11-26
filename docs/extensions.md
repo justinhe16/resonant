@@ -106,6 +106,7 @@ tools:
     effect: write
     level: L3
     secrets: [api_token]                    # must also appear in top-level secrets
+    # github_app: {repo: repo, permissions: {contents: write}}  # optional, PER-336 (§5)
 ```
 
 Contract:
@@ -209,6 +210,41 @@ Everything above applies (listed tools only, your descriptions, stripped and enf
 - Every encoding of a value (raw, URL-encoded, JSON-escaped, base64) is replaced with `[redacted]` in results, events, errors, audit rows and logs. Don't print secrets in other forms: those aren't caught.
 - Never put secrets in the manifest, in `.env`, or in your repo. The Resonant repo runs gitleaks, and yours should too.
 
+### Secrets minted by the GitHub App (PER-336)
+
+An instance whose GitHub credential is its GitHub App (`runner.github_app`, the one workers push with) can back an extension secret with the App instead of a static Keychain token. Fine-grained PATs can't read check runs and belong to one person; an installation token can read checks, sees the repos (an org's too) the App is installed on, and lives an hour. The extension can't tell the difference: the value still arrives on fd 4 and is still redacted everywhere. It is opt-in per instance, in the instance's config:
+
+```yaml
+runner:
+  github_app: {app_id: 123456, installation_id: 7890123}   # key: resonant secret set runner/github_app_key
+extensions:
+  secret_sources:
+    github/token: github_app       # <ext>/<name> -> github_app; unlisted refs stay in the Keychain
+```
+
+- **Per call.** Every tool call, job run, health check or recover run that declares the secret gets a fresh installation token, minted just before it runs and **revoked when it ends** (however it ends: success, failure, timeout, kill). A revoke that fails is logged without the value; the token dies within the hour anyway. Nothing is stored in the Keychain for that ref, and `resonant secret list` shows it as `minted`.
+- **Reach, declared by the tool.** A CLI tool or job may say what its token covers with a `github_app` block. A Keychain secret ignores it, so the same manifest serves both kinds of instance:
+
+  ```yaml
+  tools:
+    merge_pr:
+      run: python3 cli.py merge_pr --repo {repo} --number {number} --head-sha {head_sha}
+      effect: write
+      args: {repo: string, number: integer, head_sha: string}
+      secrets: [token]
+      github_app:
+        repo: repo                                   # the string arg holding owner/name
+        permissions: {contents: write, pull_requests: write, checks: read, statuses: read}
+  ```
+
+  - `repo` names a declared `string` arg. The token covers only that `owner/name`; a value that isn't `owner/name` mints nothing and the call fails before it runs, as for a missing secret. Without `repo` (and always for a job, which has no args) the token covers every repo the installation sees.
+  - `permissions` maps `actions`, `checks`, `contents`, `issues`, `pull_requests` or `statuses` to `read` or `write`; `metadata: read` is always added. Never administration. A reply from GitHub granting anything beyond the request is revoked and refused.
+  - **Default** (no block on a tool or job with secrets): read on all six, for the repo in a `repo` string arg if the tool has one, else for every repo. So reads need no block; give each write the narrowest block that does its job.
+  - Health checks and `recover` runs get the read-only default for every repo.
+- **Not for MCP servers.** A stdio server holds its secrets for its whole life, so it can't have a per-call token: a server that declares an App-backed secret doesn't start (`a secret this MCP server needs is missing or unreadable`).
+- **Who the token is.** An installation token is the App's bot (`<app-slug>[bot]`), not a person: `/user` and `@me` searches don't work with it. GitHub installation tokens start with `ghs_`, which is how an extension can tell (the github extension's `prs` then asks for `author` in its config).
+- **Config checks.** A ref mapped to `github_app` while `runner.github_app` is unset is a config error at start, as is a key that isn't `<ext>/<name>`.
+
 ## 6. Jobs
 
 ```yaml
@@ -223,6 +259,7 @@ jobs:
     timeout_s: 300                 # default 300, at most 1800
     catchup: 1h                    # none (default) or up to 24h: run once if missed while down
     description: polls your PRs' CI for the hourly rollup   # optional, one line, ≤ 160 chars
+    github_app: {permissions: {checks: read}}   # optional: an App-minted token's reach (§5)
 ```
 
 - `description` says what the job does, in one line, for the dashboard's Diagram tab (`github/watch: every 10 min job (read, runs without asking): polls …`). Display only; optional.

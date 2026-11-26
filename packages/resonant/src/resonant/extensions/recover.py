@@ -38,6 +38,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
@@ -49,6 +50,7 @@ from resonant.config import Settings
 from resonant.extensions.notify import clean_text
 from resonant.extensions.process import (
     ExtAmbiguous,
+    ExtCommand,
     ExtFailed,
     ExtRequest,
     ensure_data_dir,
@@ -258,14 +260,28 @@ class Recovery:
         """``(exit code or None, why it didn't exit, first stdout line)``."""
         recover, command = ext.manifest.recover, ext.recover
         assert recover is not None and command is not None  # checked by observe
-        env_secrets: dict[str, str] = {}
-        if recover.secrets:
-            try:
-                if self.secrets is None:
-                    raise SecretError(f"{name}/{recover.secrets[0]}", "unavailable")
-                env_secrets = await self.secrets.env_for(name, recover.secrets)
-            except SecretError:
-                return None, "a declared secret is missing", ""
+        async with AsyncExitStack() as leases:
+            env_secrets: dict[str, str] = {}
+            if recover.secrets:
+                try:
+                    if self.secrets is None:
+                        raise SecretError(f"{name}/{recover.secrets[0]}", "unavailable")
+                    # PER-336: a minted secret gets the read-only default for every repo.
+                    env_secrets = await leases.enter_async_context(
+                        self.secrets.lease(name, recover.secrets)
+                    )
+                except SecretError:
+                    return None, "a declared secret is missing", ""
+            return await self._run_command(name, ext, command, recover.timeout_s, env_secrets)
+
+    async def _run_command(
+        self,
+        name: str,
+        ext: LoadedExtension,
+        command: ExtCommand,
+        timeout_s: float,
+        env_secrets: dict[str, str],
+    ) -> tuple[int | None, str, str]:
         data_dir = self.host.data_dir / name
         ensure_data_dir(data_dir)
         env = scratch_env(
@@ -276,7 +292,7 @@ class Recovery:
             argv=command.render({}),
             cwd=ext.root,
             env=env,
-            timeout_s=recover.timeout_s,
+            timeout_s=timeout_s,
             label=f"{name}/recover",
         )
         try:
