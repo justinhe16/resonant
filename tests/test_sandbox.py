@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -636,3 +637,18 @@ def test_cli_check_with_the_guard_off_skips_every_probe_and_says_so() -> None:
 
     rows = json.loads(local.output)
     assert rows and {r["status"] for r in rows} == {"skip"} and {r["scope"] for r in rows} == {"ci"}
+
+
+def test_git_is_started_through_an_exec_script_not_a_symlink(tmp_path: Path) -> None:
+    # Cori 2026-11-25: Xcode's git, symlinked into <run>/bin, looked for git-remote-https in
+    # <run>/libexec/git-core and every https push failed.
+    params = params_in(tmp_path)
+    prepare_dirs(params)
+    real = tmp_path / "real git"
+    real.write_text('#!/bin/sh\necho "args:$*"\n')
+    real.chmod(0o755)
+    link_tools(params, {"git": real})
+    wrapper = params.resolved().run_dir / "bin" / "git"
+    assert not wrapper.is_symlink()
+    out = subprocess.run([str(wrapper), "push", "a b"], capture_output=True, text=True, check=True)
+    assert out.stdout == "args:push a b\n"

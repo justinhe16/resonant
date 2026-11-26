@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,8 @@ HOST_TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 SYSTEM_ONLY_TOOLS = frozenset({"git"})
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
+# Started through a one-line exec script instead of a symlink (see link_tools).
+EXEC_WRAPPED = frozenset({"git"})
 
 _API_PORT = "@API_PORT@"  # an int, the one value spliced into the text (checked in render)
 _PLACEHOLDERS = {
@@ -467,7 +470,14 @@ def link_tools(params: SandboxParams, tools: Mapping[str, str | os.PathLike[str]
             raise SandboxError(f"{real} is in a denied exec path")
         link = bin_dir / name
         link.unlink(missing_ok=True)
-        link.symlink_to(real)
+        if name in EXEC_WRAPPED:
+            # A tiny script, not a symlink: git (Xcode's, with RUNTIME_PREFIX) finds its
+            # helpers (git-remote-https) next to the path it was started from, so a symlink
+            # here sends it to <run>/libexec/git-core and every https push fails.
+            link.write_text(f'#!/bin/sh\nexec {shlex.quote(str(real))} "$@"\n')
+            link.chmod(0o700)
+        else:
+            link.symlink_to(real)
 
 
 def scratch_env(
