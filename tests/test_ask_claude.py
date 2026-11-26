@@ -38,6 +38,7 @@ from resonant.redact import Redactor
 from resonant.runners import ask as ask_mod
 from resonant.runners.ask import (
     ASK_PROMPT,
+    FOLLOW_UP_KEY,
     NOT_SET_UP,
     PAUSED,
     READ_BUILTINS,
@@ -990,3 +991,14 @@ def test_a_run_that_announced_itself_counts_as_a_change_for_the_guard() -> None:
     started = SimpleNamespace(reports=[], progress=[], announced=3)
     assert not AskRunner._ran(cast(Any, quiet))  # pyright: ignore[reportPrivateUsage]
     assert AskRunner._ran(cast(Any, started))  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_watch_follow_up_is_marked_with_its_key(db: sqlite3.Connection, tmp_path: Path) -> None:
+    """PER-346: a fired watch's follow-up ask carries the notice key, so a retry finds it;
+    an ordinary ask carries none."""
+    h = make(db, tmp_path)
+    plain = h.runner.enqueue("hello?", principal="justin")
+    marked = h.runner.enqueue("Watch W1 (x) fired.", principal="justin", follow_up="watch/1/1")
+    assert isinstance(plain, Queued) and isinstance(marked, Queued)
+    assert FOLLOW_UP_KEY not in h.task(plain.task_id).checkpoint
+    assert h.task(marked.task_id).checkpoint[FOLLOW_UP_KEY] == "watch/1/1"

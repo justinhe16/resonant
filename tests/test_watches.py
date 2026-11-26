@@ -18,14 +18,15 @@ from resonant.brain import notices
 from resonant.brain import watches as store
 from resonant.components import Components, build_components
 from resonant.config import Settings, load_settings
-from resonant.executor import ToolFailed
+from resonant.executor import CallContext, ContextHandler, ToolFailed
 from resonant.extensions.notify import clean_text
 from resonant.extensions.scheduler import CORE_JOBS, CoreDeps
 from resonant.gate import Intent, NeedsApproval
+from resonant.gateway.channel import MessageRef
 from resonant.loop import Loop, SlotPool
 from resonant.loop.types import Done, NewTask, StepContext
-from resonant.runners.ask import Queued
-from resonant.runners.watch import WatchRunner, queue_due, watches_job
+from resonant.runners.ask import FOLLOW_UP_KEY, AskRefused, Queued
+from resonant.runners.watch import WatchRunner, check_label, queue_due, watches_job
 from resonant.store import pulse as items
 from resonant.store.db import kv_set
 from resonant.store.tasks import get_task, insert_task
@@ -46,6 +47,7 @@ class Sent:
     principal: str
     text: str
     dedupe_key: str | None
+    thread: MessageRef | None = None
 
 
 @dataclass
@@ -54,13 +56,19 @@ class Recorder:
     keys: set[str] = field(default_factory=set[str])
 
     async def send(
-        self, principal: str, text: str, *, dedupe_key: str | None = None, **_: Any
+        self,
+        principal: str,
+        text: str,
+        *,
+        dedupe_key: str | None = None,
+        thread: MessageRef | None = None,
+        **_: Any,
     ) -> Any:
         if dedupe_key is not None and dedupe_key in self.keys:
             return None
         if dedupe_key is not None:
             self.keys.add(dedupe_key)
-        self.sent.append(Sent(principal, text, dedupe_key))
+        self.sent.append(Sent(principal, text, dedupe_key, thread))
         return None
 
 
@@ -192,7 +200,7 @@ async def test_create_an_ask_watch_defaults_to_hourly(components: Components) ->
         ({"what": "x", "tool": "ask_claude", "args": {}, "when": "changed"}, "no tool named"),
         ({"what": "x", "tool": "nope", "when": "changed"}, "no tool named"),
         ({"what": "x", "tool": "list_notes", "args": {"x": 1}, "when": "changed"}, "don't fit"),
-        ({"what": "x", "tool": "list_notes", "when": "contains"}, "needs text"),
+        ({"what": "x", "tool": "list_notes", "when": "contains"}, "needs match_text"),
         ({"what": "x", "tool": "list_notes", "when": "changed", "every_minutes": 10}, "every 15"),
         ({"what": "x", "ask": "q?", "every_minutes": 30}, "every 60"),
         ({"what": "x", "ask": "q?", "days": 31}, "days is 1 to 30"),
@@ -740,3 +748,258 @@ def test_the_briefing_reads_notices_by_their_prefix() -> None:
     from resonant.extensions import briefing as bf
 
     assert bf.NOTICE_PREFIX == notices.KEY_PREFIX
+
+
+# --- origin and follow-up (PER-346) ---------------------------------------------------------
+
+THREAD_REF = {"channel": "slack", "principal": "justin", "thread": "C1:1700.1", "ref": "C1:1700.2"}
+PR_WATCH: dict[str, Any] = {
+    "what": "PR 159 green",
+    "tool": "list_notes",
+    "args": {},
+    "when": "contains",
+    "match_text": "green",
+    "every_minutes": 15,
+}
+
+
+def asking_task(db: sqlite3.Connection, channel_ref: dict[str, Any] | None) -> CallContext:
+    """The brain turn that calls ``create_watch``: a task with that ``channel_ref``."""
+    task = insert_task(
+        db,
+        NewTask(kind="ask", runner="ask", priority=1, principal="justin", channel_ref=channel_ref),
+    )
+    return CallContext(secrets={}, idempotency_key=f"k-{task}", task_id=task)
+
+
+async def create_in(
+    c: Components, db: sqlite3.Connection, args: dict[str, Any], ref: dict[str, Any] | None
+) -> dict[str, Any]:
+    handler = cast(ContextHandler, c.handlers[(None, "create_watch")])
+    return await handler(args, asking_task(db, ref))
+
+
+class FollowUps:
+    """A fake ask runner that inserts the task like the real one (its checkpoint marker)."""
+
+    def __init__(self, db: sqlite3.Connection, refuse: str | None = None) -> None:
+        self.db = db
+        self.refuse = refuse
+        self.calls: list[dict[str, Any]] = []
+
+    def enqueue(self, question: str, **kw: Any) -> Queued | AskRefused:
+        self.calls.append({"question": question, **kw})
+        if self.refuse is not None:
+            return AskRefused(self.refuse, "busy")
+        cp = {"question": question, "tainted": kw["tainted"], FOLLOW_UP_KEY: kw["follow_up"]}
+        task = insert_task(
+            self.db,
+            NewTask(kind="ask", runner="ask", priority=1, principal=kw["principal"],
+                    checkpoint=cp, channel_ref=kw["channel_ref"]),
+        )  # fmt: skip
+        return Queued(task)
+
+
+async def test_a_watch_keeps_its_origin_and_notices_go_there(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    ch = Recorder()
+    w = runner(components, db, settings, ch, clock)
+    out = await create_in(components, db, PR_WATCH, THREAD_REF)
+    assert out["origin"] == "thread" and out["then"] == "stop" and out["follow_up"] is None
+    assert out["check"]["match_text"] == "green"
+    watch = store.get(db, 1)
+    assert watch is not None and watch.channel_ref == THREAD_REF
+    assert watch.conversation == "C1:1700.1"
+    await call(components, "add_note", {"text": "checks green"})
+    await run_due(db, w, clock)
+    (sent,) = ch.sent
+    assert sent.principal == "justin"
+    assert sent.thread == MessageRef(channel="slack", ref="C1:1700.2", thread="C1:1700.1")
+
+
+async def test_no_origin_or_someone_elses_thread_falls_back_to_the_dm(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    ch = Recorder()
+    w = runner(components, db, settings, ch, clock)
+    await create_in(components, db, PR_WATCH, None)  # an iMessage turn, or no thread
+    await create_in(components, db, {**PR_WATCH, "what": "b"}, {**THREAD_REF, "principal": "x"})
+    listed = await call(components, "list_watches")
+    assert [x["origin"] for x in listed["watches"]] == ["direct", "direct"]
+    await call(components, "add_note", {"text": "green"})
+    await run_due(db, w, clock)
+    assert len(ch.sent) == 2 and all(s.thread is None for s in ch.sent)
+
+
+async def test_default_behaviour_is_unchanged_without_a_task(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    asks = FollowUps(db)
+    ch = Recorder()
+    w = runner(components, db, settings, ch, clock, asks=asks)
+    await call(components, "create_watch", {**PR_WATCH, "match_text": None, "text": "green"})
+    watch = store.get(db, 1)
+    assert watch is not None and (watch.then, watch.channel_ref, watch.follow_up) == (
+        "stop",
+        None,
+        None,
+    )
+    await call(components, "add_note", {"text": "green"})
+    await run_due(db, w, clock)
+    (sent,) = ch.sent
+    assert sent.thread is None and asks.calls == []  # no follow-up without then=follow_up
+    assert check_label(watch) == "watch W1"
+
+
+async def test_follow_up_queues_one_tainted_ask_as_the_creator_in_the_origin(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    asks = FollowUps(db)
+    ch = Recorder()
+    w = runner(components, db, settings, ch, clock, asks=asks)
+    args = {**PR_WATCH, "then": "follow_up", "follow_up": "merge PR 159 if green, else say why"}
+    out = await create_in(components, db, args, THREAD_REF)
+    assert out["then"] == "follow_up" and out["follow_up"] == args["follow_up"]
+    watch = store.get(db, 1)
+    assert watch is not None and check_label(watch) == "watch W1 (in a thread, then follow up)"
+    (first,) = await run_due(db, w, clock)
+    assert first.result["status"] == "checked" and asks.calls == []
+    await call(components, "add_note", {"text": "checks green"})
+    clock.now += timedelta(minutes=15)
+    (out2,) = await run_due(db, w, clock)
+    assert out2.result["status"] == "fired"
+    (q,) = asks.calls
+    assert q["question"] == (
+        'Watch W1 (PR 159 green) fired: saw "green". '
+        "You asked yourself to: merge PR 159 if green, else say why"
+    )
+    assert (q["principal"], q["channel_ref"], q["tools"], q["tainted"], q["taint_hops"]) == (
+        "justin",
+        THREAD_REF,
+        True,
+        True,
+        0,
+    )
+    assert q["follow_up"] == "watch/1/1" and "requested_by" not in q
+    (sent,) = ch.sent
+    assert sent.thread is not None and "couldn't follow up" not in sent.text
+    after = store.get(db, 1)
+    assert after is not None and after.state == "fired"
+    assert after.follow_up_task is not None
+    clock.now += timedelta(minutes=15)
+    assert await run_due(db, w, clock) == []  # the watch ended after its follow-up
+
+
+async def test_a_retried_fire_never_queues_the_follow_up_twice(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    asks = FollowUps(db)
+    w = runner(components, db, settings, Recorder(), clock, asks=asks)
+    args = {**PR_WATCH, "then": "follow_up", "follow_up": "merge it"}
+    await create_in(components, db, args, THREAD_REF)
+    await call(components, "add_note", {"text": "green"})
+    watch = store.get(db, 1)
+    assert watch is not None
+    v = store.judge_tool(watch, {"notes": ["green"]})
+    # a crash after the follow-up was queued but before the hit was recorded: the retry
+    # judges the same still-active watch again
+    assert watch.state == "active"
+    first = w._follow_up(watch, v.detail, "watch/1/1")  # pyright: ignore[reportPrivateUsage]
+    again = w._follow_up(watch, v.detail, "watch/1/1")  # pyright: ignore[reportPrivateUsage]
+    assert first is None and again is None and len(asks.calls) == 1
+    queued = db.execute(
+        "SELECT COUNT(*) FROM tasks WHERE json_extract(checkpoint, '$.watch_follow_up') = ?",
+        ("watch/1/1",),
+    ).fetchone()[0]
+    assert queued == 1
+
+
+async def test_a_refused_follow_up_is_said_in_the_notice(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    ch = Recorder()
+    w = runner(components, db, settings, ch, clock, asks=FollowUps(db, refuse="Claude is busy."))
+    await create_in(components, db, {**PR_WATCH, "follow_up": "merge it"}, THREAD_REF)
+    await call(components, "add_note", {"text": "green"})
+    await run_due(db, w, clock)
+    (sent,) = ch.sent
+    assert sent.text.endswith("(couldn't follow up: Claude is busy.)")
+    watch = store.get(db, 1)
+    assert watch is not None and watch.state == "fired" and watch.follow_up_task is None
+
+
+@pytest.mark.parametrize(
+    ("args", "why"),
+    [
+        ({"match_text": "Merge PR 159 once checks pass. Then tell Justin."}, "then: follow_up"),
+        ({"match_text": "x" * 61}, "not a sentence"),
+        ({"match_text": None, "text": "Merge it when it is green."}, "then: follow_up"),
+        ({"text": "red"}, "give match_text only"),
+        ({"then": "follow_up"}, "needs follow_up"),
+        ({"then": "continue", "follow_up": "merge it"}, "goes with then=follow_up"),
+    ],
+)
+async def test_create_refuses_sentences_and_bad_follow_ups(
+    components: Components, args: dict[str, Any], why: str
+) -> None:
+    full = {k: v for k, v in {**PR_WATCH, **args}.items() if v is not None}
+    with pytest.raises(ToolFailed, match=why):
+        await call(components, "create_watch", full)
+
+
+@pytest.mark.parametrize(
+    ("text", "sentence"),
+    [
+        ("MERGED", False),
+        ("v1.2 released", False),
+        ('"conclusion":"success"', False),
+        ("Add to bag", False),
+        ("merge it.", True),
+        ("Checks pass. Merge.", True),
+        ("x" * 61, True),
+    ],
+)
+def test_sentence_like(text: str, sentence: bool) -> None:
+    assert store.sentence_like(text) is sentence
+
+
+def test_the_approval_shows_the_follow_up(components: Components) -> None:
+    spec = components.registry.get(None, "create_watch")
+    assert spec is not None
+    args = {**PR_WATCH, "then": "follow_up", "follow_up": "merge PR 159"}
+    intent = Intent.for_tool(spec, task_id="t", principal="justin", origin="inferred", args=args)
+    assert watch_tools.summary_action(intent) == (
+        'watch "PR 159 green": call list_notes {} every 15m for the default days, '
+        'text you when it contains "green", then follow up: "merge PR 159"'
+    )
+
+
+def test_migration_037_keeps_old_watches_and_their_ids(tmp_path: Any) -> None:
+    from resonant.store.db import _migrations, migrate  # pyright: ignore[reportPrivateUsage]
+
+    raw = sqlite3.connect(tmp_path / "v36.db", isolation_level=None)
+    raw.row_factory = sqlite3.Row
+    every = _migrations()
+    assert migrate(raw, [m for m in every if m[0] <= 36]) == 36
+    cols = "principal, what, check_kind, op, value, interval_s, created_at, expires_at, next_at"
+    for what in ("a", "b"):
+        raw.execute(
+            f"INSERT INTO brain_watches ({cols}) VALUES ('justin', ?, 'tool', 'contains', 'x', "
+            "900, '2026-11-01T00:00:00+00:00', '2026-11-08T00:00:00+00:00', "
+            "'2026-11-01T00:00:00+00:00')",
+            (what,),
+        )
+    raw.execute("DELETE FROM brain_watches WHERE what = 'b'")  # the high-water mark is 2
+    assert migrate(raw, every) == 37
+    old = store.get(raw, 1)
+    assert old is not None and (old.what, old.then, old.channel_ref, old.follow_up) == (
+        "a",
+        "stop",
+        None,
+        None,
+    )
+    new = store.create(raw, principal="justin", what="c", check_kind="ask", op="yes",
+                       interval_s=3600, now=NOW, expires_at=NOW, question="q?",
+                       then="follow_up", follow_up="do it")  # fmt: skip
+    assert new.id == 3 and new.then == "follow_up" and new.follow_up == "do it"
