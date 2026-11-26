@@ -1492,6 +1492,9 @@ def secret_list(
             rows = []
         finally:
             conn.close()
+    # PER-336: a ref the GitHub App mints per call has no Keychain item to look for.
+    minted = {r for r, src in settings.extensions.secret_sources.items() if src == "github_app"}
+    declared = [(r, p) for r, p in declared if r not in minted]
     problems = dict(declared)
     good = [r for r, p in declared if p is None]
     store = _secret_store()
@@ -1514,6 +1517,10 @@ def secret_list(
         if e.present and (note := sp.list_note(sp.target_for(settings, ref), probed.get(ref))):
             line += f" · {note}"
         typer.echo(line.rstrip())
+    for ref in sorted(minted):
+        total += 1
+        present += 1
+        typer.echo(f"  {ref:<40} {'minted':<12} by the GitHub App for each call (no Keychain item)")
     # PER-297: which Keychain service was asked, so a changed secrets.service explains itself
     typer.echo(f"{present} of {total} present (service {store.service})")
     if unavailable:

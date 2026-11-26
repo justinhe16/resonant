@@ -76,6 +76,7 @@ import logging
 import shlex
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -988,14 +989,23 @@ class ExtensionHealth:
         return True
 
     async def _run(self, name: str, ext: LoadedExtension, command: ExtCommand) -> tuple[bool, str]:
-        env_secrets: dict[str, str] = {}
-        if ext.manifest.secrets:
-            try:
-                if self.secrets is None:
-                    raise SecretError(f"{name}/{ext.manifest.secrets[0]}", "unavailable")
-                env_secrets = await self.secrets.env_for(name, ext.manifest.secrets)
-            except SecretError:
-                return False, "health check: a declared secret is missing or unreadable"
+        async with AsyncExitStack() as leases:
+            env_secrets: dict[str, str] = {}
+            if ext.manifest.secrets:
+                try:
+                    if self.secrets is None:
+                        raise SecretError(f"{name}/{ext.manifest.secrets[0]}", "unavailable")
+                    # PER-336: a minted secret gets the read-only default for every repo.
+                    env_secrets = await leases.enter_async_context(
+                        self.secrets.lease(name, ext.manifest.secrets)
+                    )
+                except SecretError:
+                    return False, "health check: a declared secret is missing or unreadable"
+            return await self._check(name, ext, command, env_secrets)
+
+    async def _check(
+        self, name: str, ext: LoadedExtension, command: ExtCommand, env_secrets: dict[str, str]
+    ) -> tuple[bool, str]:
         data_dir = self.host.data_dir / name
         ensure_data_dir(data_dir)
         env = scratch_env(

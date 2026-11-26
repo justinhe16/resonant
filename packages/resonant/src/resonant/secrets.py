@@ -21,6 +21,11 @@ Rules this module keeps:
   ``-a`` value can never look like an option.
 - Errors carry the ref and an exit code or reason, never a value or ``security``'s output.
 - Nothing is cached: every call asks the Keychain.
+- PER-336: an extension ref may instead be *minted* per call (``SecretStore.minter``, the
+  instance's GitHub App for the refs ``extensions.secret_sources`` maps to it). ``lease``
+  mints those for one call, scoped by a ``MintScope``, and releases them (revokes the token)
+  when the call ends; ``env_for`` refuses them, so a caller that can't release one (a
+  long-running MCP server) fails cleanly instead of holding a token.
 
 The daemon must run as a GUI-session LaunchAgent: the login keychain is unlocked there and
 items created by ``security`` trust that binary, so reads don't prompt. Python ``keyring``
@@ -35,12 +40,13 @@ import contextlib
 import os
 import re
 import signal
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
 from resonant.instance import SERVICE_RE
+from resonant_sdk.tool import AppToken
 
 SECURITY = "/usr/bin/security"
 SERVICE = "resonant"
@@ -239,9 +245,38 @@ def delete_argv(ref: str, *, service: str = SERVICE) -> list[str]:
     return [SECURITY, "delete-generic-password", "-s", s, "-a", validate_ref(ref)]
 
 
+@dataclass(frozen=True)
+class MintScope:
+    """What one call's minted secret may cover (PER-336): the repo ``owner/name`` (None: every
+    repo the source can see) and the permissions (``{name: read|write}``; empty: the source's
+    read-only default)."""
+
+    repo: str | None = None
+    permissions: Mapping[str, str] = field(default_factory=dict[str, str])
+
+
+class SecretMinter(Protocol):
+    """A source that mints an extension secret per call instead of the Keychain holding it
+    (``resonant.extensions.app_secrets.GitHubAppMinter``)."""
+
+    def mints(self, ref: str) -> bool:
+        """Whether this source backs ``ref`` (``<ext>/<name>``)."""
+        ...
+
+    async def mint(self, ref: str, scope: MintScope) -> str:
+        """A fresh value for one call. Raises ``SecretError`` (never quoting a value)."""
+        ...
+
+    async def release(self, value: str) -> None:
+        """Ends a minted value once its call is over. Never raises."""
+        ...
+
+
 class SecretStore:
     """Keychain items ``<service>`` / ``<ext>/<name>``. No caching. ``service`` is the
-    instance's (``Settings.keychain_service``); the default is the personal instance's."""
+    instance's (``Settings.keychain_service``); the default is the personal instance's.
+    ``minter`` (PER-336, set by ``build_components``) backs some extension refs with a
+    per-call value instead (see ``lease``)."""
 
     def __init__(
         self,
@@ -249,10 +284,16 @@ class SecretStore:
         *,
         timeout_s: float = TIMEOUT_S,
         service: str = SERVICE,
+        minter: SecretMinter | None = None,
     ) -> None:
         self.runner: SecurityRunner = runner if runner is not None else SubprocessSecurity()
         self.timeout_s = timeout_s
         self.service = validate_service(service)
+        self.minter = minter
+
+    def minted(self, ref: str) -> bool:
+        """Whether ``ref`` is minted per call (PER-336) rather than read from the Keychain."""
+        return self.minter is not None and self.minter.mints(ref)
 
     async def _run(self, ref: str, argv: list[str], stdin: bytes | None = None) -> SecurityResult:
         try:
@@ -324,11 +365,42 @@ class SecretStore:
 
     async def env_for(self, ext: str, names: Iterable[str]) -> dict[str, str]:
         """``{RESONANT_SECRET_<NAME>: value}`` for one tool's declared secrets. Raises on the
-        first missing or unavailable one, so a tool never runs with part of its secrets."""
+        first missing or unavailable one, so a tool never runs with part of its secrets. A
+        minted ref is refused: only ``lease`` can end one (an MCP server holds its secrets for
+        its whole life, so it can't use one)."""
         env: dict[str, str] = {}
         for name in names:
-            env[env_name(name)] = await self.get(secret_ref(ext, name))
+            ref = secret_ref(ext, name)
+            if self.minted(ref):
+                raise SecretUnavailable(
+                    ref, "unavailable: it is minted per call, which a long-running server can't use"
+                )
+            env[env_name(name)] = await self.get(ref)
         return env
+
+    @contextlib.asynccontextmanager
+    async def lease(
+        self, ext: str, names: Iterable[str], scope: MintScope | None = None
+    ) -> AsyncGenerator[dict[str, str]]:
+        """``env_for`` for one call, where a minted ref (PER-336) gets a fresh value scoped by
+        ``scope`` that is released when the block exits, however it exits. Raises (before
+        the block) on the first secret that can't be had; any already minted is released."""
+        env: dict[str, str] = {}
+        minted: list[str] = []
+        try:
+            for name in names:
+                ref = secret_ref(ext, name)
+                if self.minter is not None and self.minter.mints(ref):
+                    value = await self.minter.mint(ref, scope or MintScope())
+                    minted.append(value)
+                    env[env_name(name)] = value
+                else:
+                    env[env_name(name)] = await self.get(ref)
+            yield env
+        finally:
+            if self.minter is not None:
+                for value in minted:
+                    await self.minter.release(value)
 
 
 def parse_mdat(attributes: str) -> datetime | None:
@@ -348,6 +420,19 @@ def mdat_line(at: datetime) -> str:
     stamp = at.astimezone(UTC).strftime("%Y%m%d%H%M%S") + "Z"
     raw = (stamp + "\0").encode().hex().upper()
     return f'    "mdat"<timedate>=0x{raw}  "{stamp}\\000"'
+
+
+def mint_scope(app: AppToken | None, args: Mapping[str, object]) -> MintScope:
+    """One call's ``MintScope`` from its spec's ``github_app`` and its args (None: the read-only
+    default for every repo the source sees). A repo arg the call didn't set as a string scopes
+    to ``""``, which the minter refuses rather than widen the token."""
+    if app is None:
+        return MintScope()
+    repo: str | None = None
+    if app.repo is not None:
+        value = args.get(app.repo)
+        repo = value if isinstance(value, str) else ""
+    return MintScope(repo, {str(k): str(v) for k, v in app.permissions.items()})
 
 
 def values_of(env: Mapping[str, str]) -> list[str]:

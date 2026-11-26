@@ -1,7 +1,9 @@
-# github: your pull requests' CI and reviews, plus two approved writes (rerun, merge).
-# Stdlib Python plus the gh CLI. The token (resonant secret set github/token) reaches this extension on
-# fd 4 and gh through a private 0600 hosts.yml in a GH_CONFIG_DIR; it is never in any env or
-# argv. A read-only token is fine: the writes then fail cleanly.
+# github: pull requests' CI, reviews and diffs, plus three approved writes (rerun, merge, comment).
+# Stdlib Python plus the gh CLI. The token (resonant secret set github/token, or minted per call by
+# the instance's GitHub App: extensions.secret_sources, PER-336) reaches this extension on fd 4 and
+# gh through a private 0600 hosts.yml in a GH_CONFIG_DIR; it is never in any env or argv. A
+# read-only token is fine: the writes then fail cleanly. Each tool's github_app block is the reach
+# of an App-minted token (one repo, these permissions); a Keychain token ignores it.
 name: github
 version: 1
 description: Your GitHub pull requests; open PRs, CI failures and fixes, review requests.
@@ -28,8 +30,24 @@ tools:
     secrets: [token]
     timeout_s: 60
   pr:
-    description: One pull request with its checks.
+    description: One pull request (any author, any repo the token sees) with its checks.
     run: python3 cli.py pr --repo {repo} --number {number}
+    effect: read
+    args: {repo: string, number: integer}
+    secrets: [token]
+    timeout_s: 60
+  pr_diff:
+    description: A pull request's changed files with their patches (clipped), for reviewing it.
+    run: python3 cli.py pr_diff --repo {repo} --number {number}
+    effect: read
+    args: {repo: string, number: integer}
+    secrets: [token]
+    timeout_s: 60
+  pr_comments:
+    description: >-
+      A pull request's reviews (who approved or asked for changes), inline review comments and
+      conversation comments, newest last.
+    run: python3 cli.py pr_comments --repo {repo} --number {number}
     effect: read
     args: {repo: string, number: integer}
     secrets: [token]
@@ -42,6 +60,7 @@ tools:
     approval_summary: "re-run the failed CI on PR #{number} in {repo}"
     args: {repo: string, number: integer}
     secrets: [token]
+    github_app: {repo: repo, permissions: {actions: write, contents: read, pull_requests: read}}
     timeout_s: 120
   merge_pr:
     description: >-
@@ -54,7 +73,21 @@ tools:
     approval_summary: "merge PR #{number} in {repo}{~head_sha}"  # OK to merge PR #121 in …?
     args: {repo: string, number: integer, head_sha: string}
     secrets: [token]
+    github_app:
+      repo: repo
+      permissions: {contents: write, pull_requests: write, checks: read, statuses: read}
     timeout_s: 120
+  comment_pr:
+    description: Post a comment on a pull request's conversation (any repo the token can write to).
+    run: python3 cli.py comment_pr --repo {repo} --number {number} --body={body}
+    effect: write
+    level: L3                          # a comment is visible but small: act, then report
+    approval_summary: "comment on PR #{number} in {repo}"
+    approval_detail: body
+    args: {repo: string, number: integer, body: string}
+    secrets: [token]
+    github_app: {repo: repo, permissions: {pull_requests: write}}
+    timeout_s: 60
 
 jobs:
   # stateless: the events table's dedupe key is the memory. Its events (CI, reviews, PR
