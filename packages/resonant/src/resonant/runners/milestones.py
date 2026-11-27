@@ -19,7 +19,9 @@ for a create, no error for a merge or a deploy, a failing check for CI, ``CHANGE
 for a review. Nothing from the result reaches a line but a PR number and a ``github.com``
 pull link matched by a strict pattern; the rest of each line is fixed text.
 
-Each kind is said at most once per run (``deployed`` once per target). The record lives in
+Each kind is said at most once per run (``deployed`` once per target). A ``merged`` with
+nothing after it waits (:func:`held`): the run's end text says the merge, so a worker that
+merges and ends closes the run once, not twice (PER-325). The record lives in
 ``kv`` (``run.milestones:<code>``) and every send carries PER-319's dedupe key
 (``status:<task>:milestone:<kind>``), so a restart or a retried send never repeats one.
 Quiet runs stay quiet: nothing is posted before the session has worked ``QUIET_S`` (a
@@ -132,13 +134,22 @@ def _env(text: str) -> str | None:
     return None
 
 
+def _auto_flag(arg: str) -> bool:
+    """``--auto`` / ``--disable-auto``, also spelled ``--auto=true`` (PER-325); never
+    ``--auto=false``, which is a plain merge."""
+    name, eq, value = arg.partition("=")
+    if name not in ("--auto", "--disable-auto"):
+        return False
+    return not eq or value.strip().lower() not in ("false", "0", "f")
+
+
 def _classify_gh(argv: Sequence[str]) -> _Open | None:
     words = _gh_words(argv)
     group, sub = [*words, "", ""][:2]
     if group == "pr" and sub == "create":
         return _Open("pr_create")
     if group == "pr" and sub == "merge":
-        if any(x in ("--auto", "--disable-auto") for x in argv):
+        if any(_auto_flag(x) for x in argv):
             return None  # queues (or unqueues) a merge: nothing merged yet
         return _Open("pr_merge", _pr_of(words[2:]))
     if (group == "pr" and sub == "checks") or (group == "run" and sub in ("watch", "view")):
@@ -333,6 +344,17 @@ def pending(conn: sqlite3.Connection, code: str) -> list[tuple[str, Milestone]]:
         m = _from(row)
         if m is not None and row.get("state") == "new":
             out.append((key, m))
+    return out
+
+
+def held(todo: Sequence[tuple[str, Milestone]]) -> list[tuple[str, Milestone]]:
+    """PER-325: what to post of ``todo`` now: a ``merged`` last waits. A worker that merged
+    its own PR usually ends right after, and the run's end text says the merge: posting it too
+    would close the run twice. It goes out with the next milestone (more work came after it),
+    or, when the run ends other than ``done``, before the end text."""
+    out = list(todo)
+    if out and out[-1][1].kind == "merged":
+        out.pop()
     return out
 
 

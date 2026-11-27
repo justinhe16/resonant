@@ -49,6 +49,7 @@ class FakeRunner:
         self.conn = conn
         self.missing = missing
         self.calls: list[tuple[Any, ...]] = []
+        self.cancelled_by: str | None = None
         self.unattended: list[bool] = []
         self.reports: list[str] = []
         self.announced: list[bool] = []
@@ -85,8 +86,11 @@ class FakeRunner:
     def get_run(self, code: str) -> runs_store.Run | None:
         return runs_store.get(self.conn, code)
 
-    async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused:
+    async def cancel_run(
+        self, code: str, *, reason: str = "cancelled", by: str | None = None
+    ) -> Cancelled | Refused:
         self.calls.append(("cancel", code))
+        self.cancelled_by = by
         return Cancelled(code) if self.get_run(code) else Refused(f"No run {code}.")
 
     async def merge_run(
@@ -525,6 +529,7 @@ async def test_cancel_run(
         "code": "R1",
         "text": "R1 cancelled.",
     }
+    assert runner.cancelled_by is None  # no asking task: who cancelled isn't known
     out = await call(components, "cancel_run", {"code": "R7"})
     assert out["cancelled"] is False and out["text"] == "No run R7."
     with pytest.raises(ToolFailed):

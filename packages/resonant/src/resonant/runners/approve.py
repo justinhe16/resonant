@@ -8,8 +8,9 @@ system text the brains see, PER-268):
   ``approval.unreachable``. The others still get the prompt.
 - Any other ``ChannelError`` is transient: the rest are still tried. PER-319: when at least
   one copy was delivered, each such failure is audited ``approval.send_failed`` (approver,
-  error) and skipped (``PromptResult.failed``): one approver's bad DM (Slack's Messages tab
-  off) doesn't fail the ask, which waits for an answer from those who got it. Only when no
+  error; PER-325: once per approval and approver, not again on each re-prompt) and skipped
+  (``PromptResult.failed``): one approver's bad DM (Slack's Messages tab off) doesn't fail
+  the ask, which waits for an answer from those who got it. Only when no
   copy was delivered does the result carry the first such error so the caller can retry
   (and, once the retries are spent, the asking conversation hears ``Couldn't finish that:
   …``, ``runners.status``). Re-prompting is idempotent, because the channel dedupes by
@@ -325,7 +326,10 @@ class _Sent:
             return PromptResult(tuple(self.reached), tuple(self.unreachable), self.error,
                                 here=here)  # fmt: skip
         with transaction(self.conn):
+            told = self._told_failed()
             for approver, e in self.failed.items():
+                if approver in told:
+                    continue  # PER-325: once per approval and approver, not per re-prompt
                 audit(
                     self.conn,
                     "approval.send_failed",
@@ -337,6 +341,19 @@ class _Sent:
                 )
         return PromptResult(tuple(self.reached), tuple(self.unreachable), None,
                             failed=tuple(self.failed), here=here)  # fmt: skip
+
+    def _told_failed(self) -> set[str]:
+        """The approvers whose failed send of this prompt is audited already (PER-325). Looked
+        up by the task (``audit_task`` index); an approval with no task isn't deduped."""
+        if self.task_id is None:
+            return set()
+        rows = self.conn.execute(
+            "SELECT json_extract(detail, '$.approver') FROM audit_log WHERE task_id = ? "
+            "AND action = 'approval.send_failed' "
+            "AND json_extract(detail, '$.approval_id') = ?",
+            (self.task_id, self.prompt.approval_id),
+        ).fetchall()
+        return {str(r[0]) for r in rows if r[0] is not None}
 
     async def send(
         self,

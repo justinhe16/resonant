@@ -301,6 +301,9 @@ REMOTE_KV = "runner.remote_control"  # the latest Remote Control answer: {state,
 STEP_SLACK_S = 600.0  # prepare, the PR lookup and publish on top of the session limit
 SAVE_EVERY_S = 30.0
 KILL_REASON = "stopped by /kill"
+# PER-325: a run's start line is said within this long of its start or not at all: a later
+# step (a run that waited days) is past what the channel's 7-day send dedupe remembers.
+START_STALE = timedelta(days=1)
 CHECK_CACHE = "sandbox-check.json"
 TOOL_NAMES = ("claude", "uv")
 MAX_FIX_ATTEMPTS = 3  # CI fixes the session may push after the first push
@@ -783,7 +786,14 @@ def end_parts(
         case "failed":
             return f"{who} failed: {run.failure or 'unknown error'}", [], []
         case "cancelled":
-            head = f"{who} was cancelled."
+            # PER-325: who cancelled, when a person did; the requester's own cancel is theirs
+            by = status.cancelled_by(run.failure)
+            if by is not None and by == run.requester:
+                head = f"{who} stopped, as you asked."
+            elif by is not None and ":" not in by:
+                head = f"{who} was cancelled by {status.display(by)}."
+            else:
+                head = f"{who} was cancelled."
             if run.pr_url:
                 head += f" Its PR was already open: {run.pr_url}"
             return head, [], []
@@ -1165,11 +1175,14 @@ class ClaudeRunner:
 
         PER-323: ``milestones_mode`` (``runs.milestones``) posts a run's milestones in its
         conversation (``thread``) or records them only (``off``); nothing is posted before
-        the session has worked ``milestone_quiet_s``."""
+        the session has worked ``milestone_quiet_s``. PER-325: nor its start line: a run that
+        ends sooner says it once, in its end text."""
         self.conn = conn
         self.milestones_mode: milestones.Mode = milestones_mode
         self.milestone_quiet_s = milestone_quiet_s
         self._loud: set[str] = set()  # codes past the quiet window: milestones post at once
+        # PER-325: runs whose start line waits for the quiet window (dropped if they end first)
+        self._unannounced: dict[str, Task] = {}
         self._milestone_locks: dict[str, asyncio.Lock] = {}
         self._pushes: dict[str, PushWatch] = {}  # PER-355: each run's own git pushes
         self.api_port = api_port
@@ -1963,8 +1976,13 @@ class ClaudeRunner:
             "remote_url": run.remote_url if run.status == "running" else None,
         }
 
-    async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused:
-        """End an active run: its processes, its dir, its task. Never publishes."""
+    async def cancel_run(
+        self, code: str, *, reason: str = "cancelled", by: str | None = None
+    ) -> Cancelled | Refused:
+        """End an active run: its processes, its dir, its task. Never publishes. ``by``
+        (PER-325): who cancelled it (the reason becomes ``cancelled by <by>``)."""
+        if by is not None:
+            reason = status.cancelled_reason(by)
         run = runs.get(self.conn, code)
         if run is None:
             return Refused(f"No run {code}.")
@@ -2525,9 +2543,24 @@ class ClaudeRunner:
                     return
                 if self._paused():
                     return
-                todo = milestones.pending(self.conn, code)
+                # PER-325: a ``merged`` with nothing after it waits: the end text says it
+                todo = milestones.held(milestones.pending(self.conn, code))
             except Exception:
                 log.exception("milestones not read", extra={"run": code})
+                return
+            await self._send_milestones(run, todo)
+
+    async def _send_milestones(
+        self, run: Run, todo: Sequence[tuple[str, milestones.Milestone]]
+    ) -> None:
+        """Post ``todo`` in order, each once (``status:<task>:milestone:<kind>``); a failed
+        send stops there and stays pending. Only in ``thread`` mode, unpaused, with a task.
+        Never raises."""
+        code = run.code
+        if self.milestones_mode != "thread" or run.task_id is None or not todo:
+            return
+        try:
+            if self._paused():
                 return
             for key, m in todo:
                 suffix = milestones.dedupe_suffix(key)
@@ -2545,13 +2578,24 @@ class ClaudeRunner:
                     return
                 with contextlib.suppress(Exception):
                     milestones.mark(self.conn, code, key, "posted")
+        except Exception:
+            log.exception("milestones not posted", extra={"run": code})
 
     async def _end_milestones(self, code: str) -> None:
         """The run ended: milestones not posted yet are the final result's to say. A post in
-        flight finishes first, so the final result always comes after the lines."""
+        flight finishes first, so the final result always comes after the lines. PER-325: a
+        start line still waiting for the quiet window is dropped (the end text says it), and
+        a held ``merged`` is posted first unless the run is ``done`` (whose end text says the
+        merge: one closing message, not two)."""
+        loud = code in self._loud
         self._loud.discard(code)
+        self._unannounced.pop(code, None)
         async with self._milestone_locks.setdefault(code, asyncio.Lock()):
             try:
+                run = runs.get(self.conn, code)
+                if loud and run is not None and run.status != "done":
+                    todo = milestones.pending(self.conn, code)
+                    await self._send_milestones(run, [t for t in todo if t[1].kind == "merged"])
                 milestones.fold(self.conn, code)
             except Exception:
                 log.exception("milestones not folded", extra={"run": code})
@@ -2585,10 +2629,9 @@ class ClaudeRunner:
         self._working.add(run.code)  # nothing awaited since the check
         try:
             if task.checkpoint.get("announce") is True:
-                if self._brain_words():  # PER-341: the worker needn't wait on the wording
-                    self._announce_soon(task, run)
-                else:
-                    await self._announce(task, run)
+                # PER-325: said once the session has worked the quiet window (``_quiet_over``);
+                # a run that ends sooner has only its end text
+                self._unannounced[run.code] = task
             return await self._drive(task, run, ctx)
         except asyncio.CancelledError:
             await self._on_cancelled(run.code)
@@ -2596,14 +2639,27 @@ class ClaudeRunner:
         finally:
             self._working.discard(run.code)
 
+    def _quiet_over(self, code: str) -> None:
+        """PER-323/325: run ``code``'s session has worked the quiet window: its start line (if
+        it has one waiting) goes out now, then its milestones (which wait for the line)."""
+        self._loud.add(code)
+        task = self._unannounced.pop(code, None)
+        run = runs.get(self.conn, code) if task is not None else None
+        if task is not None and run is not None:
+            self._announce_soon(task, run)
+        self._spawn(self._post_milestones(code))
+
     async def _announce(self, task: Task, run: Run) -> None:
         """PER-319: ``On it: starting R5 (…).`` in the run's thread, once per task (the
         channel dedupes ``status:<task>:started``, so a retry or restart never repeats it).
-        A run with no thread (iMessage) stays as quiet as before."""
+        A run with no thread (iMessage) stays as quiet as before. PER-325: never for a run
+        that started over ``START_STALE`` ago (a later step, past what the dedupe remembers)."""
         if run_thread(self.conn, run) is None:
             return
         n = continuations(task.checkpoint)
         why = task.checkpoint.get("limit_words")
+        if not n and run.started_at is not None and (self.clock() - run.started_at >= START_STALE):
+            return
         if n and isinstance(why, str):  # PER-344: ``Continuing R5 (…): it was stopped by …``
             text = status.continue_line(run.code, run.ask, why)
             if self._brain_words():
@@ -2672,7 +2728,11 @@ class ClaudeRunner:
         if run.task_id is None or run_thread(self.conn, run) is None:
             return
         if run.status == "cancelled":
-            why = f"{run.code} was cancelled"
+            by = status.cancelled_by(run.failure)
+            if by is not None and by == run.requester:
+                return  # PER-325: they stopped it themselves, and their cancel was answered
+            who = status.display(by) if by is not None and ":" not in by else None
+            why = f"{who} cancelled {run.code}" if who else f"{run.code} was cancelled"
         else:
             why = f"{run.code} failed ({status.plain_reason(run.failure)})"
         text = status.failed_line(why)
@@ -3423,8 +3483,7 @@ class ClaudeRunner:
                     bucket = _bucket(used)
                     self._pulse_open(self._must_get(run.code), bucket)
                 if used >= self.milestone_quiet_s and run.code not in self._loud:
-                    self._loud.add(run.code)  # PER-323: past the quiet window
-                    self._spawn(self._post_milestones(run.code))
+                    self._quiet_over(run.code)  # PER-323: past the quiet window
         finally:
             # Also on cancellation: nothing of the session may outlive the step. The socket
             # goes first, so no CLI call still in flight texts anyone after a stop.

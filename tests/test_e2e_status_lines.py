@@ -235,6 +235,7 @@ async def test_a_run_the_brain_started_says_so_once(
 ) -> None:
     async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
         assert d.stack is not None and d.stack.claude is not None
+        d.stack.claude.milestone_quiet_s = 0  # PER-325: the line waits for the quiet window
         ref = {"channel": "slack", "thread": CHANNEL_THREAD, "ref": "slack-in:9",
                "principal": "lead"}  # fmt: skip
         started = await d.stack.claude.start_run(REPO, "fix the typo in the README", "lead",
@@ -246,6 +247,24 @@ async def test_a_run_the_brain_started_says_so_once(
             "On it: starting R1 (fix the typo in the README)."
         ]
         assert not in_thread(fake, CHANNEL_THREAD, "Couldn't")
+
+
+async def test_a_run_shorter_than_the_quiet_window_has_only_its_end_text(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-325: the start line waits for the quiet window, so a quick run says it once, in
+    its end text."""
+    async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
+        assert d.stack is not None and d.stack.claude is not None
+        assert d.stack.claude.milestone_quiet_s >= 60
+        ref = {"channel": "slack", "thread": CHANNEL_THREAD, "ref": "slack-in:9",
+               "principal": "lead"}  # fmt: skip
+        started = await d.stack.claude.start_run(REPO, "fix the typo in the README", "lead",
+                                                 report="now", channel_ref=ref,
+                                                 announce=True)  # fmt: skip
+        assert getattr(started, "code", None) == "R1", started
+        await until(lambda: any("opened PR #41" in m.text for m in fake.sent), 60, "the end")
+        assert in_thread(fake, CHANNEL_THREAD, "On it") == []
 
 
 async def test_a_failed_run_says_so_in_its_thread_once(

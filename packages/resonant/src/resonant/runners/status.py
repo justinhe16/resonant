@@ -113,6 +113,21 @@ def moved_line(code: str) -> str:
     return f"{code} continued in another thread."
 
 
+CANCELLED_BY = "cancelled by "  # PER-325: a run's failure when a person cancelled it
+
+
+def cancelled_reason(by: str | None) -> str:
+    """The cancelled run's stored reason: ``cancelled by <principal>``, else ``cancelled``."""
+    return f"{CANCELLED_BY}{by}" if by else "cancelled"
+
+
+def cancelled_by(failure: str | None) -> str | None:
+    """Who cancelled a run (its ``cancelled_reason``), or None when that isn't known."""
+    if failure is None or not failure.startswith(CANCELLED_BY):
+        return None
+    return failure[len(CANCELLED_BY) :].strip() or None
+
+
 def names_text(names: Sequence[str]) -> str:
     """``A``, ``A or B``, ``A, B or C``; ``an approver`` for none."""
     if not names:

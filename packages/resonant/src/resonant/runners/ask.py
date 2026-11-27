@@ -1740,8 +1740,8 @@ class AskRunner:
             said = self._fallback(cp)
             # Claude didn't carry on: the code-built text of what was decided (it has the
             # report lines) instead, then what this turn ran
-            if status == "usage_limit" and said is not None:
-                fed = [said]
+            if status in ("usage_limit", "killed") and said is not None:
+                fed = [said]  # PER-325: a /kill's reply stays ``Stopped: …``, what ran under it
             elif status != "answered" and said is not None:
                 fed, text = [], said
             reports = [*fed, *reports]

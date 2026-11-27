@@ -216,7 +216,7 @@ def test_migration_035_adds_secret_expiry_on_a_v34_db(tmp_path: Path) -> None:
     every = _migrations()
     assert migrate(raw, [m for m in every if m[0] <= 34]) == 34
     raw.execute("INSERT INTO kv (key, value, updated_at) VALUES ('k', '1', 'x')")
-    assert migrate(raw, every) == 38
+    assert migrate(raw, every) == 39
     cols = [r["name"] for r in raw.execute("PRAGMA table_info(secret_expiry)")]
     assert cols == ["ref", "expires_at", "source", "set_at", "note"]  # no value column, ever
     raw.execute("INSERT INTO secret_expiry VALUES ('a/b', 'x', 'owner', 'x', NULL)")
@@ -245,7 +245,7 @@ def test_migration_036_keeps_a_reports_state(tmp_path: Path) -> None:
         " expires_at) VALUES ('a', 'k', 't', 'low', 'f', 0, '2026-11-22T00:00:00+00:00',"
         " '2026-11-24T00:00:00+00:00')"
     )
-    assert migrate(raw, every) == 38
+    assert migrate(raw, every) == 39
     old = pulse_store.get(raw, "a", "k")
     assert old is not None and old.state is None
     now = datetime(2026, 11, 23, tzinfo=UTC)

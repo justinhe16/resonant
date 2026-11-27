@@ -1528,6 +1528,15 @@ async def test_cancel_before_the_run_starts(h: Harness) -> None:
     assert h.chan.texts() == ["R1 (fix the flaky test) was cancelled."]
     assert not (h.tmp(code)).exists()
     assert isinstance(await h.runner.cancel_run(code), Refused)  # twice
+
+
+async def test_cancel_remembers_who_cancelled(h: Harness) -> None:
+    """PER-325: ``by`` is kept as the reason, so the run's end says it in their words."""
+    code = await h.start()
+    assert isinstance(await h.runner.cancel_run(code, by="owner"), claude_mod.Cancelled)
+    assert h.run(code).failure == "cancelled by owner"
+    await h.drain()
+    assert h.chan.texts() == ["R1 (fix the flaky test) stopped, as you asked."]
     assert isinstance(await h.runner.cancel_run("R99"), Refused)
 
 
@@ -1938,6 +1947,15 @@ def test_reply_texts() -> None:
     assert reply_text(replace(base, status="cancelled", pr_url=None)) == f"{who} was cancelled."
     assert reply_text(replace(base, ask="")) is not None
     assert reply_text(replace(base, ask="", status="cancelled", pr_url=None)) == "R3 was cancelled."
+    # PER-325: who cancelled it. The requester's own cancel is theirs; someone else is named
+    mine = replace(base, status="cancelled", pr_url=None, failure="cancelled by owner")
+    assert reply_text(mine) == f"{who} stopped, as you asked."
+    asked = replace(mine, requested_by="alice", failure="cancelled by alice")
+    assert reply_text(asked) == f"{who} stopped, as you asked."
+    other = replace(asked, failure="cancelled by owner")
+    assert reply_text(other) == f"{who} was cancelled by Owner."
+    unlisted = replace(asked, failure="cancelled by slack:U123")
+    assert reply_text(unlisted) == f"{who} was cancelled."
     assert reply_text(replace(base, status="running")) is None
     long = claude_mod.run_name(
         replace(base, ask="Review PR #121 (branch resonant/r1-robot) and merge")
