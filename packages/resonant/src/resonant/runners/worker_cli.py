@@ -431,7 +431,10 @@ def main():
     if args.cmd is None:
         p.print_help()
         return 2
-    if args.cmd == "ask" and args.done:
+    if args.cmd == "ask" and args.done and args.question:
+        print("Usage error: resonant ask --done takes no question.")
+        return 2
+    elif args.cmd == "ask" and args.done:
         req = {"cmd": "ask_done"}
     elif args.cmd == "ask" and not args.question:
         print("Usage error: resonant ask \"<question>\" (or resonant ask --done).")

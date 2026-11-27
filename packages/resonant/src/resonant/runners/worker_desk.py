@@ -509,12 +509,12 @@ class WorkerDesk:
         now = self.clock()
         closed = 0
         for q in qs.open_for_run(self.conn, run.code, "ask"):
-            if not qs.answer(self.conn, q.id, ANSWERED_IN_APP, at=now):
-                continue  # a texted answer won the race: that one is delivered as usual
-            qs.mark_delivered(self.conn, q.id, at=now)
-            closed += 1
             with atomic(self.conn):
+                if not qs.answer(self.conn, q.id, ANSWERED_IN_APP, at=now):
+                    continue  # a texted answer won the race: that one is delivered as usual
+                qs.mark_delivered(self.conn, q.id, at=now)
                 audit(self.conn, "run.ask_done", run=run.code, question_id=q.id)
+            closed += 1
             self._pulse_question_done(run.code, q.id)
             if (ev := self._waiters.pop(q.id, None)) is not None:
                 ev.set()

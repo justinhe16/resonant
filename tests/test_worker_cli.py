@@ -414,6 +414,8 @@ async def test_the_shims_ask_done_sends_ask_done(tmp_path: Path) -> None:
 
     bare = await asyncio.to_thread(run, "ask")
     assert bare.returncode == 2 and "ask --done" in bare.stdout
+    both = await asyncio.to_thread(run, "ask", "Which DB?", "--done")
+    assert both.returncode == 2 and "takes no question" in both.stdout
     seen: list[Request] = []
 
     async def handle(req: Request, gone: asyncio.Future[None]) -> Reply:
