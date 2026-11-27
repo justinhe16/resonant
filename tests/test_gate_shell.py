@@ -500,12 +500,10 @@ CLOSE = "gh pr close 161 --repo o/web --comment 'Closing as  a duplicate.'"
         # the brain dropped (or added) the leading cd: the same command in the same dir
         (bash(f"cd /code && {CLOSE}", "/ask"), bash(CLOSE, "/code")),
         (bash(CLOSE, "/code"), bash(f"cd /code&&{CLOSE}", "/elsewhere")),
-        (bash(f"cd /a && cd /code && {CLOSE}", "/ask"), bash(f"cd /code && {CLOSE}", "/b")),
-        # unquoted blanks
-        (bash(f"cd /code && {CLOSE}", "/ask"),
-         bash(f"  cd /code  &&  {CLOSE.replace(' ', '  ', 3)} ", "/x")),
-        (bash("git push -q origin main 2>&1 | tail -1", "/r"),
-         bash("git push -q origin main 2>&1 |  tail -1", "/r")),
+        # leading and trailing blanks; blanks between plain words
+        (bash(f"cd /code && {CLOSE}", "/ask"), bash(f"  cd /code  &&  {CLOSE} ", "/x")),
+        (bash("cd /r && git push -q origin main", "/ask"),
+         bash("git  push\t-q origin   main", "/r")),
         # a file tool's absolute path doesn't depend on the shell's dir
         ({"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d1"},
          {"tool": "Edit", "command": "/r/a.py", "cwd": "/y", "digest": "d1"}),
@@ -537,6 +535,17 @@ def test_a_grant_matches_the_same_action_however_its_reissued(
         (bash("cd $HOME/code && make", "/ask"), bash("make", "/Users/u/code")),
         (bash("cd code && make", "/ask"), bash("make", "/ask/code")),
         (bash("cd '/code' && make", "/ask"), bash("make", "/code")),
+        # blanks only collapse in plain words: never in quotes, heredocs or substitutions
+        (bash(CLOSE.replace("as  a", "as a"), "/code"), bash(CLOSE.replace("  a", "\ta"), "/code")),
+        (bash("cat > f.py <<EOF\nif x:\n    y\nEOF", "/r"),
+         bash("cat > f.py <<EOF\nif x:\n y\nEOF", "/r")),
+        (bash('echo "$(echo "a  b")"', "/r"), bash('echo "$(echo "a b")"', "/r")),
+        (bash("echo $'a\\'b  c'", "/r"), bash("echo $'a\\'b c'", "/r")),
+        # a quote in a comment can't hide a later line from the hop check
+        (bash("cd /x && true # don't\nrm y # '", "/ask"), bash("true # don't\nrm y # '", "/x")),
+        # cd's own side effects: OLDPWD, cd -
+        (bash("cd /r && cd -", "/ask"), bash("cd -", "/r")),
+        (bash("cd /r && echo $OLDPWD", "/ask"), bash("echo $OLDPWD", "/r")),
         ({"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d1"},
          {"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d2"}),
     ],

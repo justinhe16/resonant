@@ -1049,73 +1049,52 @@ def _brief(raw: Mapping[str, Any]) -> str:
 
 # A leading ``cd <dir> &&`` whose dir is a plain absolute path (no quotes, variables, globs,
 # ``~``, option or CDPATH lookup), so where the rest runs needs no shell to tell.
-_LEAD_CD = re.compile(r"[ \t]*cd[ \t]+(/[^\s'\"$`\\~;&|<>(){}*?\[\]!#]*)[ \t]*&&(?!&)\s*")
+_LEAD_CD = re.compile(r"[ \t]*cd[ \t]+(/[^\s'\"$`\\~;&|<>(){}*?\[\]!#]*)[ \t]*&&(?!&)[ \t]*")
+# What the rest after a dropped hop may not hold anywhere, quoted or not (no quote parsing to
+# get wrong): something that runs even when the cd failed (``;``, ``|``, ``&``, a new line),
+# an expansion or escape that could tell where it started (``$OLDPWD``, ``$(...)``, a
+# backtick, ``\``), a redirect or heredoc, or another ``cd`` (``cd -``).
+_HOP_UNSAFE = re.compile(r"[;|&\n\r$`\\<>]|(^|\s)cd(\s|$)")
+# A command made only of plain words: no quotes, expansions, escapes, comments, operators or
+# new lines, so its blanks only separate words and may be collapsed.
+_PLAIN = re.compile(r"[^'\"$`\\#;&|<>()\n\r{}]*")
 
 
 def grant_form(args: Mapping[str, Any]) -> dict[str, Any]:
     """What a one-shot grant for an approved shell change matches: the action that runs, not
     the string that asked for it. Bash: the directory it runs in and the command after any
-    leading ``cd <absolute dir> &&`` hops, unquoted runs of blanks collapsed, so ``cd /r && gh
-    pr close 1`` from anywhere and ``gh pr close 1`` from ``/r`` are one action. A hop is
-    only dropped when nothing after it could run had the ``cd`` failed (no ``;``, ``||``,
-    ``&`` or new line outside quotes); otherwise the command is matched as written, from the
-    same directory. A file tool: its absolute path and the edit's digest (the shell's
-    directory doesn't change what an absolute path names)."""
+    leading ``cd <absolute dir> &&`` hops, so ``cd /r && gh pr close 1`` from anywhere and
+    ``gh pr close 1`` from ``/r`` are one action. A hop is only dropped when the rest is
+    plain enough that nothing in it could run, or differ, had the ``cd`` failed or been left
+    out (``_HOP_UNSAFE``); otherwise the command is matched as written, from the same
+    directory. Blanks are collapsed only in a command of plain words (``_PLAIN``); any
+    other is matched byte for byte, bar its leading and trailing blanks. A file tool: its
+    absolute path and the edit's digest (the shell's directory doesn't change what an
+    absolute path names)."""
     tool, command, cwd = args.get("tool"), args.get("command"), args.get("cwd")
     if tool == "Bash" and isinstance(command, str) and isinstance(cwd, str):
         where, rest = cwd, command
         while (m := _LEAD_CD.match(rest)) is not None:
-            after, loose = _blanks(rest[m.end() :])
-            if not after or loose:
+            after = rest[m.end() :]
+            if not after.strip(" \t") or _HOP_UNSAFE.search(after):
                 break
-            where, rest = os.path.normpath(m.group(1)), rest[m.end() :]
-        return {"tool": tool, "at": where, "run": _blanks(rest)[0]}
+            where, rest = os.path.normpath(m.group(1)), after
+        return {"tool": tool, "at": where, "run": _settled(rest)}
     if tool in FILE_TOOLS and isinstance(command, str) and command.startswith("/"):
         return {"tool": tool, "command": command, "digest": args.get("digest")}
     return {k: args.get(k) for k in ("tool", "command", "cwd", "digest")}
 
 
-def _blanks(text: str) -> tuple[str, bool]:
-    """``text`` with each unquoted run of spaces and tabs as one space (ends trimmed; quoted
-    text kept byte for byte), and whether it has an unquoted ``;``, ``||``, lone ``&`` or new
-    line: something that runs even when an earlier ``&&`` step failed."""
-    out: list[str] = []
-    quote: str | None = None
-    loose = blank = False
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if quote is not None:
-            step = 2 if quote == '"' and c == "\\" and i + 1 < n else 1
-            out.append(text[i : i + step])
-            if c == quote:
-                quote = None
-            i += step
-            continue
-        if c in " \t":
-            blank = True
-            i += 1
-            continue
-        if blank and out:
-            out.append(" ")
-        blank = False
-        step = 1
-        if c == "\\" and i + 1 < n:
-            step = 2
-        elif c in "'\"":
-            quote = c
-        elif c in ";\n":
-            loose = True
-        elif c == "|" and text[i + 1 : i + 2] == "|":
-            loose, step = True, 2
-        elif c == "&":
-            if text[i + 1 : i + 2] == "&":
-                step = 2
-            elif text[i - 1 : i] not in ("<", ">", "|") and text[i + 1 : i + 2] != ">":
-                loose = True  # a background job, not a redirect (``2>&1``, ``&>``, ``|&``)
-        out.append(text[i : i + step])
-        i += step
-    return "".join(out), loose
+def _settled(text: str) -> str:
+    """``text`` as a grant compares it: leading blanks dropped (they never sit in a quote);
+    trailing ones too unless a backslash could escape one; and runs of blanks as one space
+    only in a command of plain words."""
+    text = text.lstrip(" \t")
+    if "\\" not in text:
+        text = text.rstrip(" \t")
+    if _PLAIN.fullmatch(text):
+        return " ".join(text.split())
+    return text
 
 
 def git_facts(path: str) -> GitFacts | None:
