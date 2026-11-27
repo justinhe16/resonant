@@ -202,7 +202,7 @@ def _result_text(content: Any) -> str:
     return "\n".join(parts)
 
 
-def _results(message: Mapping[str, Any]) -> list[tuple[str, bool, str]]:
+def tool_results(message: Mapping[str, Any]) -> list[tuple[str, bool, str]]:
     """``(tool_use_id, is_error, text)`` of each ``tool_result`` in a ``user`` message."""
     if message.get("type") != "user":
         return []
@@ -273,7 +273,7 @@ class Tracker:
     def results(self, message: Mapping[str, Any]) -> list[Milestone]:
         """The milestones a ``user`` message's tool results show."""
         out: list[Milestone] = []
-        for tid, is_error, text in _results(message):
+        for tid, is_error, text in tool_results(message):
             call = self._open.pop(tid, None)
             if call is not None and (m := judge(call, is_error, text)) is not None:
                 out.append(m)

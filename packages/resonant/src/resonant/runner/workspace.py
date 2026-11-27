@@ -188,6 +188,7 @@ MERGE_KINDS = ("pr_merge", "merge_queue_merge")
 _FEED_KINDS = DIRECT_KINDS + MERGE_KINDS
 CLEAN_TRIES = 3  # reads of mergeStateStatus while GitHub answers UNKNOWN (PER-272)
 CLEAN_RETRY_S = 2.0
+OWN_COMMITS_MAX = 1000  # commits of a run's branch looked at for its own (PER-355)
 _PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
 WORKTREES = ".worktrees"  # <code_dir>/.worktrees/<name>/R<n>
 SCRATCH = ".scratch"  # <code_dir>/.scratch/R<n>
@@ -1302,17 +1303,50 @@ class Workspace:
         return res.returncode == 0
 
     async def local_commits(self, p: Prepared) -> int:
-        """How many commits the run's local branch has beyond its base, read in the owner's
-        checkout under the guard (a run that can't push leaves its work there)."""
+        """How many commits of the run's own its local branch has: beyond its base, read in
+        the owner's checkout under the guard (a run that can't push leaves its work there),
+        and not already on the remote. PER-355: a session that checked out a PR (``gh pr
+        checkout``, a reset to its head) has that PR's commits on its branch, and they aren't
+        its work. "On the remote" is the daemon-only mirror (every branch, as last fetched),
+        never the checkout's ``refs/remotes``, which a worker can write."""
         if p.checkout is None:
             return 0
         try:
             out = await self._in_checkout(
-                p.checkout, "rev-list", "--count", f"{p.base_sha}..refs/heads/{p.branch}"
-            )
+                p.checkout, "rev-list", f"--max-count={OWN_COMMITS_MAX}",
+                f"{p.base_sha}..refs/heads/{p.branch}",
+            )  # fmt: skip
         except GitError:
             return 0
-        return int(out.decode().strip() or 0)
+        shas = [s for s in out.decode().split() if _SHA.fullmatch(s)]
+        if not shas or not p.repo_name:
+            return len(shas)
+        return await self._not_on_remote(p.repo_name, shas)
+
+    async def _not_on_remote(self, repo_name: str, shas: Sequence[str]) -> int:
+        """How many of ``shas`` (a branch's commits, newest first) no branch in the mirror
+        has: missing from it, or there but on no branch. Fails toward counting them all."""
+        mirror_git = self._mirror_git(repo_name)
+        async with self.mirror_lock(repo_name):
+            if not (self.mirror_path(repo_name) / "HEAD").exists():
+                return len(shas)
+            try:
+                found = await mirror_git(
+                    "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                    stdin="".join(f"{s}\n" for s in shas).encode(),
+                )  # fmt: skip
+                present = [
+                    sha for sha, kind in
+                    (line.split(" ", 1) for line in found.decode().splitlines() if " " in line)
+                    if kind == "commit"
+                ]  # fmt: skip
+                if not present:
+                    return len(shas)
+                # ancestors of a present commit are present too: walk only those
+                off = await mirror_git("rev-list", "--count", *present, "--not", "--all")
+            except GitError:
+                return len(shas)
+        return len(shas) - len(present) + int(off.decode().strip() or 0)
 
     async def prepare_scratch(self, code: str) -> Prepared:
         """A run with no repo: the run dir and an empty ``<code_dir>/.scratch/<code>``."""
