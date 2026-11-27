@@ -35,6 +35,8 @@ at call time: the runner is built after the tools are registered) and return cod
   else is a refusal (``continued: false`` and the reason as ``text``). The owner and approvers
   only: a global builtin with no member grant, and the handler checks the asker again. Chosen
   by the brain, the run says ``Continuing R5 (…)`` in its thread itself (``announced``).
+  PER-351: the run moves to the calling task's thread and asker: its later updates, end and
+  merge go where it was continued, and its old thread gets one pointer.
 - ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
   the trust rules (``merge_level``, docs/employee-plan.md D4): it runs without asking when
   ``merge_decision`` is ok and the run flagged no sensitive paths, else it asks a plain yes.
@@ -131,7 +133,14 @@ class RunnerApi(Protocol):
 
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
 
-    async def continue_run(self, code: str, *, announce: bool = False) -> Continued | Refused: ...
+    async def continue_run(
+        self,
+        code: str,
+        *,
+        announce: bool = False,
+        channel_ref: dict[str, Any] | None = None,
+        requested_by: str | None = None,
+    ) -> Continued | Refused: ...
 
     async def merge_run(
         self, code: str, *, unattended: bool = False
@@ -631,7 +640,11 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         if claude is None:
             return {"continued": False, "code": code, "text": missing()}
         announce = call is not None and call.origin != "explicit"  # as start_run's (PER-319)
-        result = await claude.continue_run(code, announce=announce)
+        # PER-351: the run moves to the thread the continue was asked in, and to who asked
+        moved: dict[str, Any] = {}
+        if task is not None and task.channel_ref is not None:
+            moved = {"channel_ref": task.channel_ref, "requested_by": asker}
+        result = await claude.continue_run(code, announce=announce, **moved)
         if (reason := _refusal(result)) is not None:
             return {"continued": False, "code": code, "text": reason}
         out: dict[str, Any] = {"continued": True, "code": code,

@@ -340,6 +340,21 @@ def reopen(conn: sqlite3.Connection, code: str, *, max_seconds: int, resume_prom
     return conn.execute(sql, (max_seconds, resume_prompt, now_iso(), code)).rowcount == 1
 
 
+def move(
+    conn: sqlite3.Connection,
+    code: str,
+    *,
+    channel_ref: Mapping[str, Any] | None,
+    requested_by: str | None,
+) -> bool:
+    """PER-351: the run's texts go to a new thread, addressed to a new requester (a continued
+    run reports where it was continued). Both move together: a thread is only ever its
+    asker's (``thread_of``). ``requested_by`` None: the run's principal."""
+    ref = None if channel_ref is None else json.dumps(dict(channel_ref))
+    sql = "UPDATE runs SET channel_ref = ?, requested_by = ?, updated_at = ? WHERE code = ?"
+    return conn.execute(sql, (ref, requested_by, now_iso(), code)).rowcount == 1
+
+
 def cancel(conn: sqlite3.Connection, code: str, reason: str) -> bool:
     """queued, running or waiting -> cancelled. False if it wasn't active."""
     return finish(conn, code, "cancelled", failure=reason, step="reply")
