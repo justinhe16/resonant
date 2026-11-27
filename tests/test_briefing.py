@@ -327,6 +327,27 @@ async def test_sections_come_from_the_store_in_local_time_without_bodies() -> No
         assert "SECRET" not in text and "SECRET" not in repr(out)
 
 
+async def test_counts_are_counted_not_capped_lists() -> None:
+    """PER-264: past the old 50-row lists, the briefing still says how many."""
+    async with harness() as h:
+        now = local(10, 13, 7, 30)
+        for i in range(55):
+            remind(h.db, local(10, 13, 9) + timedelta(minutes=i), f"r{i}", now=now)
+        remind(h.db, local(10, 14, 9), "tomorrow", now=now)
+        for _ in range(53):
+            task(h.db, "running")
+        for _ in range(52):
+            task(h.db, "waiting", wait_reason="human_reply")
+        b = bf.gather(h.db, owner=OWNER, now=now, day=now.date(), tz=LA)
+        assert b.reminder_count == 55 and len(b.reminders) == bf.REMINDERS_SHOWN
+        assert (b.running, len(b.waiting), b.queued) == (53, 52, 0)
+        text = bf.render(b)
+        assert text.startswith(
+            "⏰ 55 reminders: 9:00am r0, 9:01am r1, 9:02am r2, +52 more\n"
+            "▶ 53 running, 52 waiting (human_reply)"
+        )
+
+
 async def test_github_summary_is_an_updates_item_not_a_hard_coded_line() -> None:
     async with harness() as h:
         with atomic(h.db):

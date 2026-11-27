@@ -184,6 +184,21 @@ def test_urgent_note_texts_are_capped_per_run_an_hour(db: sqlite3.Connection) ->
     assert r.note_text(run) == "R1 note: deploying"
 
 
+def test_the_note_text_cap_survives_a_restart(db: sqlite3.Connection) -> None:
+    """PER-264: the per-run cap is in kv, so a new WorkerReports (a restart) keeps it; the
+    run's end drops it."""
+    clock = [NOW]
+    run = make_run(db, last_note="deploying")
+    first = WorkerReports(db, clock=lambda: clock[0], tz=ZoneInfo("UTC"))
+    assert all(first.note_text(run) for _ in range(NOTE_TEXTS_PER_HOUR))
+    again = WorkerReports(db, clock=lambda: clock[0], tz=ZoneInfo("UTC"))
+    assert again.note_text(run) is None
+    clock[0] = NOW + timedelta(minutes=61)
+    assert again.note_text(run) == "R1 note: deploying"
+    again.forget("R1")
+    assert db.execute("SELECT 1 FROM kv WHERE key = 'run.note_texts:R1'").fetchone() is None
+
+
 # --- the run's item ------------------------------------------------------------------------------
 
 

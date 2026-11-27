@@ -410,7 +410,7 @@ BUILTIN_WRITES: dict[str, bool] = {
     # scopes name, restarts, deleting the owner's notes and reminders
     "add_ci": False, "merge_ci_pr": False, "create_repo": False, "add_repo": False,
     "forget_repo": False, "restart_resonant": False, "restart_ollama": False,
-    "delete_note": False, "cancel_reminder": False,
+    "delete_note": False, "undo_note": False, "cancel_reminder": False,
     # taint_exempt: ToolCore sends them as ``inferred`` already (PER-245)
     "add_note": False, "add_reminder": False, "remember": False, "forget": False,
 }  # fmt: skip

@@ -46,6 +46,15 @@ def _notes_cleared(d: dict[str, Any]) -> str | None:
     return f"Cleared {n} note{'' if n == 1 else 's'}."
 
 
+def _notes_restored(d: dict[str, Any]) -> str | None:
+    n = d.get("restored")
+    if not isinstance(n, int):
+        return None
+    if n == 0:
+        return "Nothing to restore: those notes were deleted again since."
+    return f"Restored {n} note{'' if n == 1 else 's'}."
+
+
 def _reminder_set(d: dict[str, Any]) -> str | None:
     n, due, text = d.get("id"), d.get("due"), d.get("text")
     if not isinstance(n, int) or not isinstance(due, str) or not isinstance(text, str):
@@ -195,6 +204,7 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "add_note": _note_saved,
     "delete_note": _note_deleted,
     "clear_notes": _notes_cleared,
+    "undo_note": _notes_restored,
     "add_reminder": _reminder_set,
     "cancel_reminder": _reminder_cancelled,
     "restart_ollama": _ollama_restarted,

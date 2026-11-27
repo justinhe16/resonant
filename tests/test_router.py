@@ -509,6 +509,7 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "/note <text>: save a note\n"
         "/notes [clear]: your notes; clear deletes them all (asks first)\n"
         "/unnote <n>: delete note n\n"
+        "/undo: bring back the notes you last deleted or cleared\n"
         "/remind <when> <text>: set a reminder: 3pm, in 20 min, tomorrow 9am, fri 5pm\n"
         "/reminders: pending reminders, soonest first\n"
         "/unremind <n>: cancel reminder n\n"
@@ -792,6 +793,7 @@ async def test_projects_end_to_end_shows_titles_not_bodies(
         ('/note "Buy\nmilk"', "/note", "add_note", {"text": "Buy\nmilk"}),
         ("/unnote 1", "/unnote", "delete_note", {"id": 1}),
         ("/notes clear", "/notes clear", "clear_notes", {}),
+        ("/undo", "/undo", "undo_note", {}),
         ("/unremind #3", "/unremind", "cancel_reminder", {"id": 3}),
         ("/restart ollama", "/restart ollama", "restart_ollama", {}),
         ("/restart resonant", "/restart resonant", "restart_resonant", {}),

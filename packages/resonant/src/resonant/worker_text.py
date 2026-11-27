@@ -59,3 +59,10 @@ def owner_question_text(
     if urgent:
         text = f"{URGENT_MARK} {text}"
     return text if len(text) <= OWNER_TEXT_MAX else text[: OWNER_TEXT_MAX - 3].rstrip() + "..."
+
+
+def question_timed_out_text(code: str, question: str, *, redactor: Redactor | None = None) -> str:
+    """PER-264: ``R4's question got no answer in time; it carries on without one: Which
+    DB?``, texted to the requester when a worker's ``resonant ask`` times out."""
+    shown = worker_text(code, question, QUESTION_SHOWN, redactor)
+    return f"{code}'s question got no answer in time; it carries on without one: {shown}"

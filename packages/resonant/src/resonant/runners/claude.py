@@ -413,7 +413,9 @@ WORKER_PROMPT = (
     '`resonant ask "<question>" [--options a,b,c] [--urgent]`: only when you are blocked on a '
     "decision only the owner can make. It waits for the answer; if it says there is no answer "
     "yet, finish what you can, then end your turn with a short summary: you'll be resumed with "
-    'the answer. `resonant note "<progress>" [--urgent]`: on meaningful progress (--urgent only '
+    "the answer. If the owner answers it here in the Claude app instead, run `resonant ask "
+    "--done` so Resonant stops waiting. "
+    '`resonant note "<progress>" [--urgent]`: on meaningful progress (--urgent only '
     "for what the owner must see now). After any side effect outside your branch and PR (a "
     "merge with gh, a deploy, a push to another repo, an email, a payment), run `resonant note "
     '"did: <what you did>"`: those go in your report to the owner. '

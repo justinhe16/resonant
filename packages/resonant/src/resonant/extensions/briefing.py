@@ -101,8 +101,8 @@ from resonant.monitor import health_snapshot
 from resonant.store import pulse as pulse_store
 from resonant.store.approvals import answerable as pending_for  # BA-1: codes that bind
 from resonant.store.db import kv_get, utcnow
-from resonant.tools.projects import clip, projects
-from resonant.tools.reminders import list_reminders
+from resonant.tools.projects import clip
+from resonant.tools.reminders import due_between
 from resonant.tools.when import clock_time
 
 if TYPE_CHECKING:
@@ -155,6 +155,9 @@ def manual_dedupe_key(local_now: datetime) -> str:
 @dataclass(frozen=True)
 class Briefing:
     reminders: tuple[tuple[str, str], ...] = ()  # (local clock time, text), soonest first
+    # PER-264: today's reminders counted in SQL; ``reminders`` may hold only the first few.
+    # None: ``reminders`` is all of them.
+    reminder_total: int | None = None
     running: int = 0
     waiting: tuple[str, ...] = ()  # one wait reason per waiting task
     queued: int = 0
@@ -164,6 +167,10 @@ class Briefing:
     workers: tuple[pulse_store.Item, ...] = ()  # running workers, and finished ones untold
     roll: rollup.Rollup = field(default_factory=rollup.Rollup)  # the Workers rollup's names
     day: date | None = None  # the local date (picks the empty briefing's line)
+
+    @property
+    def reminder_count(self) -> int:
+        return len(self.reminders) if self.reminder_total is None else self.reminder_total
 
 
 def nothing_line(day: date | None) -> str:
@@ -177,13 +184,13 @@ def _plural(n: int, word: str) -> str:
 
 
 def _reminders_line(b: Briefing) -> str | None:
-    if not b.reminders:
+    if not b.reminder_count:
         return None
     shown = [f"{t} {clip(text, REMINDER_TEXT_MAX)}" for t, text in b.reminders[:REMINDERS_SHOWN]]
-    more = len(b.reminders) - REMINDERS_SHOWN
+    more = b.reminder_count - len(shown)
     if more > 0:
         shown.append(f"+{more} more")
-    return f"⏰ {_plural(len(b.reminders), 'reminder')}: {', '.join(shown)}"
+    return f"⏰ {_plural(b.reminder_count, 'reminder')}: {', '.join(shown)}"
 
 
 def _work_line(b: Briefing) -> str | None:
@@ -279,31 +286,38 @@ def sections(b: Briefing) -> list[str]:
 
 
 def _reminders(
-    conn: sqlite3.Connection, owner: str, now: datetime, day: date, tz: ZoneInfo
-) -> tuple[tuple[str, str], ...]:
-    out: list[tuple[str, str]] = []
-    for r in list_reminders(conn, owner=owner, now=now, tz=tz.key)["reminders"]:
-        item = cast(dict[str, Any], r)
-        at = datetime.fromisoformat(str(item["at"])).astimezone(tz)
-        if at.date() == day:
-            out.append((clock_time(at), str(item["text"])))
-    return tuple(out)
+    conn: sqlite3.Connection, owner: str, day: date, tz: ZoneInfo
+) -> tuple[tuple[tuple[str, str], ...], int]:
+    """Today's reminders (local ``day``): the first ``REMINDERS_SHOWN`` and how many in all,
+    counted in SQL (PER-264: never a list capped at ``LIST_MAX``)."""
+    start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+    total, rows = due_between(conn, owner=owner, start=start, end=end, limit=REMINDERS_SHOWN)
+    return tuple((clock_time(at.astimezone(tz)), text) for at, text in rows), total
+
+
+# Open work, counted in SQL (PER-264): the ``projects`` query's rows (a malformed checkpoint
+# and fast-path reply bookkeeping are not work), reminders left out, by state and wait reason.
+_WORK_SQL = """SELECT status, wait_reason, COUNT(*) AS n FROM tasks
+    WHERE json_valid(checkpoint) AND kind <> 'reminder'
+      AND status IN ('running', 'waiting', 'queued')  -- OPEN_STATES
+      AND NOT (kind = 'reply' AND json_type(checkpoint, '$.fast_reply') IS NOT NULL
+               AND status <> 'waiting')
+    GROUP BY status, wait_reason"""
 
 
 def _work(conn: sqlite3.Connection) -> tuple[int, tuple[str, ...], int]:
-    """Open work from the ``projects`` query: states and wait reasons only."""
-    items = cast(list[dict[str, Any]], projects(conn, {"all": True})["items"])
+    """Open work: states and wait reasons only (one reason per waiting task)."""
     running = queued = 0
     waiting: list[str] = []
-    for item in items:
-        if item["kind"] == "reminder" or item["state"] not in OPEN_STATES:
-            continue
-        if item["state"] == "running":
-            running += 1
-        elif item["state"] == "waiting":
-            waiting.append(str(item["wait_reason"] or "?"))
+    for r in conn.execute(_WORK_SQL).fetchall():
+        n = int(r["n"])
+        if r["status"] == "running":
+            running += n
+        elif r["status"] == "waiting":
+            waiting += [str(r["wait_reason"] or "?")] * n
         else:
-            queued += 1
+            queued += n
     return running, tuple(waiting), queued
 
 
@@ -349,8 +363,10 @@ def gather(
     """Every section's data for local ``day``."""
     running, waiting, queued = _work(conn)
     workers = _workers(conn, now)
+    reminders, reminder_total = _reminders(conn, owner, day, tz)
     return Briefing(
-        reminders=_reminders(conn, owner, now, day, tz),
+        reminders=reminders,
+        reminder_total=reminder_total,
         running=running,
         waiting=waiting,
         queued=queued,
@@ -396,7 +412,7 @@ def briefing_facts(
     if (health := _health_line(b)) is not None:
         tail.append(health)
     tail += [item_line(i) for i in listed if not is_worker_item(i)]
-    if (more := len(b.reminders) - REMINDERS_SHOWN) > 0:
+    if (more := b.reminder_count - len(reminders)) > 0:
         tail.append(f"+{more} more reminders")
     last = text.rsplit("\n", 1)[-1]
     if _MORE.fullmatch(last):

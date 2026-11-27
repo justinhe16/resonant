@@ -12,6 +12,8 @@ checks and owner messages for running Claude workers.
   the session with the answer (or, after ``runner.ask_timeout_minutes``, with
   ``ASK_TIMEOUT``). The same question asked again while it is open (a retry after a Bash
   timeout) joins the open one; nothing is texted twice.
+- ``ask_done`` (PER-264, ``resonant ask --done``): the owner answered in the Claude app, so
+  the run's open questions close as answered and delivered, untexted.
 - ``note``: becomes the run's ``last_note`` (its pulse item) and a ``note`` event. A note
   that starts with ``did:`` also goes on the run's side-effect list (``reports.record_did``),
   which its digest lines show.
@@ -87,6 +89,7 @@ from resonant.runners.worker_cli import (
     EXIT_USAGE,
     NO_ANSWER_YET,
     Ask,
+    AskDone,
     Check,
     JobNote,
     Note,
@@ -105,7 +108,7 @@ from resonant.store.db import atomic
 from resonant.store.runs import Run
 from resonant.store.trust import ANY, slug
 from resonant.trust.checks import CHECK_TOOL, MAX_PENDING
-from resonant.worker_text import owner_question_text
+from resonant.worker_text import owner_question_text, question_timed_out_text
 
 if TYPE_CHECKING:
     from resonant.runners.worker_requests import Fulfilled
@@ -119,6 +122,7 @@ OWNER_TEXT_MAX = 600
 TWIN_S = 600.0  # an ask repeated this soon after its answer is a retry: the same answer
 NOTE_MAX = 200
 ASK_TIMEOUT = "No answer from the owner; use your judgment or stop."
+ANSWERED_IN_APP = "(answered in the Claude app)"  # PER-264: ``resonant ask --done``
 CHECK_TIMEOUT = "No decision from the owner; treat it as denied: don't do it."
 RESTARTED = (
     "Resonant restarted before the owner decided; run `resonant check` again if you still need it."
@@ -357,6 +361,7 @@ class WorkerDesk:
         # (run, system, action, irreversible, cost, what) -> (question id, the decision task)
         self._checks: dict[tuple[Any, ...], tuple[int, asyncio.Task[None]]] = {}
         self.requests = requests
+        self._sends: set[asyncio.Task[None]] = set()  # background texts (a question timed out)
         # (run, extension, tool, args) -> (question id, the request's task: its result)
         self._requests: dict[tuple[Any, ...], tuple[int, asyncio.Task[Fulfilled | None]]] = {}
 
@@ -370,6 +375,8 @@ class WorkerDesk:
         match req:
             case Ask():
                 return await self._ask(run, req, gone)
+            case AskDone():
+                return self._ask_done(run)
             case Note():
                 return await self._note(run, req)
             case Check():
@@ -493,6 +500,27 @@ class WorkerDesk:
         if current is not None and current.status == "open":
             await self._wait_for(self._waiter(q.id), gone)
         return self._ask_reply(run.code, q.id, hung_up=gone.done())
+
+    def _ask_done(self, run: Run) -> Reply:
+        """``resonant ask --done`` (PER-264): the run's open questions were answered in the
+        Claude app. Each is closed as answered (``ANSWERED_IN_APP``) and already delivered
+        (the session has the answer), its pulse item cleared silently, and a CLI call still
+        waiting on it is released. Nothing is texted."""
+        now = self.clock()
+        closed = 0
+        for q in qs.open_for_run(self.conn, run.code, "ask"):
+            if not qs.answer(self.conn, q.id, ANSWERED_IN_APP, at=now):
+                continue  # a texted answer won the race: that one is delivered as usual
+            qs.mark_delivered(self.conn, q.id, at=now)
+            closed += 1
+            with atomic(self.conn):
+                audit(self.conn, "run.ask_done", run=run.code, question_id=q.id)
+            self._pulse_question_done(run.code, q.id)
+            if (ev := self._waiters.pop(q.id, None)) is not None:
+                ev.set()
+        if not closed:
+            return Reply("No open question to close.", EXIT_OK)
+        return Reply("Closed your open question: Resonant stopped waiting for a text.", EXIT_OK)
 
     def _ask_reply(self, code: str, qid: int, *, hung_up: bool) -> Reply | None:
         q = qs.get(self.conn, qid)
@@ -949,9 +977,34 @@ class WorkerDesk:
                     audit(self.conn, "run.ask_timeout", run=code, question_id=q.id)
                 if q.kind == "ask":
                     self._pulse_question_done(code, q.id)
+                    self._tell_timed_out(code, q)
                 self._stop_check(q.id)
                 if (ev := self._waiters.pop(q.id, None)) is not None:
                     ev.set()
+
+    def _tell_timed_out(self, code: str, q: qs.Question) -> None:
+        """PER-264: text the requester that the question timed out, in the run's thread, in
+        the background (``time_out_due`` is called where nothing may be awaited). Deduped per
+        question; a failed send is logged, never raised."""
+        run = runs.get(self.conn, code)
+        if run is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        text = question_timed_out_text(code, q.question, redactor=self._redactor_for(code))
+
+        async def send() -> None:
+            try:
+                await send_run(self.channel, self.conn, run, text,
+                               dedupe_key=f"run:{code}:ask_timeout:{q.id}")  # fmt: skip
+            except ChannelError as e:
+                log.warning("question timeout not texted", extra={"run": code, "reason": str(e)})
+
+        job = loop.create_task(send())
+        self._sends.add(job)
+        job.add_done_callback(self._sends.discard)
 
     def wait_until(self, code: str) -> datetime | None:
         """When the run's earliest open question times out; None when none is open."""
@@ -1004,6 +1057,7 @@ class WorkerDesk:
     async def aclose(self) -> None:
         tasks: list[asyncio.Task[Any]] = [t for _qid, t in self._checks.values()]
         tasks += [t for _qid, t in self._requests.values()]
+        tasks += list(self._sends)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -117,9 +118,17 @@ def test_ext_validate(resonant_home: Path) -> None:
     assert ok.exit_code == 0, ok.output
     assert "get_time" in ok.output and "write_note" in ok.output and "ok" in ok.output
 
+    # PER-264: the owner is implied, so the example names no approver and validates whatever
+    # the owner's principal is called; a named approver that doesn't exist still fails
     (resonant_home / "principals.yaml").write_text("principals:\n  alice: {role: owner}\n")
-    bad = runner.invoke(app, ["ext", "validate", str(repo / "extensions/example")])
-    assert bad.exit_code == 1  # example lists approver 'owner', which doesn't exist here
+    named = runner.invoke(app, ["ext", "validate", str(repo / "extensions/example")])
+    assert named.exit_code == 0, named.output
+    ghost = resonant_home / "ghost"
+    shutil.copytree(repo / "extensions/example", ghost)
+    manifest = ghost / "resonant.yaml"
+    manifest.write_text(manifest.read_text() + "approvers: [ghost]\n")
+    bad = runner.invoke(app, ["ext", "validate", str(ghost)])
+    assert bad.exit_code == 1 and "ghost" in bad.output
 
     broken = resonant_home / "broken.yaml"
     broken.write_text("name: x\nversion: 2\n")

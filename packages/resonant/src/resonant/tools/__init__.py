@@ -8,7 +8,7 @@ from resonant_sdk import ToolSpec
 # with one of these names and no secrets. An extension tool with the same name is not
 # exempt. Ops tools are never exempt: they act on the system. A test pins this set.
 STORE_INTERNAL_TOOLS: frozenset[str] = frozenset(
-    {"add_note", "delete_note", "clear_notes", "add_reminder", "cancel_reminder"}
+    {"add_note", "delete_note", "clear_notes", "undo_note", "add_reminder", "cancel_reminder"}
 )
 
 

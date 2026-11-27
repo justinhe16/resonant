@@ -6,7 +6,6 @@ description: Example extension; tells the time in a timezone and keeps a notes f
 examples:
   - what time is it in tokyo
   - add "buy milk" to the example notes
-approvers: [owner]
 
 jobs:
   - id: morning-ping

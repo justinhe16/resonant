@@ -365,7 +365,14 @@ def test_veto_never_returned_and_every_evaluate_audited_once(
 
 
 def test_exempt_set_is_pinned() -> None:
-    pinned = {"add_note", "delete_note", "clear_notes", "add_reminder", "cancel_reminder"}
+    pinned = {
+        "add_note",
+        "delete_note",
+        "clear_notes",
+        "undo_note",
+        "add_reminder",
+        "cancel_reminder",
+    }
     assert pinned == STORE_INTERNAL_TOOLS
     for name in ("restart_ollama", "restart_resonant", "update_resonant", "list_notes"):
         assert name not in STORE_INTERNAL_TOOLS

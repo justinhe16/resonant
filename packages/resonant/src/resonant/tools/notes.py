@@ -1,4 +1,5 @@
-"""Notes: ``list_notes`` (L0), ``add_note`` (L3), ``delete_note`` (L3), ``clear_notes`` (L1).
+"""Notes: ``list_notes`` (L0), ``add_note`` (L3), ``delete_note`` (L3), ``clear_notes`` (L1),
+``undo_note`` (L3).
 
 Notes live in ``memory`` with ``scope="notes"``: the key is the note id as a decimal string
 and the value is JSON ``{text, at, deleted_at}``. Ids come from kv ``notes.seq`` and are
@@ -7,6 +8,12 @@ undo), and every read hides soft-deleted notes. No migration is needed.
 
 Replay can't duplicate a note: the executor records each call under its idempotency key
 and returns the recorded result instead of running the handler again.
+
+``undo_note`` (``/undo``, PER-264) restores the last ``delete_note`` or ``clear_notes``: each
+records what it deleted in kv ``notes.undo`` (the ids and their ``deleted_at``), and the undo
+clears ``deleted_at`` on exactly those rows (one deleted again since keeps its later delete).
+An undo leaves ``{"undone": true}`` there, so a second ``/undo`` refuses: an undo is never
+undone. With nothing recorded it refuses too.
 
 A note is at most ``TEXT_MAX`` (1000) characters after stripping.
 
@@ -22,7 +29,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
+from typing import Any, cast
 
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.types import Intent
@@ -32,6 +39,7 @@ from resonant_sdk import Effect, Level, ToolSpec
 
 SCOPE = "notes"
 SEQ_KEY = "notes.seq"
+UNDO_KEY = "notes.undo"  # {"ids": [...], "at": deleted_at, "what": "unnote"|"clear"}
 TEXT_MAX = 1000  # GT-1: was 200
 LIST_MAX = 20
 
@@ -80,7 +88,17 @@ CLEAR_NOTES = ToolSpec(
     timeout_s=5.0,
 )
 
-SPECS: tuple[ToolSpec, ...] = (LIST_NOTES, ADD_NOTE, DELETE_NOTE, CLEAR_NOTES)
+UNDO_NOTE = ToolSpec(
+    name="undo_note",
+    description="Undo the last note delete or clear (restores those notes). Not an undo.",
+    args_schema=NO_ARGS,
+    effect=Effect.WRITE,
+    level=Level.L3,
+    timeout_s=5.0,
+    approval_summary="undo the last note delete",
+)
+
+SPECS: tuple[ToolSpec, ...] = (LIST_NOTES, ADD_NOTE, DELETE_NOTE, CLEAR_NOTES, UNDO_NOTE)
 
 
 def _check_keys(name: str, args: dict[str, Any], allowed: set[str]) -> None:
@@ -156,18 +174,55 @@ def delete_note(conn: sqlite3.Connection, args: dict[str, Any]) -> dict[str, Any
             "WHERE scope = ? AND key = ?",
             (at, at, SCOPE, str(note_id)),
         )
+        kv_set(conn, UNDO_KEY, {"ids": [note_id], "at": at, "what": "unnote"})
     return {**_note(row["key"], row["value"]), "deleted_at": at}
 
 
 def clear_notes(conn: sqlite3.Connection) -> dict[str, Any]:
     at = now_iso()
     with atomic(conn):
+        ids = [
+            int(r["key"])
+            for r in conn.execute(
+                "SELECT key FROM memory "
+                "WHERE scope = ? AND json_extract(value, '$.deleted_at') IS NULL",
+                (SCOPE,),
+            ).fetchall()
+        ]
         cur = conn.execute(
             "UPDATE memory SET value = json_set(value, '$.deleted_at', ?), updated_at = ? "
             "WHERE scope = ? AND json_extract(value, '$.deleted_at') IS NULL",
             (at, at, SCOPE),
         )
+        if ids:  # clearing nothing leaves the last real delete undoable
+            kv_set(conn, UNDO_KEY, {"ids": ids, "at": at, "what": "clear"})
     return {"cleared": cur.rowcount, "deleted_at": at}
+
+
+def undo_note(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Restore what the last ``delete_note``/``clear_notes`` deleted (module docstring)."""
+    with atomic(conn):
+        raw = kv_get(conn, UNDO_KEY)
+        last = cast(dict[str, Any], raw) if isinstance(raw, dict) else None
+        if last is not None and last.get("undone") is True:
+            raise ToolFailed("undo_note: the last change was an undo; an undo can't be undone")
+        if last is None or not isinstance(last.get("at"), str):
+            raise ToolFailed("undo_note: no note delete to undo")
+        at = cast(str, last["at"])
+        ids = [i for i in cast(list[Any], last.get("ids") or []) if isinstance(i, int)]
+        now = now_iso()
+        restored: list[int] = []
+        for note_id in ids:
+            cur = conn.execute(
+                "UPDATE memory SET value = json_set(value, '$.deleted_at', json('null')), "
+                "updated_at = ? WHERE scope = ? AND key = ? "
+                "AND json_extract(value, '$.deleted_at') = ?",
+                (now, SCOPE, str(note_id), at),
+            )
+            if cur.rowcount == 1:
+                restored.append(note_id)
+        kv_set(conn, UNDO_KEY, {"undone": True})
+    return {"restored": len(restored), "ids": restored, "what": last.get("what")}
 
 
 def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
@@ -199,9 +254,14 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         no_args(CLEAR_NOTES.name, args)
         return clear_notes(conn)
 
+    async def _undo_note(args: dict[str, Any]) -> dict[str, Any]:
+        no_args(UNDO_NOTE.name, args)
+        return undo_note(conn)
+
     return {
         LIST_NOTES.name: _list_notes,
         ADD_NOTE.name: _add_note,
         DELETE_NOTE.name: _delete_note,
         CLEAR_NOTES.name: _clear_notes,
+        UNDO_NOTE.name: _undo_note,
     }

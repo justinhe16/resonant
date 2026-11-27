@@ -550,6 +550,13 @@ COMMANDS: tuple[Command, ...] = (
         "/unnote", "/unnote <n>", "delete note n", "notes", tool="delete_note", parse=unnote_args
     ),
     Command(
+        "/undo",
+        "/undo",
+        "bring back the notes you last deleted or cleared",
+        "notes",
+        tool="undo_note",
+    ),
+    Command(
         "/remind",
         "/remind <when> <text>",
         "set a reminder: 3pm, in 20 min, tomorrow 9am, fri 5pm",

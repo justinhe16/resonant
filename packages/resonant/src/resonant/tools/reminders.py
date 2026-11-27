@@ -196,6 +196,28 @@ _BY_N_SQL = """SELECT id, status, json_extract(checkpoint, '$.n') AS n,
         AND json_extract(checkpoint, '$.n') = ?"""
 
 
+_DUE_SQL = """SELECT json_extract(checkpoint, '$.text') AS text,
+           json_extract(checkpoint, '$.at') AS at, COUNT(*) OVER () AS total
+    FROM tasks WHERE kind = ? AND runner = ? AND principal = ? AND status IN ('queued', 'running')
+        AND julianday(json_extract(checkpoint, '$.at')) >= julianday(?)
+        AND julianday(json_extract(checkpoint, '$.at')) < julianday(?)
+    ORDER BY julianday(json_extract(checkpoint, '$.at')), json_extract(checkpoint, '$.n')
+    LIMIT ?"""
+
+
+def due_between(
+    conn: sqlite3.Connection, *, owner: str, start: datetime, end: datetime, limit: int
+) -> tuple[int, list[tuple[datetime, str]]]:
+    """PER-264: how many of ``owner``'s pending reminders fall in ``[start, end)`` (a COUNT,
+    never capped by ``LIST_MAX``), and the first ``limit`` of them (due time, text), soonest
+    first. ``julianday`` reads each stored ``at`` with its own UTC offset."""
+    rows = conn.execute(
+        _DUE_SQL, (KIND, RUNNER, owner, iso(start), iso(end), max(limit, 1))
+    ).fetchall()
+    total: int = rows[0]["total"] if rows else 0
+    return total, [(datetime.fromisoformat(r["at"]), str(r["text"])) for r in rows[:limit]]
+
+
 def list_reminders(
     conn: sqlite3.Connection, *, owner: str, now: datetime, tz: str
 ) -> dict[str, Any]:
