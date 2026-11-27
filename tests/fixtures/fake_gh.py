@@ -10,8 +10,8 @@ State keys: ``token``, ``user``, ``mine`` / ``review`` / ``closed`` (GraphQL sea
 (``"<repo>:<branch>"`` → ``gh run list`` rows), ``prs`` (``"<repo>#<n>"`` → ``gh pr view``),
 ``list`` (``"<repo>"`` → ``gh pr list`` rows), ``fail`` (``{"exit": n, "stderr": "..."}``) to
 fail every call, ``fail_on`` (``"pr merge"`` or ``"run rerun <id>"`` → the same shape) to fail
-one kind of call, and ``garbage`` to print non-JSON with exit 0. ``pr merge`` and ``run rerun``
-print a line of text, like gh does.
+one kind of call, and ``garbage`` to print non-JSON with exit 0. ``pr merge``, ``pr close``
+and ``run rerun`` print a line of text, like gh does.
 
 PER-336: ``api`` (``"<path>"`` → a REST reply) answers ``gh api <path>[?query]``: a list is
 paged by the query's ``per_page`` and ``page``; ``gh api <path> --method POST`` answers
@@ -42,6 +42,8 @@ def answer(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
             return int(fail_on[key]["exit"]), None, str(fail_on[key]["stderr"])
     if args[:2] == ["pr", "merge"]:
         return 0, f"✓ Squashed and merged pull request #{args[2]}\n", ""
+    if args[:2] == ["pr", "close"]:
+        return 0, f"✓ Closed pull request #{args[2]}\n", ""
     if args[:2] == ["run", "rerun"]:
         return 0, f"✓ Requested rerun (failed jobs) of run {args[2]}\n", ""
     if args[:2] == ["api", "user"]:

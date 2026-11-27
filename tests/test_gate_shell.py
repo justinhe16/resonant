@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -482,6 +483,88 @@ def test_a_grant_is_spent_once_and_only_by_its_turn(db: sqlite3.Connection) -> N
     with atomic(db):
         add_grant(db, args, task_id="T-approved", now=now)
     assert not take_grant(db, args, task_id="T-approved", now=now + timedelta(hours=1))
+
+
+def bash(command: str, cwd: str) -> dict[str, Any]:
+    return {"tool": "Bash", "command": command, "cwd": cwd, "shown": "x", "verb": "gh-pr"}
+
+
+CLOSE = "gh pr close 161 --repo o/web --comment 'Closing as  a duplicate.'"
+
+
+@pytest.mark.parametrize(
+    ("approved", "again"),
+    [
+        # PER-353: the approved turn's earlier ``cd`` moved the shell; the same string still runs
+        (bash(f"cd /code && {CLOSE}", "/ask"), bash(f"cd /code && {CLOSE}", "/code")),
+        # the brain dropped (or added) the leading cd: the same command in the same dir
+        (bash(f"cd /code && {CLOSE}", "/ask"), bash(CLOSE, "/code")),
+        (bash(CLOSE, "/code"), bash(f"cd /code&&{CLOSE}", "/elsewhere")),
+        # leading and trailing blanks; blanks between plain words
+        (bash(f"cd /code && {CLOSE}", "/ask"), bash(f"  cd /code  &&  {CLOSE} ", "/x")),
+        (bash("cd /r && git push -q origin main", "/ask"),
+         bash("git  push\t-q origin   main", "/r")),
+        # a file tool's absolute path doesn't depend on the shell's dir
+        ({"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d1"},
+         {"tool": "Edit", "command": "/r/a.py", "cwd": "/y", "digest": "d1"}),
+    ],
+)  # fmt: skip
+def test_a_grant_matches_the_same_action_however_its_reissued(
+    db: sqlite3.Connection, approved: dict[str, Any], again: dict[str, Any]
+) -> None:
+    now = utcnow()
+    with atomic(db):
+        add_grant(db, approved, task_id="T", now=now)
+    assert take_grant(db, again, task_id="T", now=now)
+
+
+@pytest.mark.parametrize(
+    ("approved", "other"),
+    [
+        (bash(f"cd /code && {CLOSE}", "/ask"), bash(CLOSE, "/ask")),  # another directory
+        (bash(CLOSE, "/code"), bash(CLOSE.replace("161", "162"), "/code")),  # another PR
+        # quoted text is the command's own: its blanks count
+        (bash(CLOSE, "/code"), bash(CLOSE.replace("as  a", "as a"), "/code")),
+        (bash("rm '*'", "/r"), bash("rm *", "/r")),
+        # after a failed cd the rest would run where the shell was: matched as written
+        (bash("cd /code && make || rm -rf out", "/ask"), bash("make || rm -rf out", "/code")),
+        (bash("cd /code && make; rm -rf out", "/ask"), bash("make; rm -rf out", "/code")),
+        (bash("cd /code && make & rm x", "/ask"), bash("make & rm x", "/code")),
+        # only a plain absolute cd target is followed (no ~, variables, relative or options)
+        (bash("cd ~/code && make", "/ask"), bash("make", "/Users/u/code")),
+        (bash("cd $HOME/code && make", "/ask"), bash("make", "/Users/u/code")),
+        (bash("cd code && make", "/ask"), bash("make", "/ask/code")),
+        (bash("cd '/code' && make", "/ask"), bash("make", "/code")),
+        # blanks only collapse in plain words: never in quotes, heredocs or substitutions
+        (bash(CLOSE.replace("as  a", "as a"), "/code"), bash(CLOSE.replace("  a", "\ta"), "/code")),
+        (bash("cat > f.py <<EOF\nif x:\n    y\nEOF", "/r"),
+         bash("cat > f.py <<EOF\nif x:\n y\nEOF", "/r")),
+        (bash('echo "$(echo "a  b")"', "/r"), bash('echo "$(echo "a b")"', "/r")),
+        (bash("echo $'a\\'b  c'", "/r"), bash("echo $'a\\'b c'", "/r")),
+        # a quote in a comment can't hide a later line from the hop check
+        (bash("cd /x && true # don't\nrm y # '", "/ask"), bash("true # don't\nrm y # '", "/x")),
+        # cd's own side effects: OLDPWD, cd -
+        (bash("cd /r && cd -", "/ask"), bash("cd -", "/r")),
+        (bash("cd /r && echo $OLDPWD", "/ask"), bash("echo $OLDPWD", "/r")),
+        (bash("cd /r && ls ~-", "/ask"), bash("ls ~-", "/r")),
+        (bash('cd /r && "cd" -', "/ask"), bash('"cd" -', "/r")),
+        (bash("cd /r && c''d -", "/ask"), bash("c''d -", "/r")),
+        # bash splits words on spaces and tabs only
+        (bash("echo a b", "/r"), bash("echo a\xa0b", "/r")),
+        (bash("echo a b", "/r"), bash("echo a\x0cb", "/r")),
+        # trailing blanks of an unterminated heredoc's body
+        (bash("cat <<EOF\nx  ", "/r"), bash("cat <<EOF\nx", "/r")),
+        ({"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d1"},
+         {"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d2"}),
+    ],
+)  # fmt: skip
+def test_a_grant_covers_only_the_action_that_was_shown(
+    db: sqlite3.Connection, approved: dict[str, Any], other: dict[str, Any]
+) -> None:
+    now = utcnow()
+    with atomic(db):
+        add_grant(db, approved, task_id="T", now=now)
+    assert not take_grant(db, other, task_id="T", now=now)
 
 
 # --- PER-291: Cori's brain shell follows her read scope --------------------------------------

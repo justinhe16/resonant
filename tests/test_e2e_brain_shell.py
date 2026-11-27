@@ -42,14 +42,15 @@ def git(cwd: Path, *args: str) -> str:
     return done.stdout.strip()
 
 
-def scratch_repo(tmp_path: Path) -> tuple[Path, Path]:
-    """``code/r`` on branch ``feat`` (one commit ahead of ``main``), and its bare remote."""
+def scratch_repo(tmp_path: Path, name: str = "r") -> tuple[Path, Path]:
+    """``code/<name>`` on branch ``feat`` (one commit ahead of ``main``), and its bare
+    remote."""
     code = tmp_path / "code"
     code.mkdir(exist_ok=True)
-    remote = tmp_path / "remote.git"
+    remote = tmp_path / ("remote.git" if name == "r" else f"{name}-remote.git")
     git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
-    repo = code / "r"
-    git(code, "init", "-q", "-b", "main", "r")
+    repo = code / name
+    git(code, "init", "-q", "-b", "main", name)
     git(repo, "config", "user.email", "t@example.com")
     git(repo, "config", "user.name", "T")
     git(repo, "commit", "-q", "--allow-empty", "-m", "one")
@@ -202,6 +203,76 @@ async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
         assert decisions == ["asked", "granted"]
         assert kv_get(w.conn, GRANTS_KV) == {}  # spent
         assert len(w.audits("brain.shell_approved")) == 1
+
+
+def main_ahead(tmp_path: Path, name: str) -> tuple[Path, Path, str]:
+    """A scratch repo on ``main`` one commit ahead of its remote, and the push of it."""
+    repo, remote = scratch_repo(tmp_path, name)
+    git(repo, "checkout", "-q", "main")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "three")
+    return repo, remote, f"cd {repo} && git push -q origin main"
+
+
+async def test_a_two_item_batch_both_approved_runs_both_and_asks_nothing_more(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-353: two changes asked in one turn (one batch prompt), one yes: the approved turn
+    runs both. Running the first (``cd <repo a> && ...``) moves Claude Code's shell into repo
+    a; the second, the same string as approved, still runs on its grant (it was asked again,
+    as a new approval, when the grant matched the shell's directory instead of where the
+    command runs)."""
+    a, remote_a, push_a = main_ahead(tmp_path, "a")
+    b, remote_b, push_b = main_ahead(tmp_path, "b")
+    pushes = [{"tool": "Bash", "command": push_a}, {"tool": "Bash", "command": push_b}]
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = CLAUDE
+        w.claude(
+            turns=[{"when": "Bash, from", "shell": pushes,
+                    "answer": "Pushed both: {r0} / {r1}"}],  # the approved turn (fmt: skip)
+            shell=pushes,
+            answer="{r0} / {r1}",
+        )  # fmt: skip
+        answer, prompt = await w.say("push main in a and b", replies=2)
+        assert answer.count("asked the owner") == 2
+        assert "1." in prompt and "2." in prompt  # one prompt, both items
+        (batch,) = w.rows("SELECT approval_ids FROM approval_batches")
+        assert len(json.loads(batch["approval_ids"])) == 2
+        await prompt_recorded(w)
+        _, ran = await w.say("yes", replies=2)
+        await w.settled()
+        assert ran.startswith("Pushed both: ")
+        assert remote_head(remote_a, "main") == git(a, "rev-parse", "main")
+        assert remote_head(remote_b, "main") == git(b, "rev-parse", "main")
+        assert [r["decision"] for r in tools(w)] == ["asked", "asked", "granted", "granted"]
+        assert [r["status"] for r in w.rows("SELECT status FROM approvals")] == ["approved"] * 2
+        assert kv_get(w.conn, GRANTS_KV) == {}  # both spent
+        assert len(w.audits("brain.shell_approved")) == 1
+
+
+async def test_the_approved_turn_may_drop_the_leading_cd(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-353: approved as ``cd <repo> && git push ...``; the approved turn first moves into
+    the repo and re-issues it without the ``cd``: the same action, so it runs on the grant
+    instead of asking a second time."""
+    repo, remote, push = main_ahead(tmp_path, "r")
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = CLAUDE
+        again = [{"tool": "Bash", "command": f"cd {repo}"},
+                 {"tool": "Bash", "command": "git push  -q origin main"}]  # fmt: skip
+        w.claude(
+            turns=[{"when": "Bash, from", "shell": again, "answer": "Pushed: {r1}"}],
+            shell=[{"tool": "Bash", "command": push}],
+            answer="{r0}",
+        )
+        await w.say("push main", replies=2)
+        await prompt_recorded(w)
+        _, ran = await w.say("yes", replies=2)
+        await w.settled()
+        assert ran.startswith("Pushed: ")
+        assert remote_head(remote, "main") == git(repo, "rev-parse", "main")
+        assert [r["decision"] for r in tools(w)] == ["asked", "read", "granted"]
+        assert len(w.rows("SELECT 1 FROM approvals")) == 1
 
 
 async def test_in_a_thread_the_approved_turn_answers_in_that_thread(

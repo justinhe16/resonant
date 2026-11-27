@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""github extension CLI: PRs, a stateless CI/review watch, a digest, and three gated writes.
+"""github extension CLI: PRs, a stateless CI/review watch, a digest, and four gated writes.
 
 Stdlib only and a single file: Resonant runs it as ``python -I -S cli.py``, so nothing next to
 it is importable. Every GitHub call goes through the ``gh`` CLI. The Keychain token arrives
@@ -8,8 +8,8 @@ gets it from a ``hosts.yml`` in a private 0700 ``GH_CONFIG_DIR`` that is removed
 
 Tools print one JSON object on stdout and exit 0. Any failure prints one line to stderr and
 exits 1, and a failed run changed nothing: the writes (``rerun_failed``, ``merge_pr``,
-``comment_pr``) check everything before their first mutating ``gh`` call, and once one has gone
-through they report success with what happened rather than exit 1.
+``comment_pr``, ``close_pr``) check everything before their first mutating ``gh`` call, and once
+one has gone through they report success with what happened rather than exit 1.
 
 The token is either a person's (a fine-grained PAT in the Keychain) or, on an instance that
 backs ``github/token`` with its GitHub App (PER-336), an installation token minted for this one
@@ -130,7 +130,7 @@ RESULT_MAX = 30000
 # pr_comments: the newest of each kind, bodies clipped.
 COMMENTS_MAX = 30
 COMMENT_TEXT_MAX = 600
-# comment_pr: Resonant passes a string arg of at most 1000 characters, so that is the cap.
+# comment_pr, close_pr: Resonant passes a string arg of at most 1000 characters, so that is the cap.
 COMMENT_BODY_MAX = 1000
 
 
@@ -1060,13 +1060,51 @@ def cmd_comment_pr(gh: Gh, repo: str, number: int, body: str) -> dict[str, Any]:
     return {"summary": f"commented on {ref(pr)}", "repo": repo, "number": number, "url": url}
 
 
+def cmd_close_pr(gh: Gh, repo: str, number: int, comment: str) -> dict[str, Any]:
+    """Closes the PR without merging it (PER-353), then posts ``comment`` (blank: none) on its
+    conversation. Checked first: it's a PR, it's open, the comment fits. The close goes
+    first, so a failed run changed nothing; a comment that fails after it is the result's
+    ``warning``."""
+    check_target(repo, number)
+    text = comment.strip()
+    if len(text) > COMMENT_BODY_MAX:
+        raise Failed(f"the comment is {len(text)} characters; at most {COMMENT_BODY_MAX}")
+    pr = {"repo": repo, "number": number}
+    v = _d(gh.json("pr", "view", str(number), "--repo", repo, "--json", "number,state,url"))
+    if v.get("number") != number:
+        raise Failed(f"{ref(pr)} isn't a pull request")
+    state = _s(v.get("state")).upper()
+    if state == "MERGED":
+        raise Failed(f"{ref(pr)} is already merged; nothing to close")
+    if state != "OPEN":
+        raise Failed(f"{ref(pr)} is already {state.lower() or 'not open'}")
+    gh.text("pr", "close", str(number), "--repo", repo, need="Pull requests: write")
+    out: dict[str, Any] = {
+        "summary": f"closed {ref(pr)}", "repo": repo, "number": number,
+        "url": _s(v.get("url")), "commented": False,
+    }  # fmt: skip
+    if text:
+        try:
+            gh.text(
+                "api", f"repos/{repo}/issues/{number}/comments", "--method", "POST",
+                "-f", f"body={text}", need="Pull requests: write",
+            )  # fmt: skip
+        except Failed as e:
+            out["warning"] = f"closed, but the comment didn't post: {e}"
+        else:
+            out["commented"] = True
+            out["summary"] = f"closed {ref(pr)} with a comment"
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="github")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("prs", "watch", "digest", "health"):
         sub.add_parser(name)
     sub.add_parser("recent_prs").add_argument("--repo", required=True)
-    for name in ("pr", "pr_diff", "pr_comments", "rerun_failed", "merge_pr", "comment_pr"):
+    names = ("pr", "pr_diff", "pr_comments", "rerun_failed", "merge_pr", "comment_pr", "close_pr")
+    for name in names:
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
         p.add_argument("--number", required=True, type=int)
@@ -1075,6 +1113,8 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--ignore-checks", action="store_true")  # merge_pr_anyway
         if name == "comment_pr":
             p.add_argument("--body", required=True)
+        if name == "close_pr":
+            p.add_argument("--comment", required=True)
     args = parser.parse_args(argv)
     try:
         gh = Gh()
@@ -1086,6 +1126,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_pr_comments(gh, args.repo, args.number)
         elif args.cmd == "comment_pr":
             out = cmd_comment_pr(gh, args.repo, args.number, args.body)
+        elif args.cmd == "close_pr":
+            out = cmd_close_pr(gh, args.repo, args.number, args.comment)
         elif args.cmd == "recent_prs":
             out = cmd_recent_prs(gh, args.repo)
         elif args.cmd == "rerun_failed":

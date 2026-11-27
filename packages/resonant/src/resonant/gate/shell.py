@@ -1045,6 +1045,64 @@ def _brief(raw: Mapping[str, Any]) -> str:
         return "?"
 
 
+# --- what a one-shot grant matches (PER-353) ---------------------------------------------------
+
+# A leading ``cd <dir> &&`` whose dir is a plain absolute path (no quotes, variables, globs,
+# ``~``, option or CDPATH lookup), so where the rest runs needs no shell to tell.
+_LEAD_CD = re.compile(r"[ \t]*cd[ \t]+(/[^\s'\"$`\\~;&|<>(){}*?\[\]!#]*)[ \t]*&&(?!&)[ \t]*")
+# What the rest after a dropped hop may not hold anywhere, quoted or not (no quote parsing to
+# get wrong): something that runs even when the cd failed (``;``, ``|``, ``&``, a new line),
+# an expansion or escape that could tell where it started (``$OLDPWD``, ``$(...)``, a
+# backtick, ``\``, ``~-``), a redirect or heredoc, or another ``cd`` (``cd -``; checked with
+# quotes removed too: ``"cd" -``, ``c''d -``).
+_HOP_UNSAFE = re.compile(r"[;|&\n\r$`\\<>~]")
+_CD_WORD = re.compile(r"(^|\s)cd(\s|$)")
+# A command made only of plain words: printable characters and spaces or tabs, no quotes,
+# expansions, escapes, comments or operators, so its spaces and tabs only separate words
+# and may be collapsed (bash splits on nothing else: ``\xa0`` or ``\f`` is part of a word).
+_PLAIN = re.compile(r"(?:[ \t]|[^\s\x00-\x1f\x7f-\x9f'\"$`\\#;&|<>(){}])*")
+_BLANKS = re.compile(r"[ \t]+")
+
+
+def grant_form(args: Mapping[str, Any]) -> dict[str, Any]:
+    """What a one-shot grant for an approved shell change matches: the action that runs, not
+    the string that asked for it. Bash: the directory it runs in and the command after any
+    leading ``cd <absolute dir> &&`` hops, so ``cd /r && gh pr close 1`` from anywhere and
+    ``gh pr close 1`` from ``/r`` are one action. A hop is only dropped when the rest is
+    plain enough that nothing in it could run, or differ, had the ``cd`` failed or been left
+    out (``_HOP_UNSAFE``); otherwise the command is matched as written, from the same
+    directory. Blanks are collapsed only in a command of plain words (``_PLAIN``); any
+    other is matched byte for byte, bar its leading and trailing blanks. A file tool: its
+    absolute path and the edit's digest (the shell's directory doesn't change what an
+    absolute path names)."""
+    tool, command, cwd = args.get("tool"), args.get("command"), args.get("cwd")
+    if tool == "Bash" and isinstance(command, str) and isinstance(cwd, str):
+        where, rest = cwd, command
+        while (m := _LEAD_CD.match(rest)) is not None:
+            after = rest[m.end() :]
+            if (not after.strip(" \t") or _HOP_UNSAFE.search(after)
+                    or _CD_WORD.search(re.sub(r"['\"]", "", after))):  # fmt: skip
+                break
+            where, rest = os.path.normpath(m.group(1)), after
+        return {"tool": tool, "at": where, "run": _settled(rest)}
+    if tool in FILE_TOOLS and isinstance(command, str) and command.startswith("/"):
+        return {"tool": tool, "command": command, "digest": args.get("digest")}
+    return {k: args.get(k) for k in ("tool", "command", "cwd", "digest")}
+
+
+def _settled(text: str) -> str:
+    """``text`` as a grant compares it: leading spaces and tabs dropped (they never sit in a
+    quote); trailing ones too unless a backslash could escape one or they could end a
+    heredoc's body (a new line); and runs of spaces and tabs as one space only in a command
+    of plain words."""
+    text = text.lstrip(" \t")
+    if not any(c in text for c in "\\\n\r"):
+        text = text.rstrip(" \t")
+    if _PLAIN.fullmatch(text):
+        return _BLANKS.sub(" ", text)
+    return text
+
+
 def git_facts(path: str) -> GitFacts | None:
     """The repo ``path`` is in, read from its ``.git`` files (no git process: a repo's
     config could make one run code). None outside a repo."""
