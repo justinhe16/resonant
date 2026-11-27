@@ -84,7 +84,7 @@ def test_migration_004_over_populated_003(tmp_path: Path) -> None:
         open_existing(path)
 
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 37
+    assert schema_version(conn) == latest_version() == 38
     tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
     assert {"extensions", "ext_jobs"} <= tables
     # Existing rows survive.
@@ -280,7 +280,7 @@ def test_migration_005_adds_pulse_items_over_populated_004(tmp_path: Path) -> No
     with pytest.raises(StoreUnavailableError, match="schema v4 < v37"):
         open_existing(path)
     conn = open_db(path)
-    assert schema_version(conn) == 37
+    assert schema_version(conn) == 38
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(pulse_items)")}
     assert {"source", "key", "urgency", "fingerprint", "cleared", "told_fingerprint"} <= cols
     conn.close()
@@ -295,7 +295,7 @@ def test_migration_026_creates_ext_panels_over_a_populated_025(tmp_path: Path) -
     ext_store.save_extension(conn, _record())
     conn.close()
     conn = open_db(tmp_path / "old.db")
-    assert schema_version(conn) == 37
+    assert schema_version(conn) == 38
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(ext_panels)")]
     assert cols == [
         "ext",

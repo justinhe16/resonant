@@ -274,6 +274,7 @@ if TYPE_CHECKING:
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.notify_owner import OwnerBridge
+    from resonant.runners.ask import AskRunner
 
 log = logging.getLogger(__name__)
 
@@ -1114,6 +1115,7 @@ class ClaudeRunner:
         requests: GatedTools | None = None,
         milestones_mode: milestones.Mode = "off",
         milestone_quiet_s: float = milestones.QUIET_S,
+        asks: Callable[[], AskRunner | None] = lambda: None,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -1252,6 +1254,8 @@ class ClaudeRunner:
             requests=requests,  # PER-296: `resonant request`
         )
         self.voice = voice
+        # PER-354: the ask runner (built after this one), for a run's follow-up when it ends
+        self.asks = asks
         # PER-341: a brain-worded start line still being written, by run code (the run's
         # milestones and end text wait for it, so the thread reads in order)
         self._announcing: dict[str, asyncio.Task[None]] = {}
@@ -1577,13 +1581,16 @@ class ClaudeRunner:
         requested_by: str | None = None,
         job: jobs_store.RunLink | None = None,
         announce: bool = False,
+        follow_up: str | None = None,
+        follow_up_depth: int = 0,
     ) -> Started | Refused:
         """:meth:`_start_run`; PER-327: a refusal that is setup only the owner can finish
         (``Refused.gap``) is said in plain words when the reply is shared (a thread, or a
         member asked), and the owner is sent the exact command."""
         res = await self._start_run(repo, ask, principal, merge=merge, report=report,
                                     channel_ref=channel_ref, requested_by=requested_by, job=job,
-                                    announce=announce)  # fmt: skip
+                                    announce=announce, follow_up=follow_up,
+                                    follow_up_depth=follow_up_depth)  # fmt: skip
         if isinstance(res, Refused) and res.gap is not None:
             text = await self.setup_text(
                 res.gap, channel_ref=channel_ref, requester=requested_by or principal
@@ -1677,6 +1684,8 @@ class ClaudeRunner:
         requested_by: str | None = None,
         job: jobs_store.RunLink | None = None,
         announce: bool = False,
+        follow_up: str | None = None,
+        follow_up_depth: int = 0,
     ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
         the resolver turns it into a registered repo, registering one it hasn't seen. No repo
@@ -1712,7 +1721,12 @@ class ClaudeRunner:
 
         ``announce`` (PER-319): the asking reply won't say the run started (the Claude brain
         started it, not ``/run``): its first step says ``On it: starting R5 (…).`` in the
-        run's thread, once (``runners.status``; checkpoint ``announce``)."""
+        run's thread, once (``runners.status``; checkpoint ``announce``).
+
+        ``follow_up`` (PER-354): what to do when the run ends; kept on the run
+        (``runs.follow_up``, through a continue too) and handed to one brain ask then
+        (:meth:`_follow_up`). ``follow_up_depth``: the starting ask's depth in a chain of
+        follow-ups (0: a person started it)."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text, SetupGap(text, RUNNER_SETUP_PLAIN, "runner-setup"))
         ask = ask.strip()
@@ -1754,6 +1768,8 @@ class ClaudeRunner:
             max_budget_usd=self.cfg.max_budget_usd,
             channel_ref=channel_ref,
             requested_by=None if requested_by == principal else requested_by,
+            follow_up=follow_up,
+            follow_up_depth=follow_up_depth,
         )
         self.reports.set_report(run.code, report)
         if job is not None:
@@ -1969,6 +1985,7 @@ class ClaudeRunner:
         announce: bool = False,
         channel_ref: dict[str, Any] | None = None,
         requested_by: str | None = None,
+        follow_up_depth: int | None = None,
     ) -> Continued | Refused:
         """PER-344: pick up a run that a limit stopped (the time limit, the per-run disk cap or
         the disk running nearly full), from its kept work: the same run code, Claude session
@@ -1992,7 +2009,11 @@ class ClaudeRunner:
         questions, end and merge go to that thread, addressed to the continuer
         (``runs.channel_ref``/``requested_by``, the new task's ``channel_ref``), and its old
         thread gets one pointer (``status.moved_line``). Continued from the same thread,
-        nothing is said there. No ``channel_ref`` (no asking task): it stays where it was."""
+        nothing is said there. No ``channel_ref`` (no asking task): it stays where it was.
+
+        The run keeps its ``follow_up`` (PER-354): it is handed on again when the continued run
+        ends, in its (moved) thread. ``follow_up_depth``: a follow-up ask continued it, at that
+        depth; the run's depth only goes up, so a chain of continues stays bounded."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         if self._paused():
@@ -2041,6 +2062,8 @@ class ClaudeRunner:
                 return Refused(f"{run.code} isn't failed any more; nothing to continue.")
             if moved:  # PER-351: it reports where it was continued
                 runs.move(self.conn, run.code, channel_ref=ref, requested_by=asker)
+            if follow_up_depth is not None and follow_up_depth > run.follow_up_depth:
+                runs.update(self.conn, run.code, follow_up_depth=follow_up_depth)  # PER-354
         spec = NewTask(
             kind=TASK_KIND,
             runner=RUNNER_NAME,
@@ -2066,6 +2089,7 @@ class ClaudeRunner:
                 if moved:
                     runs.move(self.conn, run.code, channel_ref=run.channel_ref,
                               requested_by=run.requested_by)  # fmt: skip
+                runs.update(self.conn, run.code, follow_up_depth=run.follow_up_depth)
             raise
         runs.update(self.conn, run.code, task_id=task_id)
         self.reports.set_report(run.code, "now")  # asked for by name: its end is texted
@@ -3973,9 +3997,13 @@ class ClaudeRunner:
                     await self._deprovision(run.code)
                     await self._end_cli(run.code)
                 # the merged line went out by the trust rules' urgency (``_report_merged``)
+                if not owner:
+                    await self._follow_up(run)  # PER-354: once the run's merge is settled
                 return Done({"run": run.code, "status": "merged"})
             now = self._must_get(run.code)
             if now.status != "ready":  # merged (or ended) another way meanwhile: nothing to say
+                if not owner:
+                    await self._follow_up(now)
                 return Done({"run": run.code, "status": now.status})
             assert isinstance(merged, Refused)
             why = merged.reason.removeprefix(f"{run.code} not merged: ")
@@ -3995,6 +4023,7 @@ class ClaudeRunner:
                 run, f"{run.code} {note[0].lower()}{note[1:]}",
                 dedupe_key=f"run:{run.code}:auto-merge",
             )  # fmt: skip
+        await self._follow_up(run)  # PER-354: the auto-merge stopped
         return done
 
     # -- the session's GitHub token --
@@ -4136,9 +4165,76 @@ class ClaudeRunner:
         # the code, what failed and the next step: no ``Couldn't finish that`` under it.
         if run.status in ("failed", "cancelled") and not said:
             await self._say_failed(run)
+        if not watching:  # an auto-merge's wait follows up once it is merged or stops
+            await self._follow_up(run)
         if run.status == "failed":
             return Fail(run.failure or "failed")
         return Done({"run": run.code, "status": run.status})
+
+    async def _follow_up(self, run: Run) -> None:
+        """PER-354: the run ended and carries a ``follow_up``: queue exactly one brain ask in
+        its current thread (``run_ref``; PER-351 moves it on a continue), as its current
+        requester, with the instruction and how the run ended (``follow_up_prompt``). Tainted
+        from the start (the run read outside content), so its writes go through the gate like
+        any tainted turn. Marked ``run/<code>/<ended_at>`` and looked up first, so a retry or
+        restart never queues it twice, while a continued run's next end is a new one. A
+        cancelled run follows up nothing; a run at ``FOLLOW_UP_DEPTH_MAX`` queues none (the
+        chain stops). A refusal (off, a limit, busy, too deep) is said once in the thread, so
+        the promise isn't dropped silently. Never raises but a cancel."""
+        from resonant.runners.ask import FOLLOW_UP_KEY, Queued  # ask imports this module
+
+        run = self._must_get(run.code)
+        if run.follow_up is None or run.active or run.status == "cancelled":
+            return
+        if run.ended_at is None:
+            return
+        key = f"run/{run.code}/{iso(run.ended_at)}"
+        try:
+            prior = self.conn.execute(
+                "SELECT id FROM tasks WHERE runner = 'ask' AND json_extract(checkpoint, ?) = ?"
+                " LIMIT 1",
+                (f"$.{FOLLOW_UP_KEY}", key),
+            ).fetchone()
+        except sqlite3.Error:
+            log.warning("run follow-up: lookup failed", extra={"run": run.code})
+            return
+        if prior is not None:  # queued by an earlier try
+            return
+        asks = self.asks()
+        if run.follow_up_depth >= runs.FOLLOW_UP_DEPTH_MAX:
+            why = f"{run.follow_up_depth} follow-ups deep already"
+        elif asks is None:
+            why = "ask_claude isn't running"
+        else:
+            in_thread = run_thread(self.conn, run) is not None
+            result = asks.enqueue(
+                runs.follow_up_prompt(run),
+                kind="general",
+                principal=run.requester,
+                channel_ref=run_ref(self.conn, run) if in_thread else None,
+                tools=True,
+                tainted=True,  # the run's summary and everything it read are outside data
+                taint_hops=0,
+                follow_up=key,
+                follow_up_depth=run.follow_up_depth + 1,
+            )
+            if isinstance(result, Queued):
+                with atomic(self.conn):
+                    audit(self.conn, "run.follow_up", requested_by=run.requester,
+                          decision="queued", run=run.code, task_id=result.task_id,
+                          depth=run.follow_up_depth + 1)  # fmt: skip
+                return
+            why = result.text
+        why = " ".join(why.split())[:120]
+        with atomic(self.conn):
+            audit(self.conn, "run.follow_up", requested_by=run.requester, decision="refused",
+                  run=run.code, reason=why)  # fmt: skip
+        try:
+            await self._send_run(run, f"{run.code}: couldn't follow up ({why}): {run.follow_up}",
+                                 dedupe_key=f"run:{key}:follow-up")  # fmt: skip
+        except ChannelError as e:
+            why_not = {"run": run.code, "error": type(e).__name__}
+            log.warning("run follow-up refusal not sent", extra=why_not)
 
     async def _ci_word(self, run: Run) -> str | None:
         """The PR's CI as a word for the reply; None when it can't be read."""

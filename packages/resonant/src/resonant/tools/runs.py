@@ -36,7 +36,8 @@ at call time: the runner is built after the tools are registered) and return cod
   only: a global builtin with no member grant, and the handler checks the asker again. Chosen
   by the brain, the run says ``Continuing R5 (…)`` in its thread itself (``announced``).
   PER-351: the run moves to the calling task's thread and asker: its later updates, end and
-  merge go where it was continued, and its old thread gets one pointer.
+  merge go where it was continued, and its old thread gets one pointer. It keeps its
+  ``follow_up`` (PER-354), handed on in the new thread when it ends.
 - ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
   the trust rules (``merge_level``, docs/employee-plan.md D4): it runs without asking when
   ``merge_decision`` is ok and the run flagged no sensitive paths, else it asks a plain yes.
@@ -50,6 +51,13 @@ at call time: the runner is built after the tools are registered) and return cod
   CI: <repo> has no CI checks"). Red CI still refuses.
 - ``start_run{..., merge?}``: ``merge`` when the owner asked to merge it too; the run then
   merges itself once CI is green (same checks, same trust rules).
+- ``start_run{..., follow_up?}`` (PER-354): a plain instruction for when the run ends ("if the
+  review says LGTM, merge the PR"). When it ends (ready, no changes, done, failed; not
+  cancelled; an auto-merge once it is merged or stops) the runner queues one brain ask in the
+  run's current thread, as its current requester, tainted, with the instruction and the run's
+  end. A continued run keeps it. Chains are bounded: a follow-up ask carries a depth, a run it
+  starts or continues gets it, and at ``runs.FOLLOW_UP_DEPTH_MAX`` start_run refuses a
+  follow-up and the run queues none.
 - ``answer_worker{code, text}`` and ``message_worker{code, text}``: L3, no ask: it's the
   owner talking to their own worker (EM-5). The answer goes to the run's open question (a
   run with none gets it as a message); a message reaches the session at its next
@@ -125,6 +133,8 @@ class RunnerApi(Protocol):
         channel_ref: dict[str, Any] | None = None,
         requested_by: str | None = None,
         announce: bool = False,
+        follow_up: str | None = None,
+        follow_up_depth: int = 0,
     ) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
@@ -140,6 +150,7 @@ class RunnerApi(Protocol):
         announce: bool = False,
         channel_ref: dict[str, Any] | None = None,
         requested_by: str | None = None,
+        follow_up_depth: int | None = None,
     ) -> Continued | Refused: ...
 
     async def merge_run(
@@ -170,7 +181,9 @@ START_RUN = ToolSpec(
         "`repo` is optional: leave it out for work not tied to a repo (ops, research, a data "
         "fix) and it runs in a scratch dir and reports back. `ask` is what to do, in the "
         "owner's words. Set `merge` only when the owner also asks to merge it: it then merges "
-        "once CI is green, unless a trust rule says to ask."
+        "once CI is green, unless a trust rule says to ask. `follow_up`: what you will do "
+        "when the run ends (e.g. 'if the review says LGTM, merge the PR', 'after the merge, "
+        "reinstall the LaunchAgent'): you get one turn in this thread then, with how it ended."
     ),
     args_schema={
         "type": "object",
@@ -178,6 +191,14 @@ START_RUN = ToolSpec(
             "repo": {"type": "string", "maxLength": REPO_MAX},
             "ask": {"type": "string", "minLength": 1, "maxLength": ASK_MAX},
             "merge": {"type": "boolean"},
+            "follow_up": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": runs_store.FOLLOW_UP_MAX,
+                "description": (
+                    "a step you promised for when the run ends, as an instruction to yourself"
+                ),
+            },
             "report": {
                 "type": "string",
                 "enum": list(REPORTS),
@@ -493,7 +514,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         )
 
     async def _start_run(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
-        unknown = set(args) - {"repo", "ask", "merge", "report"}
+        unknown = set(args) - {"repo", "ask", "merge", "report", "follow_up"}
         if unknown:
             raise ToolFailed(f"start_run: unknown arguments: {sorted(unknown)}")
         repo, ask, merge = args.get("repo"), args.get("ask"), args.get("merge", False)
@@ -514,6 +535,10 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"started": False, "text": missing()}
         if repo is not None and len(repo) > REPO_MAX:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
+        follow_up = args.get("follow_up")
+        if follow_up is not None and not isinstance(follow_up, str):
+            raise ToolFailed("start_run: follow_up is a string")
+        follow_up = " ".join((follow_up or "").split())[: runs_store.FOLLOW_UP_MAX] or None
         # PER-292: the run's texts go to the thread it was asked in (the calling task's).
         # PER-294: the run stays the owner's, but it keeps who asked (``requested_by``): its
         # questions, checks and outcome go to their thread, addressed to them.
@@ -528,8 +553,20 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         # PER-319: a run a slash command started is announced by its reply (``On it: R5 ·
         # …``); one the brain started says ``On it: starting R5 (…).`` in its thread itself
         announce = call is not None and call.origin != "explicit"
+        # PER-354: a follow-up ask starting a run passes its depth on; the chain stops at a cap
+        depth = runs_store.chain_depth(None if task is None else task.checkpoint)
+        if follow_up is not None and depth >= runs_store.FOLLOW_UP_DEPTH_MAX:
+            raise ToolFailed(
+                f"start_run: follow-ups are already {depth} deep, so this run can't carry "
+                "another; start it without follow_up and say what is left"
+            )
+        chain: dict[str, Any] = {}
+        if follow_up is not None:
+            chain["follow_up"] = follow_up
+        if depth:
+            chain["follow_up_depth"] = depth
         result = await claude.start_run(repo, ask, owner, merge=merge, report=report,
-                                        announce=announce, **thread)  # fmt: skip
+                                        announce=announce, **thread, **chain)  # fmt: skip
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)
@@ -644,6 +681,9 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         moved: dict[str, Any] = {}
         if task is not None and task.channel_ref is not None:
             moved = {"channel_ref": task.channel_ref, "requested_by": asker}
+        # PER-354: continued by a follow-up ask: the run takes its depth (the chain stays bounded)
+        if (depth := runs_store.chain_depth(None if task is None else task.checkpoint)) > 0:
+            moved["follow_up_depth"] = depth
         result = await claude.continue_run(code, announce=announce, **moved)
         if (reason := _refusal(result)) is not None:
             return {"continued": False, "code": code, "text": reason}
