@@ -113,7 +113,7 @@ def gate(db: sqlite3.Connection) -> PolicyGate:
     reg = ToolRegistry()
     for spec in (RESTART, WIPE, PAY):
         reg.register(spec)
-    principals = Principals.model_validate({"principals": {"justin": {"role": "owner"}}})
+    principals = Principals.model_validate({"principals": {"alice": {"role": "owner"}}})
     return PolicyGate(db, principals, reg, dry_run=False, approval_ttl_s=1800, clock=Clock())
 
 
@@ -125,9 +125,9 @@ def _task(db: sqlite3.Connection) -> str:
 
 def ask(db: sqlite3.Connection, gate: PolicyGate, spec: ToolSpec) -> NeedsApproval:
     tid = _task(db)
-    asked = gate.evaluate(Intent.for_tool(spec, task_id=tid, principal="justin", args={"x": 1}))
+    asked = gate.evaluate(Intent.for_tool(spec, task_id=tid, principal="alice", args={"x": 1}))
     assert isinstance(asked, NeedsApproval) and not asked.allow_always
-    ap.add_channel_ref(db, asked.approval_id, ref=f"r-{asked.code}", at=SENT, principal="justin")
+    ap.add_channel_ref(db, asked.approval_id, ref=f"r-{asked.code}", at=SENT, principal="alice")
     return asked
 
 
@@ -143,14 +143,14 @@ def check_approval(db: sqlite3.Connection, *, allow_always: bool = True) -> ap.A
             effect=Effect.WRITE,
             level=Level.L2,
             summary="R4 wants to: deploy (new system)",
-            approvers=("justin",),
+            approvers=("alice",),
             code="K4",
             expires_at=NOW + timedelta(hours=1),
             allow_always=allow_always,
         ),
         NOW,
     )
-    ap.add_channel_ref(db, approval_id, ref="r-K4", at=SENT, principal="justin")
+    ap.add_channel_ref(db, approval_id, ref="r-K4", at=SENT, principal="alice")
     row = ap.get_approval(db, approval_id)
     assert row is not None
     return row
@@ -162,7 +162,7 @@ def always(gate: PolicyGate, code: str | None = None, event_id: str = "e1") -> R
     clock.now = REPLY + timedelta(seconds=1)
     return gate.resolve_reply(
         ApprovalReply(
-            actor="justin",
+            actor="alice",
             actor_identity="imessage:+15551234567",
             channel="imessage",
             raw_text="yes always",
@@ -229,13 +229,13 @@ def test_the_store_refuses_always_too(db: sqlite3.Connection, gate: PolicyGate) 
     """Defense in depth: the conditional UPDATE re-checks what the gate checked."""
     asked = ask(db, gate, WIPE)
     reason = ap.resolve(
-        db, asked.approval_id, approved=True, decided_by="justin", now=REPLY, always=True
+        db, asked.approval_id, approved=True, decided_by="alice", now=REPLY, always=True
     )
     assert reason == "always_unsupported"
     assert status(db, asked.approval_id) == "pending"
     with pytest.raises(ValueError):
         ap.resolve(
-            db, asked.approval_id, approved=False, decided_by="justin", now=REPLY, always=True
+            db, asked.approval_id, approved=False, decided_by="alice", now=REPLY, always=True
         )
 
 
@@ -248,7 +248,7 @@ def test_contract_guards() -> None:
             effect=Effect.WRITE,
             level=Level.L1,
             summary="s",
-            approvers=("justin",),
+            approvers=("alice",),
             code="K4",
             expires_at=NOW,
             require_code=True,
@@ -256,7 +256,7 @@ def test_contract_guards() -> None:
         )
     with pytest.raises(ValueError):
         ApprovalReply(
-            actor="justin",
+            actor="alice",
             actor_identity="imessage:+1",
             channel="imessage",
             raw_text="no always",

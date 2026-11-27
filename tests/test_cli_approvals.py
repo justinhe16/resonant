@@ -22,7 +22,7 @@ from resonant_sdk import Effect, Level, ToolSpec
 ADD = ToolSpec(name="add_item", effect=Effect.WRITE, level=Level.L2)
 WIPE = ToolSpec(name="wipe", effect=Effect.WRITE, level=Level.L1)
 
-PRINCIPALS = "principals:\n  justin:\n    role: owner\n"
+PRINCIPALS = "principals:\n  alice:\n    role: owner\n"
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def gate(db: sqlite3.Connection) -> PolicyGate:
     registry = ToolRegistry()
     registry.register(ADD)
     registry.register(WIPE)
-    principals = Principals.model_validate({"principals": {"justin": {"role": "owner"}}})
+    principals = Principals.model_validate({"principals": {"alice": {"role": "owner"}}})
     return PolicyGate(db, principals, registry, dry_run=False, approval_ttl_s=1800)
 
 
@@ -47,7 +47,7 @@ def ask(db: sqlite3.Connection, gate: PolicyGate, spec: ToolSpec = ADD, **args: 
     """A waiting task with one pending approval. Returns the approval id."""
     task_id = repo.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
     decision = gate.evaluate(
-        Intent.for_tool(spec, task_id=task_id, principal="justin", args=dict(args) or {"x": 1})
+        Intent.for_tool(spec, task_id=task_id, principal="alice", args=dict(args) or {"x": 1})
     )
     assert isinstance(decision, NeedsApproval)
     repo.set_status(db, task_id, "waiting", wait_reason="approval")
@@ -116,7 +116,7 @@ def test_show_resolved_by_id(db: sqlite3.Connection, gate: PolicyGate) -> None:
     code = get(db, approval_id).code or ""
     assert run("deny", approval_id)[0] == 0
     _, out, _ = run("show", approval_id)
-    assert "rejected by justin" in out
+    assert "rejected by alice" in out
     # A resolved approval's code no longer matches anything.
     assert run("show", code)[0] == 1
 
@@ -131,7 +131,7 @@ def test_approve_by_code_wakes_task(db: sqlite3.Connection, gate: PolicyGate) ->
     assert out.splitlines()[0] == f"[{a.code}] {a.summary}"
     assert "approved" in out.splitlines()[1]
     done = get(db, a.id)
-    assert (done.status, done.decided_by) == ("approved", "justin")
+    assert (done.status, done.decided_by) == ("approved", "alice")
     assert a.task_id is not None
     task = repo.get_task(db, a.task_id)
     assert task is not None and task.status == "queued"
@@ -228,11 +228,11 @@ def offered(db: sqlite3.Connection, *, scope: str | None = "linear") -> str:
             effect=Effect.WRITE,
             level=Level.L2,
             summary="linear: save issue id=RES-1",
-            approvers=("justin",),
+            approvers=("alice",),
             code="K4",
             expires_at=now + timedelta(minutes=30),
             extension="linear",
-            requested_by="justin",
+            requested_by="alice",
             allow_always=True,
             always_scope=scope,
             always_action="tool:linear.save_issue" if scope else None,

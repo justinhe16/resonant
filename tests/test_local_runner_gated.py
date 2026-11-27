@@ -49,7 +49,7 @@ from resonant.tools.tasks import TASK_COUNTS
 from resonant.trust.tools import StandingAllows
 from resonant_sdk import Effect, Event, Level, ToolSpec
 
-OWNER = "justin"
+OWNER = "alice"
 T0 = datetime(2026, 10, 13, 15, 0, tzinfo=UTC)
 TTL_S = 1800.0
 
@@ -799,7 +799,7 @@ def test_prompt_text_and_dedupe_key() -> None:
     assert prompt(Effect.PAY, Level.L1, True).text() == (
         "[D7] do it? Reply exactly: yes D7 / no D7"
     )
-    assert approval_dedupe_key("ap1", OWNER) == "approval:ap1:prompt:justin"
+    assert approval_dedupe_key("ap1", OWNER) == "approval:ap1:prompt:alice"
 
 
 # --- ops (P2-14): the reply goes out before the detached restart -------------------------

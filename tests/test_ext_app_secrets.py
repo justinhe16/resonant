@@ -54,7 +54,7 @@ HEAD = "a1b2c3d" + "0" * 33
 APP_CFG = {"app_id": APP_ID, "installation_id": INSTALLATION_ID}
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
 """
@@ -361,7 +361,7 @@ class Instance:
     async def call(self, tool: str, args: Mapping[str, Any]) -> ToolResult:
         spec = next(s for s in self.c.registry.specs("github") if s.name == tool)
         intent = Intent.for_tool(
-            spec, task_id=self.task_id, principal="justin", args=dict(args), origin="explicit"
+            spec, task_id=self.task_id, principal="alice", args=dict(args), origin="explicit"
         )
         decision = self.c.gate.evaluate(intent)
         assert isinstance(decision, Allow), decision
@@ -372,7 +372,7 @@ class Instance:
 def gh_world(token: str, *tokens: str) -> dict[str, Any]:
     pr = {
         "number": 159, "title": "Voyager onboarding", "url": f"https://github.com/{DORI}/pull/159",
-        "state": "OPEN", "isDraft": False, "author": {"login": "brian"},
+        "state": "OPEN", "isDraft": False, "author": {"login": "bob"},
         "headRefName": "onboarding", "headRefOid": HEAD, "baseRefName": "main",
         "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
         "statusCheckRollup": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
@@ -399,7 +399,7 @@ def gh_world(token: str, *tokens: str) -> dict[str, Any]:
 
 
 async def read_review_merge(inst: Instance) -> list[ToolResult]:
-    """Read PR 159's checks, reviews and diff, then merge it: what Brian asked Cori for."""
+    """Read PR 159's checks, reviews and diff, then merge it: what Bob asked Cori for."""
     out = [
         await inst.call("pr", {"repo": DORI, "number": 159}),
         await inst.call("pr_comments", {"repo": DORI, "number": 159}),
@@ -409,7 +409,7 @@ async def read_review_merge(inst: Instance) -> list[ToolResult]:
     for r in out:
         assert r.ok, (r.error, r.notice, r.reason)
     pr, comments, diff, merged = (r.data or {} for r in out)
-    assert pr["author"] == "brian" and pr["ci"] == "passing" and pr["checks"][0]["name"] == "ci"
+    assert pr["author"] == "bob" and pr["ci"] == "passing" and pr["checks"][0]["name"] == "ci"
     assert comments["review_states"] == {"ana": "approved"}
     assert diff["files"][0]["patch"] == "+a"
     assert merged["summary"] == "merged voyager-web#159 (squash) at a1b2c3d"

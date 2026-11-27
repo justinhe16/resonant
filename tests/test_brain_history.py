@@ -695,7 +695,7 @@ def test_since_last_shows_a_one_shot_answer_and_a_local_reply_but_not_a_session_
 
 # --- PER-294: one thread is one conversation -----------------------------------------------------
 
-BRIAN = "brian"
+BOB = "bob"
 
 
 def _said(messages: list[Any]) -> list[str]:
@@ -709,9 +709,9 @@ def test_each_thread_reads_only_its_own_transcript(db: sqlite3.Connection) -> No
     message(db, "owner's own chat", reply="own reply", at=now - timedelta(minutes=9))
     a1 = message(db, "deploy the api?", reply="Which env?", thread="T-A", source="slack",
                  at=now - timedelta(minutes=8))  # fmt: skip
-    message(db, "staging first", reply="OK", thread="T-B", source="slack", principal=BRIAN,
+    message(db, "staging first", reply="OK", thread="T-B", source="slack", principal=BOB,
             at=now - timedelta(minutes=7))  # fmt: skip
-    message(db, "prod please", reply="Noted", thread="T-A", source="slack", principal=BRIAN,
+    message(db, "prod please", reply="Noted", thread="T-A", source="slack", principal=BOB,
             at=now - timedelta(minutes=6))  # fmt: skip
     system_texts.record(db, OWNER, "run", "R1 opened PR #3", ref="ra", task_id=task_of(db, a1),
                         now=now - timedelta(minutes=5))  # fmt: skip
@@ -719,20 +719,20 @@ def test_each_thread_reads_only_its_own_transcript(db: sqlite3.Connection) -> No
     b_now = message(db, "done?", thread="T-B", source="slack", at=now)
     display = Principals(principals={
         OWNER: Principal(role="owner", identities=("slack:U1",)),
-        BRIAN: Principal(role="approver", identities=("slack:U2",)),
+        BOB: Principal(role="approver", identities=("slack:U2",)),
     }).display  # fmt: skip
     a = _said(replayed(db, OWNER, before_event_id=a_now, conversation="T-A",
                        speaker=history.named(display)).messages)  # fmt: skip
     assert a == [
-        "<message>Justin: deploy the api?</message>",
+        "<message>Alice: deploy the api?</message>",
         "Which env?",
-        "<message>Brian: prod please</message>",
+        "<message>Bob: prod please</message>",
         "Noted",
         "R1 opened PR #3",
     ]
     b = _said(replayed(db, OWNER, before_event_id=b_now, conversation="T-B",
                        speaker=history.named(display)).messages)  # fmt: skip
-    assert b == ["<message>Brian: staging first</message>", "OK"]
+    assert b == ["<message>Bob: staging first</message>", "OK"]
     # the owner's own conversation: as before, without the threads or their system texts
     own = _said(replayed(db, OWNER, before_event_id=None).messages)
     assert own == ["<message>owner's own chat</message>", "own reply"]
@@ -741,7 +741,7 @@ def test_each_thread_reads_only_its_own_transcript(db: sqlite3.Connection) -> No
 def test_a_threads_delta_names_senders_and_notes_older_messages(db: sqlite3.Connection) -> None:
     now = utcnow()
     for i in range(12):
-        who = BRIAN if i % 2 else OWNER
+        who = BOB if i % 2 else OWNER
         message(db, f"line {i}", reply=f"ok {i}", thread="T-A", source="slack", principal=who,
                 at=now - timedelta(minutes=30 - i))  # fmt: skip
     current = message(db, "so?", thread="T-A", source="slack", at=now)
@@ -753,7 +753,7 @@ def test_a_threads_delta_names_senders_and_notes_older_messages(db: sqlite3.Conn
     lines = [ln for ln in delta.text.splitlines() if ln.startswith("- ")]
     assert lines[0] == f"- {history.OLDER_NOTE}"
     assert len(lines) == history.SINCE_ITEMS + 1
-    assert lines[-2].endswith("Brian: line 11") and lines[-4].endswith("Justin: line 10")
+    assert lines[-2].endswith("Bob: line 11") and lines[-4].endswith("Alice: line 10")
     assert lines[-1].endswith("Resonant: ok 11")
     # the owner's own conversation has none of it
     nothing = history.since_last(db, OWNER, after_event_id=None, before_event_id=None,

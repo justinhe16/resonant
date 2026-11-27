@@ -616,7 +616,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "reader": {"grants": {"builtin:files": ["request"]}},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
             }
@@ -626,7 +626,7 @@ def principals() -> Principals:
 
 def test_principals_builtin_grant(principals: Principals) -> None:
     list_tasks = ToolSpec(name="list_tasks", effect=Effect.READ)
-    assert principals.may_request("justin", files.READ_FILE)
+    assert principals.may_request("alice", files.READ_FILE)
     assert principals.may_request("reader", files.READ_FILE)
     assert not principals.may_request("cofounder", files.READ_FILE)
     assert not principals.may_request("reader", list_tasks)
@@ -640,7 +640,7 @@ def test_builtin_grant_may_only_request() -> None:
         Principals.model_validate(
             {
                 "principals": {
-                    "justin": {"role": "owner"},
+                    "alice": {"role": "owner"},
                     "x": {"grants": {"builtin:files": ["request", "approve"]}},
                 }
             }
@@ -664,7 +664,7 @@ def test_gate_lets_a_granted_member_read(db: sqlite3.Connection, principals: Pri
     assert isinstance(decide(files.READ_FILE, "reader"), Allow)
     assert isinstance(decide(files.READ_FILE, "cofounder"), Deny)
     assert isinstance(decide(list_tasks, "reader"), Deny)
-    assert isinstance(decide(files.READ_FILE, "justin"), Allow)
+    assert isinstance(decide(files.READ_FILE, "alice"), Allow)
 
 
 async def test_registered_handlers(db: sqlite3.Connection, root: Path, tmp_path: Path) -> None:

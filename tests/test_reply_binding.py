@@ -58,7 +58,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
             }
         }
@@ -103,14 +103,12 @@ def ask(
     """A waiting task with one pending approval, its prompt sent at ``sent``."""
     tid = repo.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
     repo.set_status(db, tid, "running")
-    i = Intent.for_tool(spec, task_id=tid, principal="justin", args=args or {"x": 1})
+    i = Intent.for_tool(spec, task_id=tid, principal="alice", args=args or {"x": 1})
     asked = gate.evaluate(i)
     assert isinstance(asked, NeedsApproval)
     repo.set_status(db, tid, "waiting", wait_reason="approval", wake_at=asked.expires_at)
     if sent is not None:
-        ap.add_channel_ref(
-            db, asked.approval_id, ref=f"r-{asked.code}", at=sent, principal="justin"
-        )
+        ap.add_channel_ref(db, asked.approval_id, ref=f"r-{asked.code}", at=sent, principal="alice")
     return asked
 
 
@@ -121,7 +119,7 @@ def reply(
     code: str | None = None,
     event_id: str = "e1",
     at: datetime = REPLY,
-    actor: str = "justin",
+    actor: str = "alice",
     channel: str = "imessage",
     path: Literal["parser", "classifier"] = "parser",
     comments: str | None = None,
@@ -186,7 +184,7 @@ def test_plain_yes_binds_the_single_pending_approval(
     assert task is not None and task.status == "queued"
     assert len(wakes(db)) == 1
     row = ap.get_approval(db, asked.approval_id)
-    assert row is not None and row.resolved_event_id == "e1" and row.decided_by == "justin"
+    assert row is not None and row.resolved_event_id == "e1" and row.decided_by == "alice"
     assert resolve_audits(db)[-1]["decision"] == "approved"
 
 
@@ -197,7 +195,7 @@ def test_plain_no_denies_and_the_denial_holds(db: sqlite3.Connection, gate: Poli
     assert status(db, asked) == "rejected"
     tid = task_of(db, asked)
     repo.set_status(db, tid, "running")
-    again = gate.evaluate(Intent.for_tool(RESTART, task_id=tid, principal="justin", args={"x": 1}))
+    again = gate.evaluate(Intent.for_tool(RESTART, task_id=tid, principal="alice", args={"x": 1}))
     assert again == Deny(NOT_APPROVED)
 
 
@@ -267,7 +265,7 @@ def test_a_yes_from_a_fast_phone_clock_never_binds_a_later_prompt(
     sent-before rule still refuses it."""
     owner = "+15551234567"
     inbound = Principals.model_validate(
-        {"principals": {"justin": {"role": "owner", "identities": [f"imessage:{owner}"]}}}
+        {"principals": {"alice": {"role": "owner", "identities": [f"imessage:{owner}"]}}}
     )
     chat = FakeChatDB(tmp_path / "chat.db")
     try:
@@ -401,7 +399,7 @@ def test_the_conditional_update_decides_a_race(
 ) -> None:
     """The loser read the approval as pending before the winner committed."""
     asked = ask(db, gate)
-    stale = ap.pending_for(db, "justin", NOW)
+    stale = ap.pending_for(db, "alice", NOW)
     assert reply(gate, event_id="e1").ok
     other_conn = open_db(tmp_path / "test.db")
     try:
@@ -485,7 +483,7 @@ def test_refusals_are_audited_with_the_reply(db: sqlite3.Connection, gate: Polic
 def test_occurred_at_must_be_aware() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         ApprovalReply(
-            "justin",
+            "alice",
             "imessage:+1",
             "imessage",
             "yes",
@@ -501,5 +499,5 @@ def test_approved_reply_then_evaluate_allows(db: sqlite3.Connection, gate: Polic
     assert reply(gate).ok
     tid = task_of(db, asked)
     repo.set_status(db, tid, "running")
-    allow = gate.evaluate(Intent.for_tool(RESTART, task_id=tid, principal="justin", args={"x": 1}))
+    allow = gate.evaluate(Intent.for_tool(RESTART, task_id=tid, principal="alice", args={"x": 1}))
     assert isinstance(allow, Allow) and allow.approval_id == asked.approval_id

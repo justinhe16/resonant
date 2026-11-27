@@ -15,7 +15,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner", "identities": ["imessage:+15550000001", "slack:U1"]},
+                "alice": {"role": "owner", "identities": ["imessage:+15550000001", "slack:U1"]},
                 "cofounder": {
                     "identities": ["slack:U2"],
                     "grants": {"dori": ["request", "approve"]},
@@ -26,15 +26,15 @@ def principals() -> Principals:
 
 
 def test_resolve(principals: Principals) -> None:
-    assert principals.resolve("imessage:+15550000001") == "justin"
+    assert principals.resolve("imessage:+15550000001") == "alice"
     assert principals.resolve("slack:U2") == "cofounder"
     assert principals.resolve("slack:U999") is None
-    assert principals.owner == "justin"
+    assert principals.owner == "alice"
 
 
 def test_owner_can_everything(principals: Principals) -> None:
-    assert principals.can("justin", "admin", None)
-    assert principals.can("justin", "approve", "trade-jev")
+    assert principals.can("alice", "admin", None)
+    assert principals.can("alice", "approve", "trade-jev")
 
 
 def test_cofounder_scoped_to_dori(principals: Principals) -> None:

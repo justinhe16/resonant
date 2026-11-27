@@ -171,10 +171,10 @@ def test_remote_control_url_is_local_only(db: sqlite3.Connection) -> None:
     while it runs); the remote tier and the relay never carry it."""
     now = utcnow()
     url = f"https://claude.ai/code/session_{SECRET}"
-    live = runs.create(db, repo="dori", ask="fix", principal="justin", session_id="s1",
+    live = runs.create(db, repo="dori", ask="fix", principal="alice", session_id="s1",
                        max_seconds=60)  # fmt: skip
     runs.update(db, live.code, status="running", remote_url=url)
-    gone = runs.create(db, repo="dori", ask="fix", principal="justin", session_id="s2",
+    gone = runs.create(db, repo="dori", ask="fix", principal="alice", session_id="s2",
                        max_seconds=60)  # fmt: skip
     runs.update(db, gone.code, status="ready", remote_url=url)
     s = build_snapshot(db, load_settings(), started_at=now, last_tick=now, slots=SlotPool(3, 1),
@@ -231,7 +231,7 @@ def _approval(
             effect=Effect.WRITE,
             level=level,
             summary=summary or f"change {n} {SECRET}",
-            approvers=("justin",),
+            approvers=("alice",),
             code=f"C{n}",
             expires_at=at + timedelta(minutes=30),
             extension=extension,
@@ -262,7 +262,7 @@ def test_a_batch_is_one_row(db: sqlite3.Connection) -> None:
     )
     _approval(db, lone_task, 5, Level.L2, now - timedelta(minutes=1))
     asked = now - timedelta(minutes=2)
-    batch = ap.insert_batch(db, "justin", [a, b, c], asked)
+    batch = ap.insert_batch(db, "alice", [a, b, c], asked)
     ap.set_expiry(db, batch.approval_ids, asked + timedelta(minutes=20))
 
     s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
@@ -299,7 +299,7 @@ def test_a_batch_row_expires_with_its_first_expiry(db: sqlite3.Connection) -> No
     task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
     a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
     b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=10))  # expires first
-    ap.insert_batch(db, "justin", [a, b], now)
+    ap.insert_batch(db, "alice", [a, b], now)
     s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
     [row] = s.model_dump(mode="json")["approvals"]["items"]
     assert row["code"] == "C1"  # the batch's first approval's, though C2 is older
@@ -315,7 +315,7 @@ def test_a_split_batch_shows_what_is_left_as_lone_rows(db: sqlite3.Connection) -
     a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
     b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=4))
     c = _approval(db, task, 3, Level.L3, now - timedelta(minutes=3))
-    ap.insert_batch(db, "justin", [a, b, c], now)
+    ap.insert_batch(db, "alice", [a, b, c], now)
     ap.expire_one(db, a, now, reason="test")
     s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
     d = s.model_dump(mode="json")
@@ -337,7 +337,7 @@ def test_recently_decided_approvals(db: sqlite3.Connection) -> None:
     no = _approval(db, task, 3, Level.L1, now - timedelta(minutes=18))
     gone = _approval(db, task, 4, Level.L2, now - timedelta(minutes=17))
     _approval(db, task, 5, Level.L2, now - timedelta(minutes=1))  # still pending
-    by = "justin"
+    by = "alice"
     assert (
         ap.resolve(db, yes, approved=True, decided_by=by, now=now - timedelta(minutes=10)) is None
     )
@@ -356,7 +356,7 @@ def test_recently_decided_approvals(db: sqlite3.Connection) -> None:
         (no, "rejected"),
         (yes, "approved"),
     ]
-    assert recent[2]["decided_by"] == "justin" and recent[2]["decided_at"] is not None
+    assert recent[2]["decided_by"] == "alice" and recent[2]["decided_at"] is not None
     assert recent[0]["decided_by"] is None
     _check_remote(to_remote(s), s)
 
@@ -369,7 +369,7 @@ def test_untold_counts_what_the_owner_has_not_heard(db: sqlite3.Connection) -> N
     pulse.mark_told(db, [told], now)
     pulse.upsert(db, "github", "ci/b", "new", "low", None, False, 3600, now)
     pulse.upsert(db, "linear", "x", "muted", "urgent", None, False, 3600, now)
-    notify.mute(db, "linear", now + timedelta(hours=1), by="justin")
+    notify.mute(db, "linear", now + timedelta(hours=1), by="alice")
     pulse.upsert(db, "core", "gone", "cleared, owed", "normal", None, True, 3600, now)
     s = build_snapshot(db, load_settings(), started_at=now, now=now, version="deadbeef")
     assert (s.pulse.open, s.pulse.untold) == (3, 3)
@@ -447,7 +447,7 @@ def _busy(db: sqlite3.Connection, now: datetime) -> None:
     task_store.set_status(db, task_id, "waiting", wait_reason="approval", wake_at=now)
 
     r1 = runs.create(
-        db, repo="dori", ask=f"build {SECRET}", principal="justin", session_id="s1", max_seconds=60
+        db, repo="dori", ask=f"build {SECRET}", principal="alice", session_id="s1", max_seconds=60
     )
     runs.update(
         db,
@@ -457,7 +457,7 @@ def _busy(db: sqlite3.Connection, now: datetime) -> None:
         branch=f"resonant/{SECRET}",
         last_note=f"note {SECRET}",
     )
-    r2 = runs.create(db, repo="", ask=f"scratch {SECRET}", principal="justin", session_id="s2",
+    r2 = runs.create(db, repo="", ask=f"scratch {SECRET}", principal="alice", session_id="s2",
                      max_seconds=60)  # fmt: skip
     runs.update(db, r2.code, status="ready", pr_url=f"https://x/{SECRET}", pr_number=7)
     questions.ask(db, r1.code, "ask", f"which db {SECRET}?", options=["a", SECRET], at=now)
@@ -475,7 +475,7 @@ def _busy(db: sqlite3.Connection, now: datetime) -> None:
             effect=Effect.WRITE,
             level=Level.L2,
             summary=f"restart {SECRET}",
-            approvers=("justin",),
+            approvers=("alice",),
             code="K4",
             expires_at=now + timedelta(minutes=30),
         ),
@@ -498,11 +498,11 @@ def _busy(db: sqlite3.Connection, now: datetime) -> None:
                 ],
             },
             installed_at=now,
-            installed_by="justin",
+            installed_by="alice",
         ),
     )
     ext_store.record_run(db, "github", "ci-watch", at=now, outcome="failed", ok=False)
-    notify.mute(db, "github", now + timedelta(hours=1), by="justin")
+    notify.mute(db, "github", now + timedelta(hours=1), by="alice")
     ext_store.record_run(db, "github", "morning", at=now, outcome=f"weird {SECRET}", ok=True)
     trust.add_rule(db, scope="dori", action="merge", effect="ask", created_from="chat", now=now)
     repos.add(db, "justinhe16/dori", base="main", source="test", name="dori", ci=True)
@@ -619,7 +619,7 @@ def test_rows_with_bad_identifiers_are_left_out(db: sqlite3.Connection) -> None:
             manifest_sha="m",
             manifest={"name": name, "jobs": jobs},
             installed_at=now,
-            installed_by="justin",
+            installed_by="alice",
         )
 
     ext_store.save_extension(db, ext("Bad.Ext", []))
@@ -702,7 +702,7 @@ def test_linear_ids() -> None:
         "PER-278",  # its key is in the ask
     ]
     assert linear_ids("try gpt-4 and use GPT 4", "resonant/r3-try-gpt-4") == []
-    assert linear_ids("fix the login", "justin/per-276-fix-login") == ["PER-276"]
+    assert linear_ids("fix the login", "alice/per-276-fix-login") == ["PER-276"]
     assert linear_ids("A-1 ZZZZZZZZZZZ-1 ok", None) == []
     assert len(linear_ids(" ".join(f"AB-{i}" for i in range(1, 12)))) == 5
 
@@ -736,7 +736,7 @@ def test_related_approvals_and_questions(db: sqlite3.Connection) -> None:
     runs.update(db, run.code, task_id=task_id, status="waiting", wait_reason="question")
     pending = _approval(db, task_id, 1, Level.L2, now - timedelta(minutes=5))
     decided = _approval(db, task_id, 2, Level.L2, now - timedelta(minutes=4))
-    assert ap.resolve(db, decided, approved=True, decided_by="justin", now=now) is None
+    assert ap.resolve(db, decided, approved=True, decided_by="alice", now=now) is None
     q = questions.ask(db, run.code, "ask", "which?", options=["a", "b"], at=now)
     other = runs.create(db, repo="", ask="y", principal="j", session_id="s2", max_seconds=60)
     s = build_snapshot(db, load_settings(), started_at=now, now=now)
@@ -783,7 +783,7 @@ def _member_tasks(db: sqlite3.Connection, now: datetime) -> dict[str, tuple[str,
     title (the label), a run and a pending approval. name -> (task id, run code)."""
     out: dict[str, tuple[str, str]] = {}
     for n, (name, principal) in enumerate(
-        (("owner", "justin"), ("member", "teammate"), ("system", None)), start=1
+        (("owner", "alice"), ("member", "teammate"), ("system", None)), start=1
     ):
         tid = task_store.insert_task(
             db,
@@ -805,7 +805,7 @@ def test_a_members_words_are_marked_outside(db: sqlite3.Connection) -> None:
     summary marked outside; the owner's and a principal-less task's are not."""
     now = utcnow().replace(microsecond=0)
     made = _member_tasks(db, now)
-    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="alice")
     tasks = {t.id: t for t in s.tasks.items}
     run_items = {r.code: r for r in s.runs.items}
     approvals = {a.task_id: a for a in s.approvals.items}
@@ -839,7 +839,7 @@ def test_a_members_secret_is_redacted_and_marked(db: sqlite3.Connection) -> None
     ghp = "ghp_" + "a1b2" * 8  # credential-shaped
     db.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"use {ghp} or {SECRET}", tid))
     s = build_snapshot(
-        db, load_settings(), started_at=now, now=now, owner="justin", redactor=Redactor([SECRET])
+        db, load_settings(), started_at=now, now=now, owner="alice", redactor=Redactor([SECRET])
     )
     [t] = s.tasks.items
     assert t.outside == ["title"] and t.title is not None and t.title.startswith("use ")
@@ -851,7 +851,7 @@ def test_tasks_never_ship_their_internals(db: sqlite3.Connection) -> None:
     tid = task_store.insert_task(
         db,
         NewTask(
-            kind="chat", runner="local", priority=1, extension="linear", principal="justin",
+            kind="chat", runner="local", priority=1, extension="linear", principal="alice",
             checkpoint={"title": "plan the week", "claude_reply": "PRIVATE-REPLY"},
             scope={"repo": "PRIVATE-SCOPE"}, channel_ref={"chat": "PRIVATE-CHANNEL"},
         ),
@@ -935,7 +935,7 @@ def test_extension_detail_never_ships_commands_pins_or_paths(db: sqlite3.Connect
         ext_store.ExtensionRecord(
             name="tools", source="path:/Users/PRIVATE/ext", commit="0123456789abcdef0123",
             tree_digest="d", manifest_sha="m", manifest=manifest, installed_at=now,
-            installed_by="justin", argv0_paths={"x": "/PRIVATE/bin/x"},
+            installed_by="alice", argv0_paths={"x": "/PRIVATE/bin/x"},
             mcp_pins={"search": {"server": "remote", "pin": "PRIVATE-PIN", "input_schema": {}}},
         ),
     )  # fmt: skip
@@ -1030,7 +1030,7 @@ def _seed_texts(db: sqlite3.Connection, now: datetime, text: Any) -> None:
     _approval(db, task_id, 1, Level.L2, now, summary=text() or "x")
     a = _approval(db, task_id, 2, Level.L2, now, summary=text() or "x")
     b = _approval(db, task_id, 3, Level.L1, now, summary=text() or "x")
-    ap.insert_batch(db, "justin", [a, b], now)
+    ap.insert_batch(db, "alice", [a, b], now)
     pulse.upsert(db, "core", "k/1", text().strip() or "t", "normal", None, False, 3600, now)
     pulse.upsert(db, "github", "k/2", text().strip() or "t", "low", None, False, 3600, now)
     audit(db, TOOL_ACTION, tool=text(), decision=text(), command=text(), cwd=text(),
@@ -1056,7 +1056,7 @@ def _seed_texts(db: sqlite3.Connection, now: datetime, text: Any) -> None:
         db,
         ext_store.ExtensionRecord(
             name="github", source="repo:github", commit="abc1234", tree_digest="d",
-            manifest_sha="m", installed_at=now, installed_by="justin",
+            manifest_sha="m", installed_at=now, installed_by="alice",
             manifest={"name": "github", "description": text(), "repos": [text()],
                       "jobs": [{"id": "j", "schedule": text(), "tz": text(),
                                 "description": text()}],
@@ -1265,7 +1265,7 @@ def seed_typical(db: sqlite3.Connection, now: datetime) -> None:
             db,
             ext_store.ExtensionRecord(
                 name=f"ext{i}", source="repo:ext", commit="abcdef0123456789", tree_digest="d",
-                manifest_sha="m", installed_at=now, installed_by="justin",
+                manifest_sha="m", installed_at=now, installed_by="alice",
                 manifest={
                     "name": f"ext{i}", "description": "Does useful things for the owner",
                     "secrets": ["token"], "report": {"max_urgency": "normal"},
@@ -1286,7 +1286,7 @@ def seed_typical(db: sqlite3.Connection, now: datetime) -> None:
                      3600, now)  # fmt: skip
     for _ in range(10):
         audit(db, TOOL_ACTION, tool="Bash", decision="allowed", command="git status --short",
-              cwd="/Users/justin/code/dori", status="ok", write=False)  # fmt: skip
+              cwd="/Users/alice/code/dori", status="ok", write=False)  # fmt: skip
     kv_set(db, SESSION_KV, {"session_id": "s", "turns": 12, "pid": 1})
 
 
@@ -1332,7 +1332,7 @@ def seed_worst(db: sqlite3.Connection, now: datetime) -> None:
         a = _approval(db, tid, 100 + i, Level.L2, now, summary=x(500))
         b = _approval(db, tid, 200 + i, Level.L1, now, summary=x(500))
         if i < 25:
-            ap.insert_batch(db, "justin", [a, b], now)
+            ap.insert_batch(db, "alice", [a, b], now)
         else:
             task_store.set_status(db, tid, "waiting", wait_reason="approval")
             assert ap.resolve(db, a, approved=True, decided_by=x(80), now=now) is None
@@ -1346,7 +1346,7 @@ def seed_worst(db: sqlite3.Connection, now: datetime) -> None:
             db,
             ext_store.ExtensionRecord(
                 name=name, source="repo:" + x(50), commit="a" * 40, tree_digest="d",
-                manifest_sha="m", installed_at=now, installed_by="justin",
+                manifest_sha="m", installed_at=now, installed_by="alice",
                 manifest={
                     "name": name, "description": x(200), "secrets": [f"s{k}" for k in range(12)],
                     "repos": [x(150)] * 25, "report": {"max_urgency": "urgent"},
@@ -1381,7 +1381,7 @@ def seed_worst(db: sqlite3.Connection, now: datetime) -> None:
         db,
         ext_store.ExtensionRecord(
             name="aa-panels", source="repo:aa", commit="a" * 40, tree_digest="d",
-            manifest_sha="m", installed_at=now, installed_by="justin",
+            manifest_sha="m", installed_at=now, installed_by="alice",
             manifest=panel_manifest("aa-panels", ids),
         ),
     )  # fmt: skip
@@ -1475,7 +1475,7 @@ def _panel_ext(
         db,
         ext_store.ExtensionRecord(
             name=name, source=f"repo:{name}", commit="a" * 40, tree_digest="d", manifest_sha="m",
-            installed_at=now, installed_by="justin", manifest=panel_manifest(name, ids),
+            installed_at=now, installed_by="alice", manifest=panel_manifest(name, ids),
             status=cast(Any, status),
         ),
     )  # fmt: skip
@@ -1705,7 +1705,7 @@ def test_without_jobs_slack_or_members_the_dump_is_unchanged(db: sqlite3.Connect
     assert "jobs" not in dump and "channels" not in dump
     assert all("requested_by" not in r for r in dump["runs"]["items"])
     assert all("requested_by" not in a for a in dump["approvals"]["items"])
-    owner = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    owner = build_snapshot(db, load_settings(), started_at=now, now=now, owner="alice")
     odump = owner.model_dump(mode="json")
     assert "jobs" not in odump and "channels" not in odump
 
@@ -1713,7 +1713,7 @@ def test_without_jobs_slack_or_members_the_dump_is_unchanged(db: sqlite3.Connect
 def test_who_asked_is_named_when_it_isnt_the_owner(db: sqlite3.Connection) -> None:
     now = utcnow().replace(microsecond=0)
     made = _member_tasks(db, now)
-    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="alice")
     run_items = {r.code: r for r in s.runs.items}
     approvals = {a.task_id: a for a in s.approvals.items}
     member_task, member_run = made["member"]
@@ -1722,9 +1722,9 @@ def test_who_asked_is_named_when_it_isnt_the_owner(db: sqlite3.Connection) -> No
     owner_task, owner_run = made["owner"]
     assert run_items[owner_run].requested_by is None
     assert approvals[owner_task].requested_by is None
-    asked = runs.create(db, repo="", ask="for bob", principal="justin", session_id="b",
+    asked = runs.create(db, repo="", ask="for bob", principal="alice", session_id="b",
                         max_seconds=60, requested_by="bob")  # fmt: skip
-    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="alice")
     assert {r.code: r for r in s.runs.items}[asked.code].requested_by == "bob"
     assert "requested_by" in to_remote(s).model_dump(mode="json")["runs"]["items"][0]
 
@@ -1735,26 +1735,26 @@ def test_registered_jobs(db: sqlite3.Connection) -> None:
     now = datetime(2026, 11, 20, 17, 0, tzinfo=UTC)
     a = job_store.create(db, name="flaky CI", schedule="0 9 * * 1", tz="America/Los_Angeles",
                          prompt="check flaky CI " + SECRET, repo=None, output="room:eng",
-                         created_by="justin", channel_ref=None, now=now)  # fmt: skip
+                         created_by="alice", channel_ref=None, now=now)  # fmt: skip
     b = job_store.create(db, name="member's job", schedule="30 8 * * *", tz="UTC",
                          prompt="x", repo=None, output="thread", created_by="slack:U1",
                          channel_ref=None, now=now)  # fmt: skip
     gone = job_store.create(db, name="gone", schedule="0 1 * * *", tz="UTC", prompt="x",
-                            repo=None, output="dm", created_by="justin", channel_ref=None,
+                            repo=None, output="dm", created_by="alice", channel_ref=None,
                             now=now)  # fmt: skip
-    run = runs.create(db, repo="", ask="job run", principal="justin", session_id="j",
+    run = runs.create(db, repo="", ask="job run", principal="alice", session_id="j",
                       max_seconds=60)  # fmt: skip
     runs.update(db, run.code, status="failed")
     job_store.started(db, a.id, run.code, now)
     job_store.set_state(db, b.id, "paused", now, expect=("active",))
     job_store.set_state(db, gone.id, "deleted", now, expect=("active",))
-    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="alice")
     jobs = {j.id: j for j in s.jobs}
     assert set(jobs) == {a.id, b.id}
     ja, jb = jobs[a.id], jobs[b.id]
     assert (ja.name, ja.kind, ja.state, ja.output) == ("flaky CI", "schedule", "active", "room:eng")
     assert ja.next_due == datetime(2026, 11, 23, 17, 0, tzinfo=UTC)  # Monday 09:00 PT
-    assert (ja.last_run_code, ja.last_run_status, ja.created_by) == (run.code, "failed", "justin")
+    assert (ja.last_run_code, ja.last_run_status, ja.created_by) == (run.code, "failed", "alice")
     assert ja.outside == []
     assert jb.state == "paused" and jb.next_due is None and jb.last_run_code is None
     assert jb.outside == ["name"]  # a member's words

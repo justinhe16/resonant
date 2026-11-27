@@ -72,7 +72,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
             }
         }
@@ -126,7 +126,7 @@ def intent(
     task_id: str,
     *,
     origin: Origin = "inferred",
-    principal: str = "justin",
+    principal: str = "alice",
     **args: Any,
 ) -> Intent:
     return Intent.for_tool(
@@ -139,7 +139,7 @@ def audits(db: sqlite3.Connection, action: str) -> list[sqlite3.Row]:
 
 
 def approve(gate: PolicyGate, approval_id: str, *, approved: bool = True) -> None:
-    result = gate.resolve(ApprovalResolution(approval_id, approved, "justin", "cli", path="cli"))
+    result = gate.resolve(ApprovalResolution(approval_id, approved, "alice", "cli", path="cli"))
     assert result.ok, result.reason
 
 
@@ -267,13 +267,13 @@ def test_tainted_remember_and_forget_ask(
     for spec, args in ((facts.REMEMBER, {"name": "mycelium-path", "description": "where"}),
                        (facts.FORGET, {"name": "mycelium-path"})):  # fmt: skip
         assert spec.effective_level is Level.L3
-        i = Intent.for_tool(spec, task_id=task_id, principal="justin", args=args, origin=origin)
+        i = Intent.for_tool(spec, task_id=task_id, principal="alice", args=args, origin=origin)
         d = gate.evaluate(i)
         if origin == "tainted":
             assert isinstance(d, NeedsApproval) and not d.require_code and not d.allow_always
         else:
             assert isinstance(d, Allow)
-    listed = Intent.for_tool(facts.LIST_FACTS, task_id=task_id, principal="justin", args={},
+    listed = Intent.for_tool(facts.LIST_FACTS, task_id=task_id, principal="alice", args={},
                              origin="tainted")  # fmt: skip
     assert isinstance(gate.evaluate(listed), Allow)
 
@@ -341,11 +341,11 @@ def test_decision_matrix(
         return
     assert isinstance(decision, NeedsApproval)
     assert decision.require_code is (verdict == "ask_code")
-    assert decision.approvers == ("justin",)
+    assert decision.approvers == ("alice",)
     assert decision.expires_at == NOW + timedelta(seconds=TTL_S)
     assert (decision.effect, decision.level) == (spec.effect, level)
     row = ap.get_approval(db, decision.approval_id)
-    assert row is not None and row.code == decision.code and row.requested_by == "justin"
+    assert row is not None and row.code == decision.code and row.requested_by == "alice"
 
 
 def test_veto_never_returned_and_every_evaluate_audited_once(
@@ -422,7 +422,7 @@ def test_unsafe_args_denied_without_echo(
     db: sqlite3.Connection, gate: PolicyGate, task_id: str, args: dict[str, Any]
 ) -> None:
     for spec in (PEEK, LABEL, WIPE):
-        d = gate.evaluate(Intent.for_tool(spec, task_id=task_id, principal="justin", args=args))
+        d = gate.evaluate(Intent.for_tool(spec, task_id=task_id, principal="alice", args=args))
         assert isinstance(d, Deny)
         assert "evil" not in d.reason and "key" not in d.reason and "deep" not in d.reason
     assert db.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 0
@@ -476,7 +476,7 @@ def test_summary_action_hook(
 
     kv_set(db, "autonomy", "on")
     gate = make_gate(db, principals, registry, clock, actions={(None, "clear_notes"): clear_action})
-    d = gate.evaluate(Intent.for_tool(CLEAR_NOTES, task_id=task_id, principal="justin", args={}))
+    d = gate.evaluate(Intent.for_tool(CLEAR_NOTES, task_id=task_id, principal="alice", args={}))
     assert isinstance(d, NeedsApproval) and d.summary == "delete all 4 notes"
 
 
@@ -541,7 +541,7 @@ def test_rejection_holds(db: sqlite3.Connection, gate: PolicyGate, task_id: str)
     assert gate.evaluate(i) == Deny(NOT_APPROVED)
     # Even with a newer row for the intent, the rejection still holds.
     newer = ap.NewApproval(
-        task_id, i.hash, "label", Effect.WRITE, Level.L3, "label", ("justin",), "C3", NOW
+        task_id, i.hash, "label", Effect.WRITE, Level.L3, "label", ("alice",), "C3", NOW
     )
     ap.insert_approval(db, newer, NOW + timedelta(seconds=1))
     assert gate.evaluate(i) == Deny(NOT_APPROVED)
@@ -555,12 +555,12 @@ def test_expiry_is_lazy(
     i = intent(RESTART, task_id)
     asked = gate.evaluate(i)
     assert isinstance(asked, NeedsApproval)
-    assert [p.approval_id for p in gate.pending_for("justin")] == [asked.approval_id]
+    assert [p.approval_id for p in gate.pending_for("alice")] == [asked.approval_id]
     clock.now = asked.expires_at
-    assert gate.pending_for("justin") == ()
+    assert gate.pending_for("alice") == ()
     assert len(audits(db, "approval.expired")) == 1
     assert gate.evaluate(i) == Deny(APPROVAL_EXPIRED)
-    late = gate.resolve(ApprovalResolution(asked.approval_id, True, "justin", "cli", "cli"))
+    late = gate.resolve(ApprovalResolution(asked.approval_id, True, "alice", "cli", "cli"))
     assert not late.ok and late.reason == "expired"
 
 
@@ -573,7 +573,7 @@ def test_resolve_checks_approver_and_wakes_the_task(
 
     nope = gate.resolve(ApprovalResolution(asked.approval_id, True, "cofounder", "x", "cli"))
     assert not nope.ok and nope.reason == "not_found"  # same answer as a missing id
-    missing = gate.resolve(ApprovalResolution("nope", True, "justin", "cli", "cli"))
+    missing = gate.resolve(ApprovalResolution("nope", True, "alice", "cli", "cli"))
     assert not missing.ok and missing.reason == "not_found"
 
     approve(gate, asked.approval_id)
@@ -581,7 +581,7 @@ def test_resolve_checks_approver_and_wakes_the_task(
     assert task is not None and task.status == "queued"
     events = repo.pending_events(db, task_id)
     assert [(e.source, e.type) for e in events] == [("gate", "approval.reply")]
-    again = gate.resolve(ApprovalResolution(asked.approval_id, True, "justin", "cli", "cli"))
+    again = gate.resolve(ApprovalResolution(asked.approval_id, True, "alice", "cli", "cli"))
     assert not again.ok and again.reason == "already_resolved"
     rows = audits(db, "approval.resolve")
     assert [r["decision"] for r in rows] == ["refused", "refused", "approved", "refused"]
@@ -593,7 +593,7 @@ def test_a_batch_needs_two_pending_approvals(gate: PolicyGate) -> None:
     contract: Gate = gate  # PolicyGate satisfies the Gate protocol
     assert contract is gate
     with pytest.raises(ValueError, match="at least two"):
-        gate.open_batch("justin", [])
+        gate.open_batch("alice", [])
 
 
 def test_tokens_are_single_use_and_hash_bound(gate: PolicyGate, task_id: str) -> None:
@@ -652,7 +652,7 @@ def team() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
                 "viewer": {"grants": {"dori": ["request"]}},  # no approve
                 "elsewhere": {"grants": {"trade": ["request", "approve"]}},  # other extension
@@ -680,14 +680,14 @@ def team_gate(
 def test_approvers_are_manifest_names_with_the_grant(
     db: sqlite3.Connection, clock: Clock, task_id: str
 ) -> None:
-    named = ["viewer", "ghost", "cofounder", "elsewhere", "cofounder", "justin"]
+    named = ["viewer", "ghost", "cofounder", "elsewhere", "cofounder", "alice"]
     gate = team_gate(db, clock, named)
-    assert gate.approvers("dori") == ("justin", "cofounder")
+    assert gate.approvers("dori") == ("alice", "cofounder")
 
     asked = gate.evaluate(intent(EXT_ROTATE, task_id, origin="scheduled"))
-    assert isinstance(asked, NeedsApproval) and asked.approvers == ("justin", "cofounder")
+    assert isinstance(asked, NeedsApproval) and asked.approvers == ("alice", "cofounder")
     row = ap.get_approval(db, asked.approval_id)
-    assert row is not None and row.approvers == ("justin", "cofounder")
+    assert row is not None and row.approvers == ("alice", "cofounder")
 
 
 def test_an_extension_cant_grant_itself_approvers(
@@ -696,7 +696,7 @@ def test_an_extension_cant_grant_itself_approvers(
     # Naming principals in the manifest grants nothing: only principals.yaml does.
     gate = team_gate(db, clock, ["viewer", "elsewhere", "ghost"])
     asked = gate.evaluate(intent(EXT_ROTATE, task_id))
-    assert isinstance(asked, NeedsApproval) and asked.approvers == ("justin",)
+    assert isinstance(asked, NeedsApproval) and asked.approvers == ("alice",)
     nope = gate.resolve(ApprovalResolution(asked.approval_id, True, "viewer", "x", "cli"))
     assert not nope.ok and nope.reason == "not_found"
 
@@ -704,7 +704,7 @@ def test_an_extension_cant_grant_itself_approvers(
 def test_default_extension_approvers_are_the_owner(
     db: sqlite3.Connection, principals: Principals, registry: ToolRegistry, clock: Clock
 ) -> None:
-    assert make_gate(db, principals, registry, clock).approvers("dori") == ("justin",)
+    assert make_gate(db, principals, registry, clock).approvers("dori") == ("alice",)
 
 
 def test_builtins_never_consult_a_manifest(
@@ -713,7 +713,7 @@ def test_builtins_never_consult_a_manifest(
     calls: list[str] = []
     gate = team_gate(db, clock, ["cofounder"], calls)
     asked = gate.evaluate(intent(RESTART, task_id))
-    assert isinstance(asked, NeedsApproval) and asked.approvers == ("justin",)
+    assert isinstance(asked, NeedsApproval) and asked.approvers == ("alice",)
     assert calls == []
 
 

@@ -198,7 +198,7 @@ async def test_cori_pushes_as_cori_with_members_words_marked_and_scrubbed(
 
     async def snapshot(redactor: Redactor) -> Snapshot:
         return build_snapshot(db, settings, started_at=T0, now=utcnow(), version="abcdef12",
-                              redactor=redactor, owner="justin")  # fmt: skip
+                              redactor=redactor, owner="alice")  # fmt: skip
 
     fake = FakeSupabase()
     p = SnapshotPusher(
@@ -893,7 +893,7 @@ def test_dropping_panels_is_enough_when_they_are_what_is_over(
         db,
         ext_store.ExtensionRecord(
             name="ledger", source="repo:ledger", commit="a" * 40, tree_digest="d",
-            manifest_sha="m", installed_at=now, installed_by="justin",
+            manifest_sha="m", installed_at=now, installed_by="alice",
             manifest=panel_manifest("ledger", ids),
         ),
     )  # fmt: skip
@@ -943,7 +943,7 @@ def test_twenty_extensions_of_maxed_out_panels_still_shrink_to_fit(
             db,
             ext_store.ExtensionRecord(
                 name=name, source="repo:x", commit="a" * 40, tree_digest="d", manifest_sha="m",
-                installed_at=now, installed_by="justin", manifest=manifest,
+                installed_at=now, installed_by="alice", manifest=manifest,
             ),
         )  # fmt: skip
         for pid in ids:
@@ -1025,7 +1025,7 @@ def _history_ext(db: sqlite3.Connection) -> None:
         db,
         ext_store.ExtensionRecord(
             name="ledger", source="repo:ledger", commit="a" * 40, tree_digest="d",
-            manifest_sha="m", manifest=manifest, installed_at=T0, installed_by="justin",
+            manifest_sha="m", manifest=manifest, installed_at=T0, installed_by="alice",
         ),
     )  # fmt: skip
     data = json.dumps(normalized(raw_panel(points=20, rows=3, items=3, details=3)).data)

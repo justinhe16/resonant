@@ -131,7 +131,7 @@ class Slack(Transport):
 
 def principals_yaml(*identities: str) -> str:
     quoted = ", ".join(f'"{i}"' for i in identities)
-    return f"principals:\n  justin:\n    role: owner\n    identities: [{quoted}]\n"
+    return f"principals:\n  alice:\n    role: owner\n    identities: [{quoted}]\n"
 
 
 @contextlib.asynccontextmanager
@@ -297,7 +297,7 @@ async def test_two_adapters_reply_on_the_channel_asked_proactive_to_the_first_id
         assert (await next_sent(im, 1, "the imessage reply"))[0] == GOLDEN_REPLY[0]
         assert len(fake.sent) == 1  # the iMessage reply didn't go to Slack
         # a proactive text (no thread): the owner's first identity, iMessage
-        await hub.send("justin", "hey, some issues here", dedupe_key="t:proactive")
+        await hub.send("alice", "hey, some issues here", dedupe_key="t:proactive")
         assert w.osa.sent[-1].text == "hey, some issues here" and len(fake.sent) == 1
 
 
@@ -308,5 +308,5 @@ async def test_a_principal_with_no_running_identity_is_refused(
     async with running(w, resonant_home, f"imessage:{OWNER_PHONE}", imessage=False) as (d, _):
         assert d.stack is not None
         with pytest.raises(ChannelRefused):
-            await d.stack.channel.send("justin", "hello", dedupe_key="t:refused")
+            await d.stack.channel.send("alice", "hello", dedupe_key="t:refused")
     assert w.osa.sent == []

@@ -44,7 +44,7 @@ def _approval(
     *,
     code: str = "A7",
     intent_hash: str = "h1",
-    approvers: tuple[str, ...] = ("justin",),
+    approvers: tuple[str, ...] = ("alice",),
     expires_at: datetime = NOW + TTL,
     require_code: bool = False,
 ) -> str:
@@ -59,7 +59,7 @@ def _approval(
         code=code,
         expires_at=expires_at,
         require_code=require_code,
-        requested_by="justin",
+        requested_by="alice",
     )
     return ap.insert_approval(db, spec, NOW)
 
@@ -102,7 +102,7 @@ def test_migration_003_over_populated_002(tmp_path: Path) -> None:
     conn.execute(
         """INSERT INTO approvals (id, task_id, intent_hash, tool, effect, level, summary,
                approvers, status, expires_at, created_at, require_code, code)
-           VALUES ('a1', ?, 'h', 'x', 'write', 'L1', 's', '["justin"]', 'pending', ?, ?,
+           VALUES ('a1', ?, 'h', 'x', 'write', 'L1', 's', '["alice"]', 'pending', ?, ?,
                    1, 'D7')""",
         (task_id, iso(NOW + TTL), ts),
     )
@@ -118,7 +118,7 @@ def test_migration_003_over_populated_002(tmp_path: Path) -> None:
     assert a is not None
     assert (a.status, a.code, a.require_code) == ("pending", "D7", True)
     assert a.used_at is None and a.resolved_event_id is None
-    assert a.approvers == ("justin",) and a.channel_refs == ()
+    assert a.approvers == ("alice",) and a.channel_refs == ()
     conn.close()
     open_existing(path).close()
 
@@ -128,7 +128,7 @@ def test_migration_003_over_populated_002(tmp_path: Path) -> None:
 
 def test_insert_and_lookups(db: sqlite3.Connection) -> None:
     task_id = _task(db)
-    aid = _approval(db, task_id, approvers=("justin", "cofounder"))
+    aid = _approval(db, task_id, approvers=("alice", "cofounder"))
     a = ap.get_approval(db, aid)
     assert a is not None
     assert (a.task_id, a.tool, a.effect, a.level, a.status) == (
@@ -140,10 +140,10 @@ def test_insert_and_lookups(db: sqlite3.Connection) -> None:
     )
     assert a.expires_at == NOW + TTL and a.created_at == NOW
 
-    assert [p.id for p in ap.pending_for(db, "justin", NOW)] == [aid]
+    assert [p.id for p in ap.pending_for(db, "alice", NOW)] == [aid]
     assert [p.id for p in ap.pending_for(db, "cofounder", NOW)] == [aid]
     assert ap.pending_for(db, "stranger", NOW) == []
-    assert ap.pending_for(db, "justin", NOW + TTL) == []  # expired, even before expire_due
+    assert ap.pending_for(db, "alice", NOW + TTL) == []  # expired, even before expire_due
 
     pending = ap.pending_for_intent(db, task_id, "h1", NOW)
     assert pending is not None and pending.id == aid
@@ -164,13 +164,13 @@ def test_one_pending_per_intent_and_unique_codes(db: sqlite3.Connection) -> None
 
 def test_channel_refs_keep_first_send(db: sqlite3.Connection) -> None:
     aid = _approval(db, _task(db))
-    assert ap.add_channel_ref(db, aid, ref="g1", at=NOW, principal="justin")
-    assert not ap.add_channel_ref(db, aid, ref="g1", at=NOW + TTL, principal="justin")
+    assert ap.add_channel_ref(db, aid, ref="g1", at=NOW, principal="alice")
+    assert not ap.add_channel_ref(db, aid, ref="g1", at=NOW + TTL, principal="alice")
     assert ap.add_channel_ref(db, aid, ref="g2", at=NOW + timedelta(seconds=5), principal="co")
     a = ap.get_approval(db, aid)
     assert a is not None
     assert [r.ref for r in a.channel_refs] == ["g1", "g2"]
-    assert a.sent_at("justin") == NOW
+    assert a.sent_at("alice") == NOW
     assert a.sent_at("nobody") is None
 
 
@@ -180,23 +180,23 @@ def test_channel_refs_keep_first_send(db: sqlite3.Connection) -> None:
 def test_resolve_approves_once(db: sqlite3.Connection) -> None:
     task_id = _task(db)
     aid = _approval(db, task_id)
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW, event_id="e1") is None
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW, event_id="e1") is None
     a = ap.get_approval(db, aid)
     assert a is not None
     assert (a.status, a.decided_by, a.decided_at, a.resolved_event_id) == (
         "approved",
-        "justin",
+        "alice",
         NOW,
         "e1",
     )
-    again = ap.resolve(db, aid, approved=False, decided_by="justin", now=NOW, event_id="e2")
+    again = ap.resolve(db, aid, approved=False, decided_by="alice", now=NOW, event_id="e2")
     assert again == "already_resolved"
     assert _status(db, aid) == "approved"
 
 
 def test_resolve_reject(db: sqlite3.Connection) -> None:
     aid = _approval(db, _task(db))
-    assert ap.resolve(db, aid, approved=False, decided_by="justin", now=NOW) is None
+    assert ap.resolve(db, aid, approved=False, decided_by="alice", now=NOW) is None
     assert _status(db, aid) == "rejected"
 
 
@@ -204,10 +204,10 @@ def test_resolve_refuses_expired(db: sqlite3.Connection) -> None:
     task_id = _task(db)
     aid = _approval(db, task_id)
     late = NOW + TTL
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=late) == "expired"
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=late) == "expired"
     assert _status(db, aid) == "pending"  # lazily expired by expire_due, not by resolve
     assert ap.expire_due(db, late) == 1
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW) == "expired"
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW) == "expired"
 
 
 def test_a_worker_check_resolves_while_its_task_is_queued(db: sqlite3.Connection) -> None:
@@ -218,29 +218,27 @@ def test_a_worker_check_resolves_while_its_task_is_queued(db: sqlite3.Connection
         db,
         ap.NewApproval(task_id=task_id, intent_hash="c1", tool=ap.CHECK_TOOL,
                        effect=Effect.WRITE, level=Level.L2, summary="R4 wants to deploy",
-                       approvers=("justin",), code="C4", expires_at=NOW + TTL,
+                       approvers=("alice",), code="C4", expires_at=NOW + TTL,
                        requested_by="R4"),
         NOW,
     )  # fmt: skip
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW) is None
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW) is None
     assert _status(db, aid) == "approved"
     other = _approval(db, task_id, code="D6", intent_hash="h2")
-    assert ap.resolve(db, other, approved=True, decided_by="justin", now=NOW) == (
-        "task_not_waiting"
-    )
+    assert ap.resolve(db, other, approved=True, decided_by="alice", now=NOW) == ("task_not_waiting")
 
 
 def test_resolve_refuses_task_not_waiting(db: sqlite3.Connection) -> None:
     task_id = _task(db, "queued")
     aid = _approval(db, task_id)
-    refusal = ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW)
+    refusal = ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW)
     assert refusal == "task_not_waiting"
     repo.set_status(db, task_id, "running")
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW) is None
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW) is None
 
 
 def test_resolve_unknown(db: sqlite3.Connection) -> None:
-    assert ap.resolve(db, "nope", approved=True, decided_by="justin", now=NOW) == "not_found"
+    assert ap.resolve(db, "nope", approved=True, decided_by="alice", now=NOW) == "not_found"
 
 
 def test_two_connections_race_one_wins(tmp_path: Path) -> None:
@@ -248,7 +246,7 @@ def test_two_connections_race_one_wins(tmp_path: Path) -> None:
     a, b = open_db(path), open_db(path)
     aid = _approval(a, _task(a))
     with transaction(a):
-        first = ap.resolve(a, aid, approved=True, decided_by="justin", now=NOW, event_id="e1")
+        first = ap.resolve(a, aid, approved=True, decided_by="alice", now=NOW, event_id="e1")
     with transaction(b):
         second = ap.resolve(b, aid, approved=False, decided_by="cli", now=NOW, event_id="e2")
     assert (first, second) == (None, "already_resolved")
@@ -260,7 +258,7 @@ def test_two_connections_race_one_wins(tmp_path: Path) -> None:
 def test_by_resolved_event_rebuilds_result(db: sqlite3.Connection) -> None:
     task_id = _task(db)
     aid = _approval(db, task_id)
-    ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW, event_id="e1")
+    ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW, event_id="e1")
     result = ap.resolve_result(ap.by_resolved_event(db, "e1"))
     assert result == ResolveResult(ok=True, resolved=(ResolvedApproval(aid, task_id, "h1", True),))
 
@@ -273,7 +271,7 @@ def test_mark_used_once(db: sqlite3.Connection) -> None:
     aid = _approval(db, task_id)
     assert not ap.mark_used(db, aid, NOW)  # still pending
     assert ap.approved_unused(db, task_id, "h1") is None
-    ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW)
+    ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW)
     unused = ap.approved_unused(db, task_id, "h1")
     assert unused is not None and unused.id == aid
     # Valid for the life of the task: no expiry check once approved.
@@ -296,7 +294,7 @@ def _repin(db: sqlite3.Connection, tool: str = "mcp_repin", code: str = "A8") ->
         effect=Effect.WRITE,
         level=Level.L2,
         summary="Mail changed sleep (+required field team). Accept",
-        approvers=("justin",),
+        approvers=("alice",),
         code=code,
         expires_at=NOW + TTL,
         extension="mail",
@@ -311,8 +309,8 @@ def test_a_repin_question_resolves_without_a_task_and_other_task_less_rows_do_no
     db: sqlite3.Connection,
 ) -> None:
     yes, other = _repin(db), _repin(db, tool="other", code="A9")
-    assert ap.resolve(db, other, approved=True, decided_by="justin", now=NOW) == "task_not_waiting"
-    assert ap.resolve(db, yes, approved=True, decided_by="justin", now=NOW) is None
+    assert ap.resolve(db, other, approved=True, decided_by="alice", now=NOW) == "task_not_waiting"
+    assert ap.resolve(db, yes, approved=True, decided_by="alice", now=NOW) is None
     a = ap.get_approval(db, yes)
     assert a is not None and a.status == "approved" and a.task_id is None
     resolved = a.resolved()  # no task: an empty id, which ``wake_resolved`` skips
@@ -323,8 +321,8 @@ def test_a_repin_question_resolves_without_a_task_and_other_task_less_rows_do_no
 
 def test_settle_spends_a_decided_repin_once_either_way(db: sqlite3.Connection) -> None:
     yes, no, pending = _repin(db), _repin(db, code="A9"), _repin(db, code="B1")
-    ap.resolve(db, yes, approved=True, decided_by="justin", now=NOW)
-    ap.resolve(db, no, approved=False, decided_by="justin", now=NOW)
+    ap.resolve(db, yes, approved=True, decided_by="alice", now=NOW)
+    ap.resolve(db, no, approved=False, decided_by="alice", now=NOW)
     assert not ap.settle(db, pending, NOW)  # nothing decided
     assert {a.id for a in ap.unsettled_repins(db)} == {yes, no}
     assert ap.settle(db, yes, NOW) and not ap.settle(db, yes, NOW)
@@ -369,7 +367,7 @@ def test_orphans_expire_on_save_step(db: sqlite3.Connection, status: TaskStatus)
     orphaned = _audits(db, "approval.orphaned")
     assert [json.loads(r["detail"])["approval_id"] for r in orphaned] == [aid]
     # A later yes binds nothing.
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW) == "expired"
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW) == "expired"
 
 
 @pytest.mark.parametrize("status", ["done", "failed", "cancelled"])
@@ -395,7 +393,7 @@ def test_non_terminal_and_refused_changes_keep_approvals(db: sqlite3.Connection)
 def test_orphans_keep_decided_approvals(db: sqlite3.Connection) -> None:
     task_id = _task(db)
     aid = _approval(db, task_id)
-    ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW)
+    ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW)
     repo.set_status(db, task_id, "done")
     assert _status(db, aid) == "approved"
 
@@ -415,7 +413,7 @@ def test_orphans_expire_when_crash_recovery_fails_a_task(db: sqlite3.Connection)
 
 
 def _resolved(db: sqlite3.Connection, aid: str) -> ResolveResult:
-    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW, event_id="e1") is None
+    assert ap.resolve(db, aid, approved=True, decided_by="alice", now=NOW, event_id="e1") is None
     return ap.resolve_result(ap.by_resolved_event(db, "e1"))
 
 
@@ -430,12 +428,12 @@ def test_wake_resolved_requeues_waiting_task_once(db: sqlite3.Connection) -> Non
     aid = _approval(db, task_id)
     with transaction(db):
         result = _resolved(db, aid)
-        assert ap.wake_resolved(db, result, NOW, principal="justin") == 1
+        assert ap.wake_resolved(db, result, NOW, principal="alice") == 1
     task = repo.get_task(db, task_id)
     assert task is not None
     assert (task.status, task.wait_reason, task.wake_at) == ("queued", None, None)
     (event,) = repo.pending_events(db, task_id)
-    assert (event.type, event.principal, event.occurred_at) == ("approval.reply", "justin", NOW)
+    assert (event.type, event.principal, event.occurred_at) == ("approval.reply", "alice", NOW)
     assert event.payload == {"approval_id": aid, "approved": True}
     assert event.trace_id == task.trace_id
 
@@ -466,10 +464,10 @@ def test_wake_resolved_ignores_unknown_task(db: sqlite3.Connection) -> None:
 
 def test_count_pending_skips_expired_and_resolved(db: sqlite3.Connection) -> None:
     assert ap.count_pending(db, NOW) == 0
-    _approval(db, _task(db), code="A1", approvers=("justin",))
+    _approval(db, _task(db), code="A1", approvers=("alice",))
     _approval(db, _task(db), code="A2", approvers=("alex",))
     _approval(db, _task(db), code="A3", expires_at=NOW - timedelta(seconds=1))
     done = _approval(db, _task(db), code="A4")
-    assert ap.resolve(db, done, approved=False, decided_by="justin", now=NOW) is None
+    assert ap.resolve(db, done, approved=False, decided_by="alice", now=NOW) is None
     assert ap.count_pending(db, NOW) == 2  # every approver; expired rows don't count
     assert ap.count_pending(db, NOW + TTL) == 0

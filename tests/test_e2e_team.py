@@ -3,18 +3,18 @@
 The real daemon (router, gate, loop, ``ClaudeRunner``, worker CLI) as in
 ``test_e2e_channels``, over ``e2e.FakeChannel("slack", vouch=True)`` only, with a team:
 
-- justin (owner), brian (approver), miu (member: ``dori`` per-tool grants), and the workspace
+- alice (owner), bob (approver), carol (member: ``dori`` per-tool grants), and the workspace
   default (any unlisted ``slack:<id>`` the adapter vouches for: ``file_ticket`` only).
 - A tiny ``dori`` fixture extension with ``file_ticket`` (L3 write) and ``prod_deploy``
   (L2 write).
 
 Acceptance (the ticket's criteria):
-- Brian starts a run, approves a gated builtin, and approves his own request.
-- Miu and an unlisted workspace user can call ``file_ticket`` but not ``prod_deploy``;
+- Bob starts a run, approves a gated builtin, and approves his own request.
+- Carol and an unlisted workspace user can call ``file_ticket`` but not ``prod_deploy``;
   ``/run`` and ``/merge`` are refused with who can start work. Claude offers them only
   their tools.
-- Brian can't use admin commands.
-- Brian's "pause" pauses this instance (``approver:brian``), his "resume" resumes it; he
+- Bob can't use admin commands.
+- Bob's "pause" pauses this instance (``approver:bob``), his "resume" resumes it; he
   can't resume a ``sibling:resonant`` pause; members can do neither.
 """
 
@@ -52,13 +52,13 @@ from resonant.store.db import kv_get, open_db
 
 __all__ = ["chat"]  # the fixture
 
-JUSTIN, BRIAN, MIU, STRANGER = "U1", "U2", "U3", "U9"
+ALICE, BOB, CAROL, STRANGER = "U1", "U2", "U3", "U9"
 TEAM = f"""\
 principals:
-  justin: {{role: owner, identities: ["slack:{JUSTIN}"]}}
-  brian: {{role: approver, identities: ["slack:{BRIAN}"]}}
-  miu:
-    identities: ["slack:{MIU}"]
+  alice: {{role: owner, identities: ["slack:{ALICE}"]}}
+  bob: {{role: approver, identities: ["slack:{BOB}"]}}
+  carol:
+    identities: ["slack:{CAROL}"]
     grants: {{dori: {{request: [file_ticket, find_tickets]}}}}
 default: {{channel: slack, grants: {{dori: {{request: [file_ticket]}}}}}}
 """
@@ -84,7 +84,7 @@ DORI_CLI = r"""
 import json, sys
 print(json.dumps({"op": sys.argv[1], "arg": sys.argv[2], "ok": True}))
 """
-WORK_LINE = "Only Justin or Brian can start work. I can file a ticket for it instead."
+WORK_LINE = "Only Alice or Bob can start work. I can file a ticket for it instead."
 
 
 @contextlib.asynccontextmanager
@@ -154,7 +154,7 @@ async def test_members_file_tickets_but_never_deploy_or_start_work(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
-        for uid, name in ((MIU, "miu"), (STRANGER, f"slack:{STRANGER}")):
+        for uid, name in ((CAROL, "carol"), (STRANGER, f"slack:{STRANGER}")):
             user = Slack(fake, uid, name)
             if uid == STRANGER:
                 user.seen = len(user.texts())
@@ -178,35 +178,35 @@ async def test_members_file_tickets_but_never_deploy_or_start_work(
         assert [(r["tool"], r["decision"]) for r in rows] == [("file_ticket", "Allow")] * 2
 
 
-async def test_brian_starts_a_run_and_approves_his_own_gated_builtin(
+async def test_bob_starts_a_run_and_approves_his_own_gated_builtin(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
-        brian = Slack(fake, BRIAN, "brian")
-        started = await brian.say(f"/run {REPO} fix the typo in the README")
+        bob = Slack(fake, BOB, "bob")
+        started = await bob.say(f"/run {REPO} fix the typo in the README")
         assert started.startswith("On it: R1"), started
         await until(
             lambda: d.conn.execute("SELECT 1 FROM runs WHERE code = 'R1'").fetchone() is not None,
             20,
             "the run row",
         )
-        # A gated builtin: clearing notes is L1 and always asks, of justin and brian.
-        assert await brian.say("/note buy milk") == 'Saved note 1: "buy milk"'
+        # A gated builtin: clearing notes is L1 and always asks, of alice and bob.
+        assert await bob.say("/note buy milk") == 'Saved note 1: "buy milk"'
         prompt = ""
-        fake.inject(BRIAN, "/notes clear")
+        fake.inject(BOB, "/notes clear")
         while not prompt.startswith("["):
-            prompt = await brian.next("brian's approval prompt")
+            prompt = await bob.next("bob's approval prompt")
         code = re.match(r"^\[([A-Z0-9]+)\]", prompt)
         assert code is not None
         (row,) = d.conn.execute(
             "SELECT approvers, requested_by FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
-        assert '"brian"' in row["approvers"] and '"justin"' in row["approvers"]
-        # PER-320: one prompt, in brian's thread (every approver answers it there); no DMs
+        assert '"bob"' in row["approvers"] and '"alice"' in row["approvers"]
+        # PER-320: one prompt, in bob's thread (every approver answers it there); no DMs
         prompts = [m for m in fake.sent if m.text.startswith(f"[{code.group(1)}]")]
-        assert [(m.principal, m.mention) for m in prompts] == [("brian", ())]
+        assert [(m.principal, m.mention) for m in prompts] == [("bob", ())]
         assert prompts[0].thread is not None
-        fake.inject(BRIAN, f"yes {code.group(1)}")
+        fake.inject(BOB, f"yes {code.group(1)}")
         await until(
             lambda: (
                 d.conn.execute(
@@ -216,32 +216,32 @@ async def test_brian_starts_a_run_and_approves_his_own_gated_builtin(
                 is not None
             ),
             20,
-            "brian's own approval",
+            "bob's own approval",
         )
         (decided,) = d.conn.execute(
             "SELECT decided_by FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
-        assert decided["decided_by"] == "brian"
+        assert decided["decided_by"] == "bob"
 
 
 async def test_another_approver_answers_the_prompt_in_the_askers_thread(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # PER-320: brian asks in a thread; the one prompt is there, and justin's typed
+    # PER-320: bob asks in a thread; the one prompt is there, and alice's typed
     # "yes <code>" in that thread approves it (he got no copy of his own)
     async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
-        brian = Slack(fake, BRIAN, "brian")
+        bob = Slack(fake, BOB, "bob")
         thread = "C0TEAM:1700000000.000100"
-        assert await brian.say("/note buy milk", thread=thread) == 'Saved note 1: "buy milk"'
-        fake.inject(BRIAN, "/notes clear", thread=thread)
+        assert await bob.say("/note buy milk", thread=thread) == 'Saved note 1: "buy milk"'
+        fake.inject(BOB, "/notes clear", thread=thread)
         prompt = ""
         while not prompt.startswith("["):
-            prompt = await brian.next("the prompt in the thread")
+            prompt = await bob.next("the prompt in the thread")
         code = re.match(r"^\[([A-Z0-9]+)\]", prompt)
         assert code is not None
         sent = [m for m in fake.sent if m.text.startswith(f"[{code.group(1)}]")]
-        assert [(m.principal, m.thread) for m in sent] == [("brian", thread)]
-        assert fake.inject(JUSTIN, f"yes {code.group(1)}", thread=thread)
+        assert [(m.principal, m.thread) for m in sent] == [("bob", thread)]
+        assert fake.inject(ALICE, f"yes {code.group(1)}", thread=thread)
         await until(
             lambda: (
                 d.conn.execute(
@@ -251,35 +251,35 @@ async def test_another_approver_answers_the_prompt_in_the_askers_thread(
                 is not None
             ),
             20,
-            "justin's approval in brian's thread",
+            "alice's approval in bob's thread",
         )
         (decided,) = d.conn.execute(
             "SELECT decided_by FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
-        assert decided["decided_by"] == "justin"
-        assert not [m for m in fake.sent if m.principal == "justin" and m.thread != thread]
+        assert decided["decided_by"] == "alice"
+        assert not [m for m in fake.sent if m.principal == "alice" and m.thread != thread]
 
 
-async def test_brian_has_no_admin_and_pauses_this_instance_only(
+async def test_bob_has_no_admin_and_pauses_this_instance_only(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with team(tmp_path, resonant_home, chat, monkeypatch) as (_w, d, fake):
-        brian = Slack(fake, BRIAN, "brian")
+        bob = Slack(fake, BOB, "bob")
         for admin in ("/update", "/ext list", "/ext run dori/x", "/pulse"):
-            assert await brian.say(admin) == NOT_ALLOWED, admin
+            assert await bob.say(admin) == NOT_ALLOWED, admin
 
-        assert await brian.say("pause") == KILL_REPLY
+        assert await bob.say("pause") == KILL_REPLY
         assert kv_get(d.conn, "paused") is True and kv_get(d.conn, "autonomy") == "off"
-        assert killswitch.paused_by(d.conn) == "approver:brian"
-        miu = Slack(fake, MIU, "miu")
-        assert await miu.say("/resume") == NOT_ALLOWED
+        assert killswitch.paused_by(d.conn) == "approver:bob"
+        carol = Slack(fake, CAROL, "carol")
+        assert await carol.say("/resume") == NOT_ALLOWED
         assert kv_get(d.conn, "paused") is True
-        assert await brian.say("resume") == RESUME_REPLY
+        assert await bob.say("resume") == RESUME_REPLY
         assert kv_get(d.conn, "paused") is False and killswitch.paused_by(d.conn) is None
 
         killswitch.engage(d.conn, actor=killswitch.SIBLING_SOURCE)  # personal's /kill
-        assert await brian.say("resume") == (
-            "Justin paused everything from personal Resonant; he resumes it there."
+        assert await bob.say("resume") == (
+            "Alice paused everything from personal Resonant; he resumes it there."
         )
         assert kv_get(d.conn, "paused") is True
         assert killswitch.paused_by(d.conn) == killswitch.SIBLING_SOURCE
@@ -291,7 +291,7 @@ QUESTION = "Fix both READMEs or just the top one?"
 CHECK = "dori-api:deploy:deploy dori-api to prod"
 
 
-@pytest.mark.parametrize("answerer", [(BRIAN, "brian"), (JUSTIN, "justin")])
+@pytest.mark.parametrize("answerer", [(BOB, "bob"), (ALICE, "alice")])
 async def test_a_workers_question_goes_to_its_thread_and_only_staff_answer(
     tmp_path: Path,
     resonant_home: Path,
@@ -299,26 +299,26 @@ async def test_a_workers_question_goes_to_its_thread_and_only_staff_answer(
     monkeypatch: pytest.MonkeyPatch,
     answerer: tuple[str, str],
 ) -> None:
-    """Brian starts a run in a thread; its question goes to that thread, addressed to him.
-    Miu's reply there is refused; the requester's (Brian) or an approver's (Justin) is
+    """Bob starts a run in a thread; its question goes to that thread, addressed to him.
+    Carol's reply there is refused; the requester's (Bob) or an approver's (Alice) is
     accepted, and the run's outcome lands in the thread too."""
     async with team(tmp_path, resonant_home, chat, monkeypatch, extra=["--ask", QUESTION]) as (
         w,
         _d,
         fake,
     ):
-        brian = Slack(fake, BRIAN, "brian")
-        started = await brian.say(f"/run {REPO} fix the typo in the README")
+        bob = Slack(fake, BOB, "bob")
+        started = await bob.say(f"/run {REPO} fix the typo in the README")
         assert started.startswith("On it: R1"), started
         run_thread = f"slack-in:{fake.injected}"
-        assert await brian.next("the question") == f"R1 asks: {QUESTION}"
+        assert await bob.next("the question") == f"R1 asks: {QUESTION}"
         asked = next(m for m in fake.sent if m.text == f"R1 asks: {QUESTION}")
-        assert asked.principal == "brian" and asked.thread == run_thread
+        assert asked.principal == "bob" and asked.thread == run_thread
         await until(settled(w, "R1", "waiting"), 20, "the question wait")
-        miu = Slack(fake, MIU, "miu")
+        carol = Slack(fake, CAROL, "carol")
         # (free text in the thread is refused the same way: test_relay; no relay model here)
-        assert await miu.say("R1 just the top one", thread=run_thread) == (
-            "Only Brian or Justin can answer R1."
+        assert await carol.say("R1 just the top one", thread=run_thread) == (
+            "Only Bob or Alice can answer R1."
         )
         (row,) = w.conn.execute("SELECT status FROM run_questions WHERE run_code = 'R1'").fetchall()
         assert row["status"] == "open"
@@ -328,48 +328,48 @@ async def test_a_workers_question_goes_to_its_thread_and_only_staff_answer(
         assert await who.say("R1 just the top one", thread=run_thread) == "→ R1"
         await until(lambda: any("opened PR #41" in m.text for m in fake.sent), 30, "the end")
         ended = next(m for m in fake.sent if "opened PR #41" in m.text)
-        assert ended.principal == "brian" and ended.thread == run_thread
+        assert ended.principal == "bob" and ended.thread == run_thread
 
 
 async def test_a_workers_check_asks_the_requester_in_its_thread(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Brian's run checks a deploy: the prompt goes to Brian in the run's thread (Justin gets
-    his own copy); Brian's ``yes`` approves it. Miu can't."""
+    """Bob's run checks a deploy: the prompt goes to Bob in the run's thread (Alice gets
+    his own copy); Bob's ``yes`` approves it. Carol can't."""
     async with team(tmp_path, resonant_home, chat, monkeypatch, extra=["--check", CHECK]) as (
         w,
         _d,
         fake,
     ):
-        brian = Slack(fake, BRIAN, "brian")
-        assert (await brian.say(f"/run {REPO} fix the typo in the README")).startswith("On it")
+        bob = Slack(fake, BOB, "bob")
+        assert (await bob.say(f"/run {REPO} fix the typo in the README")).startswith("On it")
         run_thread = f"slack-in:{fake.injected}"
-        prompt = await brian.next("the check's prompt")
+        prompt = await bob.next("the check's prompt")
         code = re.match(r"^\[([A-Z0-9]+)\]", prompt)
         assert code is not None, prompt
-        sent = next(m for m in fake.sent if m.text == prompt and m.principal == "brian")
+        sent = next(m for m in fake.sent if m.text == prompt and m.principal == "bob")
         assert sent.thread == run_thread
         (row,) = w.conn.execute(
             "SELECT approvers FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
-        assert row["approvers"] == '["brian", "justin"]'
+        assert row["approvers"] == '["bob", "alice"]'
         await until(settled(w, "R1", "waiting"), 20, "the check wait")
-        miu = Slack(fake, MIU, "miu")
-        assert fake.inject(MIU, f"yes {code.group(1)}", thread=run_thread)
-        await miu.next("miu's refusal")
+        carol = Slack(fake, CAROL, "carol")
+        assert fake.inject(CAROL, f"yes {code.group(1)}", thread=run_thread)
+        await carol.next("carol's refusal")
         (status,) = w.conn.execute(
             "SELECT status FROM approvals WHERE code = ?", (code.group(1),)
         ).fetchall()
         assert status["status"] == "pending"
-        fake.inject(BRIAN, f"yes {code.group(1)}", thread=run_thread)
+        fake.inject(BOB, f"yes {code.group(1)}", thread=run_thread)
         await until(
             lambda: (
                 w.conn.execute(
-                    "SELECT 1 FROM approvals WHERE code = ? AND decided_by = 'brian'",
+                    "SELECT 1 FROM approvals WHERE code = ? AND decided_by = 'bob'",
                     (code.group(1),),
                 ).fetchone()
                 is not None
             ),
             20,
-            "brian's yes",
+            "bob's yes",
         )

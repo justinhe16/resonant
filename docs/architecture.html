@@ -416,7 +416,7 @@ usage limit → waiting(usage_reset) · result → reply step`,
     what:"Maps channel identities to principals. There is exactly one owner, who can do everything. Every other principal gets only explicit per-extension grants.",
     iface:`# ~/.resonant/principals.yaml
 principals:
-  justin:    {role: owner, identities: ["imessage:+15550000000", "slack:U01"]}
+  alice:     {role: owner, identities: ["imessage:+15550000000", "slack:U01"]}
   cofounder: {identities: ["slack:U02"], grants: {dori: [request, approve]}}
 
 can(principal, action ∈ {request, approve, admin}, extension | None) -> bool`,

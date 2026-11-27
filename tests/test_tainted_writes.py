@@ -231,7 +231,7 @@ def staff_allowed(db: sqlite3.Connection) -> list[bool | None]:
 
 @pytest.mark.parametrize("principal", [OWNER, APPROVER])
 def test_allow_runs_an_untainted_staff_l2_write(db: sqlite3.Connection, principal: str) -> None:
-    """Brian's fresh "merge #159" and "move DORI-1 to In Review" run with no prompt."""
+    """Bob's fresh "merge #159" and "move DORI-1 to In Review" run with no prompt."""
     gate = _staff_gate(db)
     merge = evaluate(db, gate, MERGE_PR, {"repo": "jhe/dori", "number": 159},
                      origin="inferred", principal=principal)  # fmt: skip

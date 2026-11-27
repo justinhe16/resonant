@@ -25,11 +25,11 @@ checks and owner messages for running Claude workers.
   and the tool runs on an approver's yes. A tool that isn't requestable, or args that don't
   fit its schema, are a usage error (exit 2); at most ``MAX_OPEN_REQUESTS`` wait per run
   (the next is ``EXIT_BUSY``: nothing asked). Waited for like a check (a repeat while it is
-  open joins it): the result (``Approved by Brian: …``, ``Denied by Justin: …``) is the
+  open joins it): the result (``Approved by Bob: …``, ``Denied by Alice: …``) is the
   CLI's reply, exit 0 when the tool ran, else 1; or, after the CLI gave up (exit 3), the
   resume prompt's ``Your request (…): …``. ``runner.ask_timeout`` and a restart close it
   like a check (its approval expires: ask again if you still need it). A call that ran goes
-  on the run's side-effect list (``ran dori.prod_deploy commit=abc (approved by Brian)``).
+  on the run's side-effect list (``ran dori.prod_deploy commit=abc (approved by Bob)``).
 
 - ``restart``/``update`` (GD-1): Resonant itself, through the same ``Ops`` as ``/restart
   resonant`` and ``/update`` (``SelfOps``). Allowed without asking when the run's requester is

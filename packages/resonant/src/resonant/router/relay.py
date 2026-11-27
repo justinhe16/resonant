@@ -39,7 +39,7 @@ The router calls it at three points (``router.py``):
 with a run's open question, only that thread's questions count (no ``For R4 or R6?`` across
 threads); elsewhere, by code as above. Only the run's requester and the approvers (the owner
 included) may answer or message a run: anyone else's answer in its thread, or ``R4 …``, gets
-``Only Brian or Justin can answer R4.`` and reaches nothing. With no threads and the owner
+``Only Bob or Alice can answer R4.`` and reaches nothing. With no threads and the owner
 alone (iMessage), nothing changes: every run is the owner's.
 
 A question only counts if it was asked before the owner's message was sent (the

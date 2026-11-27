@@ -58,12 +58,12 @@ def test_claims_change(reply: str) -> None:
         "Which note: 1 or 2?",
         "The PR was merged yesterday by sam.",
         "I'll check your calendar.",
-        "Created 3 days ago by justin, still open.",
+        "Created 3 days ago by alice, still open.",
         "Merged 2h ago: PR #41.",
         "Sent from the Mini at 9am.",
         "Opened by dependabot.",
         "Updated 5 min ago.",
-        "Logged in as justin.",
+        "Logged in as alice.",
     ],
 )
 def test_reads_and_questions_dont_claim(reply: str) -> None:
@@ -312,7 +312,7 @@ def test_the_daemon_hands_brain_reply_guard_to_the_ask_runner(mode: str) -> None
     from resonant.principals import Principal, Principals
     from resonant.runners.ask import AskRunner
 
-    owner = Principals(principals={"justin": Principal(role="owner", identities=("slack:U1",))})
+    owner = Principals(principals={"alice": Principal(role="owner", identities=("slack:U1",))})
     settings = load_settings(brain={"reply_guard": mode})
     daemon = Daemon(settings, channels={"slack": FakeChannel("slack", owner)})
     try:

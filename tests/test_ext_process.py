@@ -197,7 +197,7 @@ def test_scratch_env_is_exactly_the_allowlist(tmp_path: Path) -> None:
         data_dir=tmp_path,
         secrets={"RESONANT_SECRET_TOKEN": FAKE_A, "RESONANT_SECRET_API_KEY": FAKE_B},
         job_due_at="2026-10-14T08:00:00+00:00",
-        user="justin",
+        user="alice",
         bins={"RESONANT_BIN_GH": "/opt/homebrew/Cellar/gh/2.0/bin/gh"},
     )
     assert env == {
@@ -205,8 +205,8 @@ def test_scratch_env_is_exactly_the_allowlist(tmp_path: Path) -> None:
         "HOME": str(tmp_path),
         "TMPDIR": str(tmp_path / "tmp"),
         "LANG": "en_US.UTF-8",
-        "USER": "justin",
-        "LOGNAME": "justin",
+        "USER": "alice",
+        "LOGNAME": "alice",
         "RESONANT_EXT": "example",
         "RESONANT_EXT_DATA": str(tmp_path),
         "RESONANT_EVENTS_FD": "3",

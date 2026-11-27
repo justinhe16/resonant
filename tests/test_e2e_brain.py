@@ -42,7 +42,7 @@ MEMBER_PHONE = "+15557654321"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
   cofounder:
@@ -161,7 +161,7 @@ async def start(
     if full_cap:  # today's one ask, already answered
         with atomic(daemon.conn):
             used = task_store.insert_task(daemon.conn, NewTask(kind="ask", runner="ask", priority=1,
-                                                               principal="justin"))  # fmt: skip
+                                                               principal="alice"))  # fmt: skip
             daemon.conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (used,))
     assert daemon.imessage is not None and daemon.state.components is not None
     assert daemon.imessage.brain is not None
@@ -178,7 +178,7 @@ async def start(
         ask_root=home / "ask",
         channel=daemon.imessage.channel,
         secrets=SecretStore(keychain),
-        owner="justin",
+        owner="alice",
         create_task=daemon.loop.create_task,
         claude_cmd=[sys.executable, str(FAKE_CLAUDE), "--notes", str(notes), *list(ask_args)],
         home=tmp_path / "claude-home",
@@ -308,7 +308,7 @@ async def test_why_did_a_run_do_that_goes_to_claude_even_if_triage_says_question
 
     async with start(resonant_home, chat, tmp_path) as b:
         run = runs.create(b.conn, repo="robot-surf-prompt", ask="Add the surf skills",
-                          principal="justin", session_id="s9", max_seconds=60)  # fmt: skip
+                          principal="alice", session_id="s9", max_seconds=60)  # fmt: skip
         runs.update(b.conn, run.code, status="running")
         runs.finish(b.conn, run.code, "no_changes")
         b.model.triage = {**GREETING, "message_type": "ack", "say": "ok"}  # a bad label
@@ -366,6 +366,6 @@ async def test_history_folds_after_the_reply(
         b.model.triage = GREETING
         assert await b.say("hi") == ["Hey there!"]
         await b.runner.idle()
-        summary = brain_store.get_summary(b.conn, "justin")
+        summary = brain_store.get_summary(b.conn, "alice")
         assert summary is not None and summary.folded >= 5
         assert b.model.calls.get("fold") == 1

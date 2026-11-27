@@ -34,7 +34,7 @@ from resonant.toolcore import Asked, BatchItem, CallScope, Refused
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Event, Level, ToolSpec
 
-OWNER = "justin"
+OWNER = "alice"
 MEMBER = "cofounder"
 OWNER_ID = "imessage:+15550000000"
 MEMBER_ID = "imessage:+15550000001"

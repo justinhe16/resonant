@@ -93,7 +93,7 @@ def main() -> int:
                     {"name": "search", "state": "warn", "detail": "slow"}]),
             kv({"open incidents": 0, "on call": "maria"}),
             text("All quiet."),
-            details({"remote_url": "x", "owners": ["maria", "justin"]}),
+            details({"remote_url": "x", "owners": ["maria", "alice"]}),
         ])])
     elif which == "chart":
         t0 = datetime(2026, 10, 13, 13, 30, tzinfo=timezone.utc)

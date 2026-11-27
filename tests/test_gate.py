@@ -36,7 +36,7 @@ def gate(db: sqlite3.Connection, registry: ToolRegistry) -> DryRunGate:
     principals = Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
             }
         }
@@ -44,7 +44,7 @@ def gate(db: sqlite3.Connection, registry: ToolRegistry) -> DryRunGate:
     return DryRunGate(db, principals, registry)
 
 
-def intent(spec: ToolSpec = RESTART, principal: str = "justin", **args: object) -> Intent:
+def intent(spec: ToolSpec = RESTART, principal: str = "alice", **args: object) -> Intent:
     return Intent.for_tool(spec, task_id="t1", principal=principal, args=dict(args) or {"s": 1})
 
 
@@ -75,7 +75,7 @@ def test_origin_defaults_to_inferred_and_is_not_hashed() -> None:
     inferred = intent(a=1)
     assert inferred.origin == "inferred"
     explicit = Intent.for_tool(
-        RESTART, task_id="t1", principal="justin", args={"a": 1}, origin="explicit"
+        RESTART, task_id="t1", principal="alice", args={"a": 1}, origin="explicit"
     )
     assert explicit.origin == "explicit"
     # An approval binds to what runs, not to who asked for it.
@@ -84,14 +84,14 @@ def test_origin_defaults_to_inferred_and_is_not_hashed() -> None:
 
 def test_unknown_origin_rejected() -> None:
     with pytest.raises(ValueError, match="origin"):
-        Intent(task_id="t", principal="justin", spec=RESTART, args={}, origin="model")  # pyright: ignore[reportArgumentType]
+        Intent(task_id="t", principal="alice", spec=RESTART, args={}, origin="model")  # pyright: ignore[reportArgumentType]
     with pytest.raises(ValueError, match="origin"):
-        Intent.for_tool(RESTART, task_id="t", principal="justin", args={}, origin="model")  # pyright: ignore[reportArgumentType]
+        Intent.for_tool(RESTART, task_id="t", principal="alice", args={}, origin="model")  # pyright: ignore[reportArgumentType]
 
 
 def test_args_are_copied() -> None:
     args: dict[str, object] = {"nested": {"x": 1}}
-    i = Intent.for_tool(RESTART, task_id="t", principal="justin", args=args)
+    i = Intent.for_tool(RESTART, task_id="t", principal="alice", args=args)
     args["nested"] = {"x": 2}
     assert i.args == {"nested": {"x": 1}}
 
@@ -136,14 +136,14 @@ def test_side_effects_dry_run_and_audited(gate: DryRunGate, db: sqlite3.Connecti
     rows = db.execute("SELECT decision, requested_by FROM audit_log ORDER BY id").fetchall()
     assert [(r["decision"], r["requested_by"]) for r in rows] == [
         ("DryRun", "cofounder"),
-        ("DryRun", "justin"),
+        ("DryRun", "alice"),
     ]
 
 
 def test_approvals_unavailable_in_dry_run(gate: DryRunGate) -> None:
-    res = gate.resolve(ApprovalResolution("a1", True, "justin", "cli", "cli"))
+    res = gate.resolve(ApprovalResolution("a1", True, "alice", "cli", "cli"))
     assert not res.ok and res.resolved == ()
-    assert gate.pending_for("justin") == ()
+    assert gate.pending_for("alice") == ()
 
 
 def test_evaluate_inside_caller_transaction(gate: DryRunGate, db: sqlite3.Connection) -> None:

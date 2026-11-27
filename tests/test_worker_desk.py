@@ -48,9 +48,9 @@ from resonant_sdk.manifest import Manifest, parse_yaml
 
 TEAM = {
     "principals": {
-        "justin": {"role": "owner", "identities": ["slack:U1"]},
-        "brian": {"role": "approver", "identities": ["slack:U2"]},
-        "miu": {"identities": ["slack:U3"], "grants": {"dori": {"request": ["prod_deploy"]}}},
+        "alice": {"role": "owner", "identities": ["slack:U1"]},
+        "bob": {"role": "approver", "identities": ["slack:U2"]},
+        "carol": {"identities": ["slack:U3"], "grants": {"dori": {"request": ["prod_deploy"]}}},
     }
 }
 PROD_DEPLOY = ToolSpec(
@@ -172,13 +172,13 @@ class Harness:
             requests=self.requests,
         )
 
-    def run(self, requested_by: str | None = "brian", *, thread: bool = True) -> str:
+    def run(self, requested_by: str | None = "bob", *, thread: bool = True) -> str:
         tid = task_store.insert_task(self.db, NewTask(kind="run", runner="claude", priority=1))
         task_store.set_status(self.db, tid, "running")
         run = runs_store.create(
-            self.db, repo="voyager-service", ask="ship it", principal="justin", session_id="s",
+            self.db, repo="voyager-service", ask="ship it", principal="alice", session_id="s",
             max_seconds=600, requested_by=requested_by,
-            channel_ref=ref(requested_by or "justin") if thread else None,
+            channel_ref=ref(requested_by or "alice") if thread else None,
         )  # fmt: skip
         runs_store.update(self.db, run.code, task_id=tid, status="running")
         return run.code
@@ -211,28 +211,28 @@ def h(db: sqlite3.Connection) -> Harness:
 async def test_an_approvers_click_runs_the_tool_once_and_the_cli_gets_the_result(
     h: Harness,
 ) -> None:
-    code = h.run("brian")
+    code = h.run("bob")
     call = h.request(code, ("commit", "abc"), ("build", "7"), reason='hotfix "login"')
     prompts = dict(await h.prompted(2))
-    # one copy in the run's thread, to Brian (requester and approver); Justin's in his own DM
-    prompt, dm = prompts["brian"], prompts["justin"]
+    # one copy in the run's thread, to Bob (requester and approver); Alice's in his own DM
+    prompt, dm = prompts["bob"], prompts["alice"]
     assert prompt.thread is not None and prompt.thread.thread == THREAD
     assert dm.thread is None
     assert prompt.require_code  # L1: a Slack button carries the code
     assert (
-        prompt.summary.startswith(f"{code} (for Brian) asks for dori: prod deploy ")
+        prompt.summary.startswith(f"{code} (for Bob) asks for dori: prod deploy ")
         and "hotfix 'login'" in prompt.summary
     )
     (q,) = qs.for_run(h.db, code)
     assert (q.kind, q.question, q.approval_id) == (
         "request", "dori.prod_deploy build=7 commit=abc", prompt.approval_id
     )  # fmt: skip
-    assert h.click(prompt.approval_id, "brian")
+    assert h.click(prompt.approval_id, "bob")
     reply = await asyncio.wait_for(call, 5)
     assert reply is not None and reply.exit == EXIT_OK, reply
-    assert reply.text.startswith("Approved by Brian: Done: ") and '"version": 142' in reply.text
+    assert reply.text.startswith("Approved by Bob: Done: ") and '"version": 142' in reply.text
     assert h.executor.ran == [{"commit": "abc", "build": 7}]  # once, with the schema's types
-    assert did_list(h.db, code) == ["ran dori.prod_deploy build=7 commit=abc (approved by Brian)"]
+    assert did_list(h.db, code) == ["ran dori.prod_deploy build=7 commit=abc (approved by Bob)"]
 
 
 @pytest.mark.parametrize("how", ["deny", "expire"])
@@ -240,15 +240,15 @@ async def test_deny_or_expiry_resumes_with_that_text_and_never_runs(
     db: sqlite3.Connection, how: str
 ) -> None:
     h = Harness(db, ttl_s=0.3 if how == "expire" else 1800.0)
-    code = h.run("brian")
+    code = h.run("bob")
     call = h.request(code, ("commit", "abc"))
     (_to, prompt), *_ = await h.prompted()
     if how == "deny":
-        assert h.click(prompt.approval_id, "justin", approve=False)
+        assert h.click(prompt.approval_id, "alice", approve=False)
     reply = await asyncio.wait_for(call, 5)
     assert reply is not None and reply.exit == EXIT_DENIED
     if how == "deny":
-        assert reply.text == "Denied by Justin: the tool didn't run."
+        assert reply.text == "Denied by Alice: the tool didn't run."
     else:
         assert reply.text.startswith("No approver answered in time")
     assert h.executor.ran == [] and did_list(h.db, code) == []
@@ -260,14 +260,14 @@ async def test_asked_again_after_an_expiry_it_opens_a_fresh_approval(
     """Each request has its own task (the gate keeps one approval per task and intent), so
     "ask again if you still need it" works after an expiry or a restart."""
     h = Harness(db, ttl_s=0.3)
-    code = h.run("brian")
+    code = h.run("bob")
     first = await asyncio.wait_for(h.request(code, ("commit", "abc")), 5)
     assert first is not None and first.exit == EXIT_DENIED
     h.gate.ttl = timedelta(seconds=1800)
     again = h.request(code, ("commit", "abc"))
     prompts = await h.prompted(4)
     assert prompts[2][1].approval_id != prompts[0][1].approval_id
-    assert h.click(prompts[2][1].approval_id, "brian")
+    assert h.click(prompts[2][1].approval_id, "bob")
     reply = await asyncio.wait_for(again, 5)
     assert reply is not None and reply.exit == EXIT_OK and h.executor.ran == [{"commit": "abc"}]
     kinds = db.execute(
@@ -277,7 +277,7 @@ async def test_asked_again_after_an_expiry_it_opens_a_fresh_approval(
 
 
 async def test_refusals_before_anything_is_asked(h: Harness) -> None:
-    code = h.run("brian")
+    code = h.run("bob")
     reply = await h.request(code, ("title", "x"), tool="file_ticket")
     assert reply is not None and reply.exit == EXIT_USAGE
     assert reply.text.startswith("Not requestable: dori.file_ticket. You may request: ")
@@ -293,7 +293,7 @@ async def test_refusals_before_anything_is_asked(h: Harness) -> None:
 
 
 async def test_the_fourth_open_request_is_refused(h: Harness) -> None:
-    code = h.run("brian")
+    code = h.run("bob")
     calls = [h.request(code, ("commit", c)) for c in ("a", "b", "c")]
     await h.prompted(6)  # three approvals, two approvers each
     fourth = await h.request(code, ("commit", "d"))
@@ -308,28 +308,28 @@ async def test_the_fourth_open_request_is_refused(h: Harness) -> None:
 
 async def test_a_member_requested_run_still_needs_an_approvers_click(h: Harness) -> None:
     h.channel.threaded = True
-    code = h.run("miu")
+    code = h.run("carol")
     call = h.request(code, ("commit", "abc"))
     prompts = await h.prompted(1)
     approval_id = prompts[0][1].approval_id
     a = ap.get_approval(h.db, approval_id)
-    assert a is not None and a.approvers == ("justin", "brian") and a.requested_by == "miu"
-    # PER-320: Miu isn't an approver: one copy in the run's thread, addressed to Miu and
+    assert a is not None and a.approvers == ("alice", "bob") and a.requested_by == "carol"
+    # PER-320: Carol isn't an approver: one copy in the run's thread, addressed to Carol and
     # tagging both approvers (no DMs); it counts as sent to each approver
     await asyncio.sleep(0.05)
     assert [(p, pr.thread is not None, pr.mention) for p, pr in h.channel.prompts] == [
-        ("miu", True, ("justin", "brian"))
+        ("carol", True, ("alice", "bob"))
     ]
     a = ap.get_approval(h.db, approval_id)
     assert a is not None and {(c.principal, c.thread) for c in a.channel_refs} == {
-        ("justin", THREAD),
-        ("brian", THREAD),
+        ("alice", THREAD),
+        ("bob", THREAD),
     }
-    assert prompts[0][1].summary.startswith(f"{code} (for Miu) asks for ")
-    assert not h.click(approval_id, "miu")
+    assert prompts[0][1].summary.startswith(f"{code} (for Carol) asks for ")
+    assert not h.click(approval_id, "carol")
     await asyncio.sleep(0.05)
     assert not call.done() and h.executor.ran == []
-    assert h.click(approval_id, "brian")
+    assert h.click(approval_id, "bob")
     reply = await asyncio.wait_for(call, 5)
     assert reply is not None and reply.exit == EXIT_OK and h.executor.ran == [{"commit": "abc"}]
 
@@ -337,24 +337,24 @@ async def test_a_member_requested_run_still_needs_an_approvers_click(h: Harness)
 async def test_a_scheduled_runs_request_dms_each_approver(h: Harness) -> None:
     # PER-320: a scheduled job's run has no thread to post in: each approver gets their own
     h.channel.threaded = True
-    code = h.run("justin", thread=False)
+    code = h.run("alice", thread=False)
     call = h.request(code, ("commit", "abc"))
     prompts = await h.prompted(2)
     assert [(p, pr.thread, pr.mention) for p, pr in prompts] == [
-        ("justin", None, ()),
-        ("brian", None, ()),
+        ("alice", None, ()),
+        ("bob", None, ()),
     ]
     a = ap.get_approval(h.db, prompts[0][1].approval_id)
     assert a is not None and {(c.principal, c.thread) for c in a.channel_refs} == {
-        ("justin", None),
-        ("brian", None),
+        ("alice", None),
+        ("bob", None),
     }
     call.cancel()
     await h.desk.aclose()
 
 
 async def test_two_runs_asking_the_same_deploy_share_one_approval(h: Harness) -> None:
-    first, second = h.run("brian"), h.run("justin")
+    first, second = h.run("bob"), h.run("alice")
     call = h.request(first, ("commit", "abc"))
     await h.prompted(2)
     reply = await h.request(second, ("commit", "abc"))
@@ -369,11 +369,11 @@ async def test_no_answer_yet_parks_the_cli_and_the_result_comes_on_resume(
     db: sqlite3.Connection,
 ) -> None:
     h = Harness(db, block_s=0.1)
-    code = h.run("brian")
+    code = h.run("bob")
     reply = await h.request(code, ("commit", "abc"))
     assert reply is not None and reply.exit == EXIT_PENDING
     (_to, prompt), *_ = await h.prompted()
-    assert h.click(prompt.approval_id, "brian")
+    assert h.click(prompt.approval_id, "bob")
     for _ in range(300):
         if h.desk.has_deliveries(code):
             break
@@ -381,7 +381,7 @@ async def test_no_answer_yet_parks_the_cli_and_the_result_comes_on_resume(
     assert (code, f"answer:{qs.for_run(db, code)[0].id}") in h.woken
     resumed = h.desk.resume_text(code)
     assert resumed is not None and resumed.startswith(
-        "Your request (dori.prod_deploy commit=abc): Approved by Brian: Done: "
+        "Your request (dori.prod_deploy commit=abc): Approved by Bob: Done: "
     )
     assert h.executor.ran == [{"commit": "abc"}]
 
@@ -390,7 +390,7 @@ async def test_a_timeout_or_restart_closes_it_and_expires_the_approval(
     db: sqlite3.Connection,
 ) -> None:
     h = Harness(db, block_s=0.1)
-    code = h.run("brian")
+    code = h.run("bob")
     await h.request(code, ("commit", "abc"))
     (_to, prompt), *_ = await h.prompted()
     h.desk.ask_timeout = timedelta(0)
@@ -400,10 +400,10 @@ async def test_a_timeout_or_restart_closes_it_and_expires_the_approval(
     assert (q.status, q.answer) == ("timed_out", REQUEST_TIMEOUT)
     a = ap.get_approval(db, prompt.approval_id)
     assert a is not None and a.status == "expired"
-    assert not h.click(prompt.approval_id, "brian") and h.executor.ran == []
+    assert not h.click(prompt.approval_id, "bob") and h.executor.ran == []
 
     # a restart: the open request is closed and its approval expired ("ask again")
-    later = h.run("brian")
+    later = h.run("bob")
     await h.request(later, ("commit", "def"))
     prompts = await h.prompted(4)
     approval_id = prompts[2][1].approval_id
@@ -438,11 +438,11 @@ def test_only_extension_tools_are_worker_requestable() -> None:
 
 
 def test_a_requestable_call_is_an_action_keyed_by_its_args(db: sqlite3.Connection) -> None:
-    intent = Intent.for_tool(PROD_DEPLOY, task_id="t", principal="brian",
+    intent = Intent.for_tool(PROD_DEPLOY, task_id="t", principal="bob",
                              args={"commit": "abc", "build": 7})  # fmt: skip
     action = action_ids.for_intent(db, intent)
     assert action is not None and action.key == "dori prod_deploy build=7 commit=abc"
-    plain = Intent.for_tool(FILE_TICKET, task_id="t", principal="brian", args={"title": "x"})
+    plain = Intent.for_tool(FILE_TICKET, task_id="t", principal="bob", args={"title": "x"})
     assert action_ids.for_intent(db, plain) is None  # not requestable: no identity, as before
     assert action_ids.args_target({"x": "y" * 300}).startswith("sha256:")
 
@@ -479,10 +479,10 @@ def test_migration_033_keeps_questions_and_allows_requests(tmp_path: Path) -> No
 async def test_a_restart_after_the_approval_says_it_may_have_run(db: sqlite3.Connection) -> None:
     h = Harness(db, block_s=0.1)
     h.executor.release = asyncio.Event()  # the deploy hangs after the yes
-    code = h.run("brian")
+    code = h.run("bob")
     await h.request(code, ("commit", "abc"))
     (_to, prompt), *_ = await h.prompted()
-    assert h.click(prompt.approval_id, "brian")
+    assert h.click(prompt.approval_id, "bob")
     h.desk.ask_timeout = timedelta(0)
     for _ in range(200):
         await asyncio.sleep(0.01)

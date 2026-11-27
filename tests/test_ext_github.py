@@ -1141,11 +1141,11 @@ def test_pr_comments_reviews_inline_and_conversation(gh: FakeGh) -> None:
         f"repos/{DORI}/pulls/159/comments": [
             {"id": 11, "user": {"login": "bo"}, "path": "src/a.ts", "line": 3,
              "body": "rename this", "created_at": "2026-11-21T11:00:00Z"},
-            {"id": 12, "user": {"login": "brian"}, "path": "src/a.ts", "line": 3,
+            {"id": 12, "user": {"login": "bob"}, "path": "src/a.ts", "line": 3,
              "in_reply_to_id": 11, "body": "done", "created_at": "2026-11-21T12:00:00Z"},
         ],
         f"repos/{DORI}/issues/159/comments": [
-            {"user": {"login": "brian"}, "body": "ready", "created_at": "2026-11-22T09:00:00Z"},
+            {"user": {"login": "bob"}, "body": "ready", "created_at": "2026-11-22T09:00:00Z"},
         ],
     }  # fmt: skip
     r = gh.run("pr_comments", "--repo", DORI, "--number", "159")
@@ -1156,11 +1156,11 @@ def test_pr_comments_reviews_inline_and_conversation(gh: FakeGh) -> None:
     assert r.out["reviews"][2]["body"] == "nit\nsecond line"  # line breaks kept
     assert len(r.out["reviews"][3]["body"]) == 600 and r.out["reviews"][3]["body"].endswith("…")
     assert r.out["review_comments"][1] == {
-        "author": "brian", "file": "src/a.ts", "line": 3, "created_at": "2026-11-21T12:00:00Z",
+        "author": "bob", "file": "src/a.ts", "line": 3, "created_at": "2026-11-21T12:00:00Z",
         "reply_to": 11, "id": 12, "body": "done",
     }  # fmt: skip
     assert r.out["comments"] == [
-        {"author": "brian", "created_at": "2026-11-22T09:00:00Z", "body": "ready"}
+        {"author": "bob", "created_at": "2026-11-22T09:00:00Z", "body": "ready"}
     ]
     assert r.out["summary"] == (
         "voyager-web#159: 4 reviews; 2 review comments; 1 comments; approved by ana; "
@@ -1218,12 +1218,12 @@ def test_app_token_reads_and_merges_an_org_pr_by_someone_else(gh: FakeGh) -> Non
     """An App-minted token (``ghs_``) on an org repo, a PR the token's owner didn't open:
     pr, pr_diff and merge_pr work exactly as with a person's token."""
     secrets = app_gh(gh)
-    gh.state["prs"] = {f"{DORI}#159": {**view(159), "author": {"login": "brian"},
+    gh.state["prs"] = {f"{DORI}#159": {**view(159), "author": {"login": "bob"},
                                        "url": f"https://github.com/{DORI}/pull/159"}}  # fmt: skip
     gh.state["api"] = {f"repos/{DORI}/pulls/159/files": [diff_file("a.ts", "+a")]}
     shown = gh.run("pr", "--repo", DORI, "--number", "159", secrets=secrets)
     assert shown.code == 0, shown.err
-    assert shown.out["author"] == "brian" and shown.out["ci"] == "passing"
+    assert shown.out["author"] == "bob" and shown.out["ci"] == "passing"
     assert gh.run("pr_diff", "--repo", DORI, "--number", "159", secrets=secrets).code == 0
     merged = gh.run("merge_pr", "--repo", DORI, "--number", "159", "--head-sha", HEAD,
                     secrets=secrets)  # fmt: skip
@@ -1246,12 +1246,12 @@ def test_app_token_has_no_person_for_my_prs(gh: FakeGh) -> None:
 
 def test_app_token_with_an_author_searches_for_that_person(gh: FakeGh) -> None:
     secrets = app_gh(gh)
-    (gh.data / "config.json").write_text(json.dumps({"author": "brian", "repos": [DORI]}))
+    (gh.data / "config.json").write_text(json.dumps({"author": "bob", "repos": [DORI]}))
     gh.state["mine"] = [pr_node(159, "a" * 40, repo=DORI, contexts=[check("ci")])]
     r = gh.run("prs", secrets=secrets)
     assert r.code == 0, r.err
     assert r.out["summary"] == "1 open PRs, 0 failing CI, 0 awaiting your review"
-    assert f"repo:{DORI} author:brian" in " ".join(gh.calls()[0]["argv"])
+    assert f"repo:{DORI} author:bob" in " ".join(gh.calls()[0]["argv"])
 
 
 def test_app_token_health_lists_installation_repos(gh: FakeGh) -> None:

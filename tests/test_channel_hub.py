@@ -34,7 +34,7 @@ from resonant.tools import ToolRegistry
 from resonant.tools.builtin import BUILTIN_SPECS
 from resonant_sdk import Event
 
-OWNER = "justin"
+OWNER = "alice"
 MEMBER = "ana"
 PHONE = "+15550000000"
 
@@ -324,7 +324,7 @@ async def test_approval_reply_needs_the_events_identity_to_be_the_principal(
 ) -> None:
     reg = ToolRegistry()
     inbox = ApprovalInbox(db, principals=principals, gate=DryRunGate(db, principals, reg))
-    # ana's identity on an event claiming to be justin's: refused, nothing revealed
+    # ana's identity on an event claiming to be alice's: refused, nothing revealed
     spoofed = slack_msg("yes K4", uid="U2", principal=OWNER)
     result = inbox.handle(spoofed, "yes K4", OWNER)
     assert result is not None and result.outcome == "unauthenticated"

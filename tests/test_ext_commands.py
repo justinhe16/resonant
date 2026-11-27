@@ -51,7 +51,7 @@ from resonant.tools.ext import list_extensions, mute_extension
 from resonant_sdk import Effect, Event, Manifest, ToolSpec
 from resonant_sdk.manifest import parse_yaml
 
-OWNER, MEMBER, HELPER = "justin", "cofounder", "helper"
+OWNER, MEMBER, HELPER = "alice", "cofounder", "helper"
 DEMO = """\
 name: demo
 version: 1

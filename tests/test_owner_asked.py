@@ -31,7 +31,7 @@ from resonant.trust.tools import StandingAllows, allow_targets
 from resonant_sdk import Effect, Level, ToolSpec
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
-OWNER = "justin"
+OWNER = "alice"
 
 SAVE_ISSUE = ToolSpec(
     name="save_issue",

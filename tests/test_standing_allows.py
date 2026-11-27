@@ -59,7 +59,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
             }
         }
@@ -94,7 +94,7 @@ def call(
     db: sqlite3.Connection,
     spec: ToolSpec,
     *,
-    principal: str = "justin",
+    principal: str = "alice",
     origin: Origin = "inferred",
     **args: Any,
 ) -> Intent:
@@ -109,11 +109,11 @@ def allow(db: sqlite3.Connection, scope: str, action: str) -> None:
     )
 
 
-def sent(db: sqlite3.Connection, approval_id: str, principal: str = "justin") -> None:
+def sent(db: sqlite3.Connection, approval_id: str, principal: str = "alice") -> None:
     ap.add_channel_ref(db, approval_id, ref="r", at=NOW, principal=principal)
 
 
-def always(gate: PolicyGate, code: str, actor: str = "justin", event: str = "e1") -> Any:
+def always(gate: PolicyGate, code: str, actor: str = "alice", event: str = "e1") -> Any:
     return gate.resolve_reply(
         ApprovalReply(
             actor=actor,
@@ -184,7 +184,7 @@ def test_yes_always_saves_the_rule_and_later_calls_run_as_l3(
     row = db.execute(
         "SELECT approved_by FROM audit_log WHERE action = 'trust.rule_added'"
     ).fetchone()
-    assert row["approved_by"] == "justin"
+    assert row["approved_by"] == "alice"
 
 
 def test_an_unscoped_extension_tool_is_scoped_to_its_extension(

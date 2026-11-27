@@ -325,7 +325,7 @@ def test_a_batched_approval_is_left_to_its_batch(db: sqlite3.Connection) -> None
         ("merge PR #2", f"{SLUG}#2"),
         ("squash-merge pr 2 into main", f"{SLUG}#2"),
         ("merge pull request 7", f"{SLUG}#7"),
-        ("merge JustinHe16/Mycelium#5 too", f"{SLUG}#5"),
+        ("merge JUSTINHE16/Mycelium#5 too", f"{SLUG}#5"),
         ("merge other/repo#5 too", None),  # never another repo's PR
         ("merge it", None),  # no PR named and the run has none yet
     ],
@@ -350,7 +350,7 @@ def test_intent_identities(h: H) -> None:
     def intent(spec: ToolSpec, args: dict[str, Any]) -> Intent:
         return Intent.for_tool(spec, task_id="t", principal=OWNER, args=args)
 
-    act = action_ids.for_intent(h.db, intent(h.spec, ARGS | {"repo": "JustinHe16/Mycelium"}))
+    act = action_ids.for_intent(h.db, intent(h.spec, ARGS | {"repo": "JUSTINHE16/Mycelium"}))
     assert act is not None and act.key == f"github merge {SLUG}#2"
     assert action_ids.merged_by(intent(h.spec, ARGS)) == f"{SLUG}#2"
     assert action_ids.for_intent(h.db, intent(h.spec, ARGS | {"number": 0})) is None

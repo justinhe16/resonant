@@ -25,7 +25,7 @@ from resonant.tools.base import BuiltinContext
 from resonant.tools.commands import list_commands
 from resonant_sdk import Effect, ToolSpec
 
-OWNER, MEMBER = "justin", "cofounder"
+OWNER, MEMBER = "alice", "cofounder"
 
 
 @pytest.fixture

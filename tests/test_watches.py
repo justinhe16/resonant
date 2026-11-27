@@ -35,7 +35,7 @@ from resonant.tools.base import BuiltinContext
 
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
 """
@@ -233,9 +233,9 @@ async def test_create_watch_asks_the_owner_first(
     spec = components.registry.get(None, "create_watch")
     assert spec is not None
     for origin in ("inferred", "tainted", "scheduled"):
-        task = insert_task(db, NewTask(kind="chat", runner="brain", priority=1, principal="justin"))
+        task = insert_task(db, NewTask(kind="chat", runner="brain", priority=1, principal="alice"))
         intent = Intent.for_tool(
-            spec, task_id=task, principal="justin", origin=origin, args={"what": "x", "ask": "q?"}
+            spec, task_id=task, principal="alice", origin=origin, args={"what": "x", "ask": "q?"}
         )
         assert isinstance(components.gate.evaluate(intent), NeedsApproval), origin
 
@@ -265,7 +265,7 @@ async def test_list_and_cancel(components: Components, clock: Clock) -> None:
 def _watch(op: store.Op, value: str | None = None, **kw: Any) -> store.Watch:
     base: dict[str, Any] = dict(
         id=1,
-        principal="justin",
+        principal="alice",
         what="w",
         check_kind="tool",
         extension=None,
@@ -338,12 +338,12 @@ def test_core_job_needs_a_channel_and_an_owner(
     settings: Settings, db: sqlite3.Connection, components: Components
 ) -> None:
     assert any(f.__name__ == "watches_job" for f in CORE_JOBS)
-    deps = CoreDeps(settings, db, components, None, "justin")
+    deps = CoreDeps(settings, db, components, None, "alice")
     assert watches_job(deps) is None
-    job = watches_job(CoreDeps(settings, db, components, cast(Any, Recorder()), "justin"))
+    job = watches_job(CoreDeps(settings, db, components, cast(Any, Recorder()), "alice"))
     assert job is not None and (job.id, job.schedule) == ("watches", "*/5 * * * *")
     off = make_settings(watches={"enabled": False})
-    assert watches_job(CoreDeps(off, db, components, cast(Any, Recorder()), "justin")) is None
+    assert watches_job(CoreDeps(off, db, components, cast(Any, Recorder()), "alice")) is None
 
 
 async def test_queue_due_claims_once_and_expires(
@@ -387,7 +387,7 @@ async def test_tool_watch_fires_once_through_the_pulse(
     (out,) = await run_due(db, w, clock)
     assert out.result["status"] == "fired"
     (sent,) = ch.sent
-    assert sent.principal == "justin" and sent.text == '\U0001f440 W1 milk on the list: saw "milk"'
+    assert sent.principal == "alice" and sent.text == '\U0001f440 W1 milk on the list: saw "milk"'
     watch = store.get(db, 1)
     assert watch is not None and (watch.state, watch.fired, watch.checks) == ("fired", 1, 2)
     item = items.get(db, "core", "notice/watch/1/1")
@@ -469,7 +469,7 @@ async def test_an_ask_watch_answers_through_the_hook(
     (out,) = await run_due(db, w, clock)
     assert out.result == {"watch": 1, "status": "asked", "ask_task": "ask1"}
     assert asked[0]["watch"] == 1 and asked[0]["kind"] == "research"
-    assert asked[0]["question"] == "Is the Pro in stock?" and asked[0]["principal"] == "justin"
+    assert asked[0]["question"] == "Is the Pro in stock?" and asked[0]["principal"] == "alice"
     await w.ask_answered(1, "ask1", "answered", "NO, sold out.")
     assert ch.sent == []
     clock.now += timedelta(hours=1)
@@ -506,7 +506,7 @@ async def notice(
     db: sqlite3.Connection, settings: Settings, ch: Recorder, key: str, now: datetime = NOW
 ) -> notices.Notice:
     return await notices.send_notice(
-        db, cast(Any, ch), "justin", settings, key=key, title=f"\U0001f440 {key} happened", now=now
+        db, cast(Any, ch), "alice", settings, key=key, title=f"\U0001f440 {key} happened", now=now
     )
 
 
@@ -574,7 +574,7 @@ def test_the_approval_shows_the_whole_watch(components: Components, db: sqlite3.
     tool = Intent.for_tool(
         spec,
         task_id="t",
-        principal="justin",
+        principal="alice",
         args={
             "what": "milk",
             "tool": "list_notes",
@@ -593,7 +593,7 @@ def test_the_approval_shows_the_whole_watch(components: Components, db: sqlite3.
     ask = Intent.for_tool(
         spec,
         task_id="t",
-        principal="justin",
+        principal="alice",
         args={"what": "stock", "ask": question, "then": "continue"},
     )
     text = action(ask)
@@ -702,7 +702,7 @@ async def test_a_watch_that_expires_unfired_leaves_a_low_item_for_the_briefing(
     assert item is not None and item.urgency == "low" and item.changed
     assert item.title == "W1 iPhone 17 in stock ended without firing"
     assert items.pending(db, ("urgent", "normal"), at) == []  # the hourly pulse says nothing
-    b = bf.gather(db, owner="justin", now=at, day=at.date(), tz=ZoneInfo("UTC"))
+    b = bf.gather(db, owner="alice", now=at, day=at.date(), tz=ZoneInfo("UTC"))
     assert [i.key for i in b.updates] == ["notice/watch/1/ended"]
     assert "Updates:\nW1 iPhone 17 in stock ended without firing" in bf.render(b)
     assert queue_due(db, at + timedelta(hours=1)) == {"queued": 0, "expired": 0}  # once
@@ -710,7 +710,7 @@ async def test_a_watch_that_expires_unfired_leaves_a_low_item_for_the_briefing(
     later = at + timedelta(seconds=notices.TTL_S + 60)
     assert items.open_items(db, later) == [] and items.pending(db, ("low",), later) == []
     assert (
-        bf.gather(db, owner="justin", now=later, day=later.date(), tz=ZoneInfo("UTC")).updates == ()
+        bf.gather(db, owner="alice", now=later, day=later.date(), tz=ZoneInfo("UTC")).updates == ()
     )
 
 
@@ -752,7 +752,7 @@ def test_the_briefing_reads_notices_by_their_prefix() -> None:
 
 # --- origin and follow-up (PER-346) ---------------------------------------------------------
 
-THREAD_REF = {"channel": "slack", "principal": "justin", "thread": "C1:1700.1", "ref": "C1:1700.2"}
+THREAD_REF = {"channel": "slack", "principal": "alice", "thread": "C1:1700.1", "ref": "C1:1700.2"}
 PR_WATCH: dict[str, Any] = {
     "what": "PR 159 green",
     "tool": "list_notes",
@@ -767,7 +767,7 @@ def asking_task(db: sqlite3.Connection, channel_ref: dict[str, Any] | None) -> C
     """The brain turn that calls ``create_watch``: a task with that ``channel_ref``."""
     task = insert_task(
         db,
-        NewTask(kind="ask", runner="ask", priority=1, principal="justin", channel_ref=channel_ref),
+        NewTask(kind="ask", runner="ask", priority=1, principal="alice", channel_ref=channel_ref),
     )
     return CallContext(secrets={}, idempotency_key=f"k-{task}", task_id=task)
 
@@ -814,7 +814,7 @@ async def test_a_watch_keeps_its_origin_and_notices_go_there(
     await call(components, "add_note", {"text": "checks green"})
     await run_due(db, w, clock)
     (sent,) = ch.sent
-    assert sent.principal == "justin"
+    assert sent.principal == "alice"
     assert sent.thread == MessageRef(channel="slack", ref="C1:1700.2", thread="C1:1700.1")
 
 
@@ -875,7 +875,7 @@ async def test_follow_up_queues_one_tainted_ask_as_the_creator_in_the_origin(
         "You asked yourself to: merge PR 159 if green, else say why"
     )
     assert (q["principal"], q["channel_ref"], q["tools"], q["tainted"], q["taint_hops"]) == (
-        "justin",
+        "alice",
         THREAD_REF,
         True,
         True,
@@ -932,7 +932,7 @@ async def test_a_refused_follow_up_is_said_in_the_notice(
 @pytest.mark.parametrize(
     ("args", "why"),
     [
-        ({"match_text": "Merge PR 159 once checks pass. Then tell Justin."}, "then: follow_up"),
+        ({"match_text": "Merge PR 159 once checks pass. Then tell Alice."}, "then: follow_up"),
         ({"match_text": "x" * 61}, "not a sentence"),
         ({"match_text": None, "text": "Merge it when it is green."}, "then: follow_up"),
         ({"text": "red"}, "give match_text only"),
@@ -968,7 +968,7 @@ def test_the_approval_shows_the_follow_up(components: Components) -> None:
     spec = components.registry.get(None, "create_watch")
     assert spec is not None
     args = {**PR_WATCH, "then": "follow_up", "follow_up": "merge PR 159"}
-    intent = Intent.for_tool(spec, task_id="t", principal="justin", origin="inferred", args=args)
+    intent = Intent.for_tool(spec, task_id="t", principal="alice", origin="inferred", args=args)
     assert watch_tools.summary_action(intent) == (
         'watch "PR 159 green": call list_notes {} every 15m for the default days, '
         'text you when it contains "green", then follow up: "merge PR 159"'
@@ -985,7 +985,7 @@ def test_migration_037_keeps_old_watches_and_their_ids(tmp_path: Any) -> None:
     cols = "principal, what, check_kind, op, value, interval_s, created_at, expires_at, next_at"
     for what in ("a", "b"):
         raw.execute(
-            f"INSERT INTO brain_watches ({cols}) VALUES ('justin', ?, 'tool', 'contains', 'x', "
+            f"INSERT INTO brain_watches ({cols}) VALUES ('alice', ?, 'tool', 'contains', 'x', "
             "900, '2026-11-01T00:00:00+00:00', '2026-11-08T00:00:00+00:00', "
             "'2026-11-01T00:00:00+00:00')",
             (what,),
@@ -999,7 +999,7 @@ def test_migration_037_keeps_old_watches_and_their_ids(tmp_path: Any) -> None:
         None,
         None,
     )
-    new = store.create(raw, principal="justin", what="c", check_kind="ask", op="yes",
+    new = store.create(raw, principal="alice", what="c", check_kind="ask", op="yes",
                        interval_s=3600, now=NOW, expires_at=NOW, question="q?",
                        then="follow_up", follow_up="do it")  # fmt: skip
     assert new.id == 3 and new.then == "follow_up" and new.follow_up == "do it"
@@ -1015,4 +1015,4 @@ async def test_a_follow_up_never_uses_someone_elses_thread(
     await call(components, "add_note", {"text": "green"})
     await run_due(db, w, clock)
     (q,) = asks.calls
-    assert q["channel_ref"] is None and q["principal"] == "justin"
+    assert q["channel_ref"] is None and q["principal"] == "alice"

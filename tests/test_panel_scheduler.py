@@ -24,7 +24,7 @@ from resonant.store import extensions as ext_store
 from resonant.store.db import iso
 from resonant_sdk import panel as p
 
-OWNER = "justin"
+OWNER = "alice"
 MANIFEST = """\
 name: example
 version: 1

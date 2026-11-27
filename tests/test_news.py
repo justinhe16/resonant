@@ -17,7 +17,7 @@ from resonant.store import tasks as repo
 from resonant.store.db import kv_get, kv_set, transaction
 from resonant_sdk import Event
 
-OWNER = "justin"
+OWNER = "alice"
 LA = ZoneInfo("America/Los_Angeles")
 
 

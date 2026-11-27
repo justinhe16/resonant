@@ -37,7 +37,7 @@ from resonant.tools import facts as fact_tools
 from resonant.tools.base import BuiltinContext
 from resonant_sdk import Effect, Level
 
-OWNER = "justin"
+OWNER = "alice"
 
 
 @pytest.fixture

@@ -59,7 +59,7 @@ from resonant.store.db import kv_get, kv_set, open_db, utcnow
 from resonant.store.tasks import insert_event
 from resonant_sdk import Event
 
-OWNER = "justin"
+OWNER = "alice"
 TOKEN = "cori-notify-token-0123456789"
 T0 = datetime(2031, 6, 10, 16, 0, tzinfo=UTC)
 

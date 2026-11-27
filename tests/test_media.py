@@ -40,7 +40,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner", "identities": [f"imessage:{OWNER}"]},
+                "alice": {"role": "owner", "identities": [f"imessage:{OWNER}"]},
                 "cofounder": {"identities": [f"imessage:{MEMBER}"]},
             }
         }
@@ -306,7 +306,7 @@ async def test_a_watch_ask_goes_to_the_hook_not_the_owner(
         seen.append((watch, task, status, reply))
 
     h.runner.on_watch = hook
-    queued = h.runner.enqueue("Is it in stock?", kind="research", principal="justin", watch=3)
+    queued = h.runner.enqueue("Is it in stock?", kind="research", principal="alice", watch=3)
     assert isinstance(queued, Queued)
     out = await h.runner.step(h.task(queued.task_id), [], Ctx())
     assert isinstance(out, Done)

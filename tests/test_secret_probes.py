@@ -40,7 +40,7 @@ from resonant.store import secret_expiry as rows
 from resonant.store.db import kv_get
 
 T0 = datetime(2026, 11, 23, 18, 0, tzinfo=UTC)  # 10:00 in Los Angeles
-OWNER = "justin"
+OWNER = "alice"
 CTX = CallContext(secrets={}, idempotency_key="t", task_id="t")
 SENTINEL = "s3ntinel-VALUE-0123456789abcdef"
 

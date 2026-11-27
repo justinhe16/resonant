@@ -42,7 +42,7 @@ from resonant.store.db import kv_get, kv_set, transaction
 from resonant.tools import ToolRegistry, notes
 from resonant_sdk import Effect, Event, Level, ToolSpec
 
-OWNER, MEMBER = "justin", "cofounder"
+OWNER, MEMBER = "alice", "cofounder"
 OWNER_HANDLE, MEMBER_HANDLE = "+15550000000", "+15557654321"
 T0 = datetime(2026, 10, 13, 15, 0, tzinfo=UTC)
 TTL_S = 1800.0

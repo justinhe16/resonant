@@ -53,7 +53,7 @@ def _approval(db: sqlite3.Connection, task_id: str | None, n: int, at: datetime)
         db,
         ap.NewApproval(
             task_id=task_id, intent_hash=f"h{n}", tool="t", effect=Effect.WRITE, level=Level.L2,
-            summary=f"s{n}", approvers=("justin",), code=f"C{n}",
+            summary=f"s{n}", approvers=("alice",), code=f"C{n}",
             expires_at=at + timedelta(minutes=30),
         ),
         at,

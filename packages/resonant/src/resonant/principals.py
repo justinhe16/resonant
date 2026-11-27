@@ -257,7 +257,7 @@ class Principals(BaseModel):
         return self.role(name) in ("owner", "approver")
 
     def display(self, name: str) -> str:
-        """A principal's name as a reply says it (``justin`` -> ``Justin``)."""
+        """A principal's name as a reply says it (``alice`` -> ``Alice``)."""
         return name[:1].upper() + name[1:]
 
     def can(

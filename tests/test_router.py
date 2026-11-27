@@ -41,7 +41,7 @@ from resonant.tools.builtin import BUILTIN_SPECS
 from resonant.tools.projects import projects
 from resonant_sdk import Effect, Event, ToolSpec
 
-OWNER, MEMBER = "justin", "cofounder"
+OWNER, MEMBER = "alice", "cofounder"
 CURLY = chr(0x2019)  # iMessage sends curly apostrophes
 
 
