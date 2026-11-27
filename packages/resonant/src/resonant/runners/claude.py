@@ -4549,6 +4549,7 @@ class ClaudeRunner:
     async def _finish_cancelled(self, code: str, *, send: bool = True) -> None:
         """What a cancelled run still needs once its processes are gone: its dir deleted, its
         pulse item cleared, and (once) the reply. Safe to repeat."""
+        self._unannounced.pop(code, None)  # PER-325: a queued or waiting run's, if any
         async with self._cleanup_locks.setdefault(code, asyncio.Lock()):
             run = self._must_get(code)
             # The live session if there is one, and anything else of the run (a straggler
@@ -4580,6 +4581,7 @@ class ClaudeRunner:
         job = self._announcing.pop(code, None)  # PER-341: no start line after a cancel
         if job is not None:
             job.cancel()
+        self._unannounced.pop(code, None)  # PER-325: nor one still waiting for the window
         run = runs.get(self.conn, code)
         if run is not None and run.status == "cancelled":
             await self._finish_cancelled(code)

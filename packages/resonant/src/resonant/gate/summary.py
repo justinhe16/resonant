@@ -36,7 +36,7 @@ _LINK = re.compile(r"\b(?:https?|ftp|mailto|slack):\S*", re.IGNORECASE)
 _DOMAIN = re.compile(
     r"(?<![\w@.-])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"(?:com|net|org|io|co|dev|app|ai|me|us|uk|ca|de|fr|ru|cn|info|biz|xyz|site|online|link"
-    r"|click|top|gg|ly|sh|to|tv|cc|zip|mov|gov|edu)\b(?:/\S*)?",
+    r"|click|top|gg|ly|to|tv|cc|zip|mov|gov|edu)\b(?:/\S*)?",
     re.IGNORECASE,
 )
 
