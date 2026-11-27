@@ -146,7 +146,9 @@ class RunnerApi(Protocol):
 
     def get_run(self, code: str) -> Run | None: ...
 
-    async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
+    async def cancel_run(
+        self, code: str, *, reason: str = "cancelled", by: str | None = None
+    ) -> Cancelled | Refused: ...
 
     async def continue_run(
         self,
@@ -670,12 +672,14 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"found": False, "code": code, "text": f"No run {code}."}
         return {"found": True, **found}
 
-    async def _cancel_run(args: dict[str, Any]) -> dict[str, Any]:
+    async def _cancel_run(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         code = _need_code("cancel_run", args)
         claude = runner()
         if claude is None:
             return {"cancelled": False, "code": code, "text": missing()}
-        result = await claude.cancel_run(code)
+        # PER-325: the run remembers who cancelled it, so its end says it in their words
+        task = task_store.get_task(ctx.conn, call.task_id) if call is not None else None
+        result = await claude.cancel_run(code, by=None if task is None else task.principal)
         if (reason := _refusal(result)) is not None:
             return {"cancelled": False, "code": code, "text": reason}
         return {"cancelled": True, "code": code, "text": cast("Cancelled", result).text}
@@ -788,7 +792,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         START_RUN.name: cast(ToolHandler, _WithContext(_start_run)),
         LIST_RUNS.name: _list_runs,
         RUN_ACTIVITY.name: _run_activity,
-        CANCEL_RUN.name: _cancel_run,
+        CANCEL_RUN.name: cast(ToolHandler, _WithContext(_cancel_run)),
         CONTINUE_RUN.name: cast(ToolHandler, _WithContext(_continue_run)),
         MERGE_RUN.name: cast(ToolHandler, _WithContext(_merge_run)),
     }

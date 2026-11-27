@@ -981,6 +981,45 @@ async def test_one_approvers_send_failure_is_audited_and_the_ask_waits(make: Any
     assert details["approver"] == OWNER and "Messages is not running" in details["error"]
 
 
+async def test_a_failed_send_is_audited_once_per_approval_and_approver(make: Any) -> None:
+    """PER-325: a re-prompt whose same send fails again adds no second audit row; another
+    approver's (or another approval's) failure still gets its own."""
+    from resonant.gateway.channel import ApprovalPrompt
+    from resonant.runners.approve import _Sent  # pyright: ignore[reportPrivateUsage]
+
+    h = make_team(make)
+    h.channel.fail_prompt.append(ChannelSendError("Messages is not running"))  # the owner's
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+    (approval,) = h.approvals(task_id)
+
+    def again(approval_id: str, *failed: str) -> None:
+        prompt = ApprovalPrompt(approval_id=approval_id, code="K4", summary="rotate",
+                                effect=Effect.WRITE.value, level=Level.L2.value,
+                                expires_at=datetime.now(UTC))  # fmt: skip
+        sent = _Sent(h.db, h.channel, prompt, (approval_id,), task_id=task_id,
+                     now=lambda: datetime.now(UTC), asking=None)  # fmt: skip
+        sent.reached = [MEMBER]
+        sent.failed = {who: ChannelSendError("Messages is not running") for who in failed}
+        sent.result()
+
+    def audited() -> list[tuple[str, str]]:
+        rows = h.db.execute(
+            "SELECT detail FROM audit_log WHERE action = 'approval.send_failed' AND task_id = ?",
+            (task_id,),
+        ).fetchall()
+        return [(json.loads(r["detail"])["approval_id"], json.loads(r["detail"])["approver"])
+                for r in rows]  # fmt: skip
+
+    assert audited() == [(approval.id, OWNER)]
+    again(approval.id, OWNER)
+    again(approval.id, OWNER)
+    assert audited() == [(approval.id, OWNER)]
+    again(approval.id, OWNER, "carol")
+    again("other", OWNER)
+    assert audited() == [(approval.id, OWNER), (approval.id, "carol"), ("other", OWNER)]
+
+
 async def test_transient_failure_with_no_copy_delivered_retries(make: Any) -> None:
     h = make_team(make)
     h.channel.fail_prompt.extend([ChannelSendError("Messages is not running")] * 2)

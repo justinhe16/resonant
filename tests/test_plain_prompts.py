@@ -61,6 +61,27 @@ def test_plain_line_cleans_and_clips() -> None:
         assert plain_line(empty) is None
 
 
+def test_fullwidth_links_and_bare_domains_are_links_too() -> None:
+    """PER-325: NFKC before the link filter, and bare domains Slack would auto-link."""
+    assert plain_line("open \uff48\uff54\uff54\uff50\uff53\uff1a\uff0f\uff0fevil.test/x now") == (
+        "Open (link) now"
+    )
+    assert plain_line("check evil.com and www.bad.io/path first") == (
+        "Check (link) and (link) first"
+    )
+    # file names aren't links
+    assert plain_line("update README.md and app.py") == "Update README.md and app.py"
+
+
+def test_the_cut_ends_at_a_whole_word() -> None:
+    """PER-325: the clip lands after a word, not in the middle of one."""
+    text = "refund " + "abcdefghij " * 20
+    out = plain_line(text)
+    assert out is not None and len(out) <= PLAIN_MAX and out.endswith("abcdefghij...")
+    one_word = plain_line("x" * 300)  # no space to cut at: the hard cut stays
+    assert one_word is not None and len(one_word) == PLAIN_MAX
+
+
 def test_no_reason_is_todays_prompt() -> None:
     prompt = _prompt()
     assert prompt.text() == f"[K4] {SUMMARY}? Reply yes / no"

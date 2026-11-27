@@ -602,6 +602,29 @@ async def test_kill_switch_stops_a_running_ask(db: sqlite3.Connection, tmp_path:
     assert refused == AskRefused(PAUSED, "paused")
 
 
+async def test_a_kill_during_a_continuation_says_stopped_and_what_ran(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """PER-325: a /kill while Claude carries on after an approval replies ``Stopped: …``,
+    not the code-built ``Done: …`` alone; what the approval ran is still said under it."""
+    h = make(db, tmp_path, scenario="hang")
+    done = "Done: saved the note."
+    continues: dict[str, Any] = {"key": "approval:a1", "depth": 1, "of": "t0", "reports": [],
+                 "changed": False, "fallback": done}  # fmt: skip
+    queued = h.runner.enqueue("q", principal="alice", continues=continues)
+    assert isinstance(queued, Queued), queued
+    step = asyncio.create_task(h.runner.step(h.task(queued.task_id), [], Ctx()))
+    for _ in range(100):
+        if (h.notes / "pid.json").exists():
+            break
+        await asyncio.sleep(0.05)
+    killswitch.engage(db, actor="alice")
+    out = await asyncio.wait_for(step, 15)
+    assert isinstance(out, Done) and out.result["status"] == "killed"
+    (text,) = h.channel.texts
+    assert text.startswith(STOPPED) and done in text
+
+
 async def test_cancel_kills_the_session(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path, scenario="hang")
     queued = h.runner.enqueue("q", principal="alice")

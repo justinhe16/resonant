@@ -63,6 +63,12 @@ def test_ci_failures_reviews_merges_and_deploys() -> None:
     assert seen("gh pr checks 12", "fail-fast\tpending\t0\n", error=True) == []
     # --auto queues the merge: nothing merged yet
     assert seen("gh pr merge 12 --auto --squash", "Pull request #12 will be merged") == []
+    # PER-325: however it's spelled; ``--auto=false`` is a plain merge
+    assert seen("gh pr merge 12 --auto=true --squash", "Pull request #12 will be merged") == []
+    assert seen("gh pr merge 12 --disable-auto=true", "auto-merge disabled") == []
+    assert [m.kind for m in seen("gh pr merge 12 --auto=false", "Merged pull request #12")] == [
+        "merged"
+    ]
     # the last gh command of a compound line is its outcome
     assert seen("gh pr checks 12 --watch && gh pr merge 12", "Merged pull request #12") == [
         ms.Milestone("merged", 12)
@@ -169,3 +175,15 @@ def test_runs_milestones_off_in_yaml_is_off(resonant_home: Path) -> None:
     assert load_settings().runs.milestones == "off"
     (resonant_home / "config.yaml").write_text("runs:\n  milestones: thread\n")
     assert load_settings().runs.milestones == "thread"
+
+
+def test_a_merged_last_waits_for_the_end_text() -> None:
+    """PER-325: a ``merged`` with nothing after it is held (the end text says the merge);
+    more work after it lets it out, in order."""
+    opened = ("pr_opened", ms.Milestone("pr_opened", 12, None))
+    merged = ("merged", ms.Milestone("merged", 12))
+    deployed = ("deployed:staging", ms.Milestone("deployed", env="staging"))
+    assert ms.held([opened, merged]) == [opened]
+    assert ms.held([merged]) == []
+    assert ms.held([opened, merged, deployed]) == [opened, merged, deployed]
+    assert ms.held([]) == []

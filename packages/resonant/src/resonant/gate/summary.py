@@ -31,6 +31,14 @@ DETAIL_MAX = 4096  # PER-300: one arg shown in full under the summary
 PLAIN_MAX = 140  # PER-324: the brain's plain sentence over a prompt's exact call
 _MARKUP = re.compile(r"[`*_~|]")  # PER-324: Slack mrkdwn the plain line never carries
 _LINK = re.compile(r"\b(?:https?|ftp|mailto|slack):\S*", re.IGNORECASE)
+# PER-325: a bare domain Slack would auto-link (``evil.com``, ``www.x.io/path``). File names
+# (``README.md``, ``app.py``) aren't one: the last label must be a common web TLD.
+_DOMAIN = re.compile(
+    r"(?<![\w@.-])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:com|net|org|io|co|dev|app|ai|me|us|uk|ca|de|fr|ru|cn|info|biz|xyz|site|online|link"
+    r"|click|top|gg|ly|to|tv|cc|zip|mov|gov|edu)\b(?:/\S*)?",
+    re.IGNORECASE,
+)
 
 # Ordinary whitespace controls are readable once whitespace is collapsed for display.
 _ALLOWED_CONTROLS = frozenset("\t\n\r")
@@ -229,7 +237,8 @@ def plain_line(text: str | None) -> str | None:
     """PER-324: the brain's stated reason for a gated call as the prompt's plain first line
     (``Look up the shop's locations (read only)``), or None when there is none.
     Cleaned like any external string (``clean_external``: one line, printable ASCII, no
-    brackets, approval-code look-alikes masked; Slack mrkdwn characters and links dropped),
+    brackets, approval-code look-alikes masked; Slack mrkdwn characters and links dropped,
+    fullwidth links and bare domains too),
     trailing ``. ? !`` dropped (the prompt adds
     its own ``?``), first letter capitalised and at most ``PLAIN_MAX`` characters (a cut ends
     in ``...``). It is the model's words, so it never replaces the code-built summary: the
@@ -237,11 +246,16 @@ def plain_line(text: str | None) -> str | None:
     if not isinstance(text, str):
         return None
     # no Slack mrkdwn from the model: a backtick or fence could restyle the exact call under
-    # it, ``*bold*`` dress a write up; a link auto-links
-    flat = clean_external(_MARKUP.sub(" ", _LINK.sub("(link)", text)))
+    # it, ``*bold*`` dress a write up; a link auto-links. PER-325: NFKC first, so a fullwidth
+    # ``https://`` is a link here too; a bare domain is one as well.
+    norm = unicodedata.normalize("NFKC", text)
+    flat = clean_external(_MARKUP.sub(" ", _DOMAIN.sub("(link)", _LINK.sub("(link)", norm))))
     flat = " ".join(flat.split()).rstrip(" .?!;:,")
     if len(flat) > PLAIN_MAX:
-        flat = flat[: PLAIN_MAX - 3].rstrip(" .?!;:,") + "..."
+        cut = flat[: PLAIN_MAX - 2]  # one more than fits: a space there ends a whole word
+        space = cut.rfind(" ")
+        cut = cut[:space] if space >= PLAIN_MAX // 2 else cut[: PLAIN_MAX - 3]
+        flat = cut.rstrip(" .?!;:,") + "..."  # PER-325: at a word's end when one is near
     if not any(ch.isalnum() for ch in flat):
         return None
     return flat[0].upper() + flat[1:]

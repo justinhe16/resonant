@@ -273,6 +273,7 @@ async def test_a_brain_continued_run_says_continuing_in_its_thread(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
     h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    h.runner.milestone_quiet_s = 0  # PER-325: the line waits for the quiet window
     res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now",
                                    channel_ref=THREAD)  # fmt: skip
     assert not isinstance(res, Refused)
@@ -325,6 +326,7 @@ async def test_a_run_continued_from_another_thread_reports_there(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
     h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    h.runner.milestone_quiet_s = 0  # PER-325: the line waits for the quiet window
     await stopped_in(h, THREAD_A)
     sent = record_threads(h)
 
@@ -562,3 +564,28 @@ async def test_the_tool_moves_the_run_to_the_thread_it_was_continued_in(
     no_thread = CallContext(secrets={}, idempotency_key="k-n", task_id=_task(db, "owner"))
     assert (await handler({"code": "R1"}, no_thread))["continued"] is True
     assert fake.moved == [(ref, "lead"), (None, None)]
+
+
+async def test_a_start_line_is_never_said_a_day_after_the_run_started(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-325: a later step of a run that started days ago (past the channel's 7-day send
+    dedupe) never says ``On it: starting`` again; a fresh run does."""
+    from dataclasses import replace
+    from datetime import timedelta
+
+    h = build(tmp_path, db, scenario="hang")
+    res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now",
+                                   channel_ref=THREAD, announce=True)  # fmt: skip
+    assert not isinstance(res, Refused)
+    run = h.run("R1")
+    task = task_store.get_task(db, cast(str, run.task_id))
+    assert task is not None
+    now = h.runner.clock()
+    stale = replace(run, started_at=now - claude_mod.START_STALE - timedelta(minutes=1))
+    await h.runner._announce(task, stale)  # pyright: ignore[reportPrivateUsage]
+    assert not [t for t in h.chan.texts() if t.startswith("On it")]
+    await h.runner._announce(task, replace(run, started_at=now))  # pyright: ignore[reportPrivateUsage]
+    assert [t for t in h.chan.texts() if t.startswith("On it")] == [
+        "On it: starting R1 (fix the flaky test)."
+    ]
