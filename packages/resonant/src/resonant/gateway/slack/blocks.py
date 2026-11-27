@@ -11,7 +11,7 @@
   can't be undone" wording and its Approve button is red. A pay prompt gets no buttons
   (``SlackChannel`` sends it as text: only a typed ``yes <code>`` approves pay).
 - :func:`resolved_blocks`: the prompt's text with the outcome line and no buttons:
-  ``Approved by Brian``, ``Denied by Justin``, ``Expired, not done``.
+  ``Approved by Bob``, ``Denied by Alice``, ``Expired, not done``.
 - :func:`valid_blocks` (PER-332): a room post's caller-built Block Kit ``blocks``, checked
   defensively (a list of 1..``MAX_BLOCKS`` display-only blocks: ``BLOCK_TYPES`` holding only
   ``INNER_TYPES``, no ``<!…>``/``<@…>`` ping anywhere), else None (post the text alone).
@@ -200,7 +200,7 @@ def resolved_blocks(text: str, outcome: str) -> list[dict[str, Any]]:
 
 
 def outcome_text(status: str, by: str | None) -> str:
-    """``Approved by Brian`` / ``Denied by Justin`` / ``Expired, not done``."""
+    """``Approved by Bob`` / ``Denied by Alice`` / ``Expired, not done``."""
     if status == "approved":
         return f"Approved by {by}" if by else "Approved"
     if status == "rejected":

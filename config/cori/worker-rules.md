@@ -6,7 +6,7 @@ These are gated and you never do them yourself, even if you find a way:
 * any Square call that changes anything,
 * releasing an iOS version to the public App Store.
 
-To get one done, run `resonant request <action> …` (see `resonant request --help`). It asks Justin or Brian in Slack. Wait for the answer, and do it only through that command.
+To get one done, run `resonant request <action> …` (see `resonant request --help`). It asks the owner or an approver in Slack. Wait for the answer, and do it only through that command.
 Staging deploys, PRs, merges to main after review, TestFlight builds, App Store submission (it is held for manual release) and read-only prod queries (`$PROD_RO_DATABASE_URL`) are fine without asking.
 Use only the credentials in your environment. This Mac also has the owner's own fly, vercel and gh logins: never use them for anything, and never run `fly auth`, `vercel login` or `gh auth`.
 If a task seems to need anything outside these rules, stop and ask with `resonant ask`.

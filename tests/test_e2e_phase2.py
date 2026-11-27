@@ -54,7 +54,7 @@ OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
 """
@@ -158,7 +158,7 @@ class Running:
                 kind="script",
                 runner="script",
                 priority=PRIORITY_OWNER,
-                principal="justin",
+                principal="alice",
                 checkpoint={"calls": list(calls)},
             )
         )
@@ -383,7 +383,7 @@ async def test_e15_dry_run_ops_reply(running: Running) -> None:
             kind="command",
             runner="local",
             priority=PRIORITY_OWNER,
-            principal="justin",
+            principal="alice",
             checkpoint={
                 "direct_call": {"tool": "restart_ollama", "args": {}},
                 "title": "/restart ollama",
@@ -408,7 +408,7 @@ async def test_back_up_once_after_a_requested_restart(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     def marked(r: Running) -> None:
-        mark_restart(r.conn, by="justin", commit="abc1234", now=utcnow() - timedelta(seconds=6))
+        mark_restart(r.conn, by="alice", commit="abc1234", now=utcnow() - timedelta(seconds=6))
 
     async with start_daemon(resonant_home, chat, before_run=marked) as r:
         sent = await r.osa.wait_for(1, 10)
@@ -985,7 +985,7 @@ async def test_e14_a_used_approval_never_allows_again(live: Running) -> None:
 
     spec = r.components.registry.get(None, "restart_resonant")
     assert spec is not None
-    intent = Intent.for_tool(spec, task_id=task["id"], principal="justin", args={})
+    intent = Intent.for_tool(spec, task_id=task["id"], principal="alice", args={})
     assert not isinstance(r.components.gate.evaluate(intent), Allow)
     assert len(r.ops.spawned) == 1
 

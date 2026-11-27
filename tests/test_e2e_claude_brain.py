@@ -47,7 +47,7 @@ MEMBER_PHONE = "+15557654321"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
   cofounder:
@@ -196,7 +196,7 @@ async def start(
         ask_root=home / "ask",
         channel=daemon.imessage.channel,
         secrets=SecretStore(keychain),
-        owner="justin",
+        owner="alice",
         timezone=settings.timezone,
         create_task=daemon.loop.create_task,
         claude_cmd=[sys.executable, "-I", str(FAKE), "--script", str(plan), "--notes", str(notes)],
@@ -363,7 +363,7 @@ def _the_incident(w: World) -> None:
     from resonant.store import runs, system_texts
 
     now = utcnow()
-    run = runs.create(w.conn, repo="mycelium", ask="Review PR #1", principal="justin",
+    run = runs.create(w.conn, repo="mycelium", ask="Review PR #1", principal="alice",
                       session_id="s1", max_seconds=60)  # fmt: skip
     runs.update(w.conn, run.code, status="running")
     runs.finish(w.conn, run.code, "failed", failure="it merged its own PR #2")
@@ -371,7 +371,7 @@ def _the_incident(w: World) -> None:
     w.conn.execute("UPDATE runs SET ended_at = ?, updated_at = ? WHERE code = ?",
                    (iso(now - timedelta(seconds=12)), iso(now - timedelta(seconds=12)),
                     run.code))  # fmt: skip
-    other = runs.create(w.conn, repo="mycelium", ask="Make the prompt", principal="justin",
+    other = runs.create(w.conn, repo="mycelium", ask="Make the prompt", principal="alice",
                         session_id="s2", max_seconds=60)  # fmt: skip
     runs.update(w.conn, other.code, status="running")
     _c, item = pulse_store.upsert(w.conn, "core", pulse_store.run_key(run.code),
@@ -387,7 +387,7 @@ def _the_incident(w: World) -> None:
     w.conn.execute("UPDATE events SET consumed_at = ? WHERE task_id IS NULL", (iso(now),))
     system_texts.record(
         w.conn,
-        "justin",
+        "alice",
         "run",
         "R1 (/robot-surf-prompt Review PR #1 in mycelium) failed: it merged its own PR #2, not "
         "Resonant\nStill working on R2 (/robot-surf-prompt Make the prompt).\n"
@@ -448,7 +448,7 @@ async def test_a_news_reply_that_names_an_untold_run_tells_it(
     async with start(resonant_home, chat, tmp_path) as w:
         # no task: a queued one with a saved reply would be resent and race the reply below
         message(w.conn, "earlier", at=utcnow() - timedelta(minutes=30), task=False)
-        run = runs.create(w.conn, repo="mycelium", ask="x", principal="justin", session_id="s",
+        run = runs.create(w.conn, repo="mycelium", ask="x", principal="alice", session_id="s",
                           max_seconds=60)  # fmt: skip
         runs.update(w.conn, run.code, status="running")
         runs.finish(w.conn, run.code, "done")
@@ -699,11 +699,11 @@ async def test_a_paused_daemon_runs_nothing_from_claude(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        brain_task = _task(w, "justin")
+        brain_task = _task(w, "alice")
         bridge = _bridge(w, brain_task)
         await bridge.start()
         try:
-            killswitch.engage(w.conn, actor="justin")
+            killswitch.engage(w.conn, actor="alice")
             text, error = await bridge.call("add_note", {"text": "x"})
             assert error and text.startswith("not run: Resonant is paused")
             assert w.executions("add_note") == []
@@ -778,7 +778,7 @@ async def test_each_session_is_bound_to_its_own_task(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        a, b = _task(w, "justin"), _task(w, "justin")
+        a, b = _task(w, "alice"), _task(w, "alice")
         bridge_a, bridge_b = _bridge(w, a), _bridge(w, b)
         setup_a, setup_b = await bridge_a.start(), await bridge_b.start()
         try:
@@ -871,7 +871,7 @@ async def test_a_crash_mid_session_never_runs_a_pinned_change_again(
               "effects": ['Saved note 1: "a"']}  # fmt: skip
         n = len(w.osa.sent)
         w.daemon.loop.create_task(NewTask(kind="ask", runner="ask", priority=1,
-                                          principal="justin", checkpoint=cp))  # fmt: skip
+                                          principal="alice", checkpoint=cp))  # fmt: skip
         await w.osa.wait_for(n + 1, 20)
         text = w.osa.sent[n].text
         assert text.startswith("Not done: Resonant restarted") and 'Saved note 1: "a"' in text
@@ -987,7 +987,7 @@ async def test_a_refused_change_still_uses_up_its_tool_use(
     """Review of BR-10: a change refused before the gate (bad args) consumes its tool_use,
     so a later change still waits for its own and sees a web read in between (tainted)."""
     async with start(resonant_home, chat, tmp_path) as w:
-        bridge = _bridge(w, _task(w, "justin"))
+        bridge = _bridge(w, _task(w, "alice"))
         await bridge.start()
         try:
             bridge.observe(_use("delete_note"))
@@ -1007,7 +1007,7 @@ async def test_no_call_runs_after_the_session_ends(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        bridge = _bridge(w, _task(w, "justin"))
+        bridge = _bridge(w, _task(w, "alice"))
         await bridge.start()
         await bridge.aclose()
         bridge.observe(_use("add_note"))

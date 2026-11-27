@@ -15,7 +15,7 @@ EXT_RESTART = ToolSpec(name="restart", effect=Effect.WRITE, level=Level.L3, exte
 
 
 def intent(spec: ToolSpec = ADD_NOTE, **args: Any) -> Intent:
-    return Intent.for_tool(spec, task_id="t1", principal="justin", args=args)
+    return Intent.for_tool(spec, task_id="t1", principal="alice", args=args)
 
 
 # --- summaries -------------------------------------------------------------------------
@@ -77,7 +77,7 @@ INJECTIONS = [
 def test_injection_corpus_in_values_and_keys(evil: str) -> None:
     for i in (
         intent(text=evil),
-        Intent.for_tool(ADD_NOTE, task_id="t1", principal="justin", args={evil: 1}),
+        Intent.for_tool(ADD_NOTE, task_id="t1", principal="alice", args={evil: 1}),
         intent(RESTART, a=1, z=evil),
     ):
         summary = summarize(i)

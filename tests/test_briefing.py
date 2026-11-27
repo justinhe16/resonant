@@ -48,10 +48,10 @@ from resonant.store.db import atomic, iso, kv_get, kv_set, open_db
 from resonant.tools.reminders import add_reminder
 from resonant_sdk import Effect, Level
 
-OWNER = "justin"
+OWNER = "alice"
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
 """

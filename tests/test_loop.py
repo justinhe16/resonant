@@ -297,14 +297,14 @@ async def test_router_creates_task_from_event(db: sqlite3.Connection) -> None:
         return spec(principal=event.principal) if event.type == "message" else None
 
     loop = make_loop(db, {"scripted": r}, router=router)
-    ev = Event(source="imessage", type="message", principal="justin", payload={"text": "hi"})
+    ev = Event(source="imessage", type="message", principal="alice", payload={"text": "hi"})
     loop.submit(ev)
     loop.submit(Event(source="imessage", type="noise"))
     await loop.run_until_idle()
     created, events = r.calls[0]
     assert created.origin_event_id == ev.id
     assert created.trace_id == ev.trace_id
-    assert created.principal == "justin"
+    assert created.principal == "alice"
     assert [e.id for e in events] == [ev.id]
     assert repo.unrouted_events(db) == []
 

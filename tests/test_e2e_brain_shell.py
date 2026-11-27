@@ -265,7 +265,7 @@ async def test_in_a_thread_an_approved_turn_that_cant_run_says_so_in_that_thread
         assert fake.inject("U1", "yes", thread=thread)
         await wait_until(lambda: any(m.text.startswith("Approved, but") for m in fake.sent), 20)
         (notice,) = [m for m in fake.sent if m.text.startswith("Approved, but")]
-        assert notice.thread == thread and notice.principal == "justin"
+        assert notice.thread == thread and notice.principal == "alice"
 
 
 async def test_no_means_it_never_runs(

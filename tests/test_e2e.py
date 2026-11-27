@@ -40,7 +40,7 @@ SECRET = "my bank pin is 4321"  # a body that must never reach audit rows
 
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
 """
@@ -191,7 +191,7 @@ async def test_two_adapters_imessage_and_a_fake_slack(
             (await osa.wait_for(1, 10)).text == slack.texts[0] == "Nothing is waiting for approval."
         )
         assert len(slack.sent) == 1
-        await hub.send("justin", "proactive", dedupe_key="t:proactive")
+        await hub.send("alice", "proactive", dedupe_key="t:proactive")
         assert osa.sent[-1].text == "proactive" and len(slack.sent) == 1
         assert daemon.state.monitor is not None
         states = await daemon.state.monitor.evaluate()
@@ -219,7 +219,7 @@ async def test_enabled_daemon_wires_router_runner_and_monitor(running: Running) 
     # /update (the longest tool) is never cancelled mid-run.
     limit = d.imessage.runner.max_step_s
     assert limit is not None and limit >= UPDATE_RESONANT.timeout_s + 15
-    assert d.imessage.monitor.owner == "justin"
+    assert d.imessage.monitor.owner == "alice"
     async with httpx.AsyncClient() as client:
         channels = (await client.get(f"http://127.0.0.1:{running.port}/api/channels")).json()
     assert channels[0]["enabled"] is True and channels[0]["ok"] is True
@@ -259,7 +259,7 @@ async def test_tasks_command_end_to_end(running: Running) -> None:
     assert len(events) == 1
     ev = events[0]
     assert ev["source"] == "imessage" and ev["type"] == "message"
-    assert ev["principal"] == "justin" and ev["consumed_at"] is not None
+    assert ev["principal"] == "alice" and ev["consumed_at"] is not None
     assert json.loads(ev["payload"])["handle"] == OWNER_PHONE
 
     # The task: routed on the fast path, answered by the local runner.
@@ -274,11 +274,11 @@ async def test_tasks_command_end_to_end(running: Running) -> None:
     # The audit trail: the gated read, the send, and the dropped stranger.
     gate = r.audits("gate.evaluate")
     assert [(a["tool"], a["task_id"], a["requested_by"]) for a in gate] == [
-        ("projects", f"route:{ev['id']}", "justin")
+        ("projects", f"route:{ev['id']}", "alice")
     ]
     sends = r.audits("imessage.sent")
     assert len(sends) == 1
-    assert sends[0]["requested_by"] == "justin"
+    assert sends[0]["requested_by"] == "alice"
     assert sends[0]["idempotency_key"] == f"reply:{task['id']}"
     unknown = r.audits("imessage.unknown_sender")
     assert [a["detail"]["handle"] for a in unknown] == [STRANGER]

@@ -8,7 +8,7 @@ Usage::
 
     hub = ChannelHub({"imessage": imessage, "slack": slack}, principals, conn)
     await hub.start(loop.submit)          # starts every adapter; see "Start" below
-    await hub.send("justin", "done", thread=thread_of(task), dedupe_key=...)
+    await hub.send("alice", "done", thread=thread_of(task), dedupe_key=...)
     await hub.stop()
 
 **Which adapter sends.** ``send(principal, text, thread=...)`` and ``request_approval``:

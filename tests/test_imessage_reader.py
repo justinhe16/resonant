@@ -32,7 +32,7 @@ from resonant_sdk import Event
 
 FIXTURES = Path(__file__).parent / "fixtures" / "imessage"
 OWNER_PHONE = "+15551234567"
-OWNER_EMAIL = "justin@example.com"
+OWNER_EMAIL = "alice@example.com"
 MEMBER = "+15557654321"
 STRANGER = "+15559990000"
 SELF = "resonant.agent@icloud.com"
@@ -79,7 +79,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {
+                "alice": {
                     "role": "owner",
                     "identities": [f"imessage:{OWNER_PHONE}", f"imessage:{OWNER_EMAIL}"],
                 },
@@ -156,7 +156,7 @@ def test_known_handle_becomes_exactly_one_event(
     [event] = sink.events
     assert event.source == "imessage"
     assert event.type == "message"
-    assert event.principal == "justin"
+    assert event.principal == "alice"
     assert event.dedupe_key == "imessage:G-1"
     assert event.occurred_at == at
     assert event.task_id is None
@@ -177,10 +177,10 @@ def test_phone_and_email_map_to_same_principal(
     chat: FakeChatDB, reader: IMessageReader, db: sqlite3.Connection
 ) -> None:
     chat.add_message(handle=OWNER_PHONE, text="from phone")
-    chat.add_message(handle="Justin@Example.COM", text="from mac")
+    chat.add_message(handle="Alice@Example.COM", text="from mac")
     sink = Sink(db)
     reader.poll_once(sink)
-    assert [e.principal for e in sink.events] == ["justin", "justin"]
+    assert [e.principal for e in sink.events] == ["alice", "alice"]
     assert sink.events[1].payload["handle"] == OWNER_EMAIL
 
 
@@ -366,10 +366,10 @@ def test_rate_limit_per_principal(
         chat.add_message(handle=OWNER_PHONE, text=f"{SECRET} {i}")
     chat.add_message(handle=MEMBER, text="other principal is unaffected")
     reader.poll_once(sink)
-    assert [e.principal for e in sink.events] == ["justin"] * 3 + ["cofounder"]
+    assert [e.principal for e in sink.events] == ["alice"] * 3 + ["cofounder"]
     limited = audits(db)
     assert [(r["action"], r["requested_by"]) for r in limited] == [
-        ("imessage.rate_limited", "justin")
+        ("imessage.rate_limited", "alice")
     ] * 2
     assert SECRET not in json.dumps(limited)
     clock.advance(seconds=61)
@@ -621,7 +621,7 @@ def test_a_clock_that_runs_behind_is_kept(
 
 
 def test_normalize_handle() -> None:
-    assert normalize_handle(" Justin@Example.COM ") == OWNER_EMAIL
+    assert normalize_handle(" Alice@Example.COM ") == OWNER_EMAIL
     assert normalize_handle(OWNER_PHONE) == OWNER_PHONE
 
 

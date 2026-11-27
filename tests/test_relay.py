@@ -590,10 +590,10 @@ async def test_answers_that_mention_progress_are_still_answers(rig: Callable[...
 
 TEAM = Principals(principals={
     OWNER: Principal(role="owner", identities=("slack:U1",)),
-    "brian": Principal(role="approver", identities=("slack:U2",)),
-    "miu": Principal(identities=("slack:U3",)),
+    "bob": Principal(role="approver", identities=("slack:U2",)),
+    "carol": Principal(identities=("slack:U3",)),
 })  # fmt: skip
-SLACK_IDS = {OWNER: "slack:U1", "brian": "slack:U2", "miu": "slack:U3"}
+SLACK_IDS = {OWNER: "slack:U1", "bob": "slack:U2", "carol": "slack:U3"}
 
 
 def team_rig(db: sqlite3.Connection, pick: tuple[str, float] | None = None) -> Rig:
@@ -619,21 +619,21 @@ async def team_route(r: Rig, text: str, who: str, thread: str | None) -> str | N
 
 async def test_a_member_in_the_runs_thread_is_refused(db: sqlite3.Connection) -> None:
     r = team_rig(db, pick=("R1", 0.9))
-    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.run("R1", requested_by="bob", thread="T-1")
     r.workers.ask("R1", "Which DB?")
-    refusal = "Only Brian or Justin can answer R1."
-    assert await team_route(r, "postgres", "miu", "T-1") == refusal
-    assert await team_route(r, "R1 postgres", "miu", "T-1") == refusal
-    assert await team_route(r, "tell R1 to hurry", "miu", None) is None  # not its thread
+    refusal = "Only Bob or Alice can answer R1."
+    assert await team_route(r, "postgres", "carol", "T-1") == refusal
+    assert await team_route(r, "R1 postgres", "carol", "T-1") == refusal
+    assert await team_route(r, "tell R1 to hurry", "carol", None) is None  # not its thread
     assert r.workers.answers == [] and r.workers.messages == []
 
 
-@pytest.mark.parametrize("who", ["brian", OWNER])
+@pytest.mark.parametrize("who", ["bob", OWNER])
 async def test_the_requester_and_an_approver_answer_in_the_thread(
     db: sqlite3.Connection, who: str
 ) -> None:
     r = team_rig(db, pick=("R1", 0.9))
-    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.run("R1", requested_by="bob", thread="T-1")
     r.workers.ask("R1", "Which DB?")
     assert await team_route(r, "postgres", who, "T-1") == "→ R1"
     assert r.workers.answers == [("R1", "postgres", 1)]
@@ -658,15 +658,15 @@ async def test_an_approver_answers_anothers_run_only_by_code_outside_its_thread(
     r = team_rig(db, pick=("R1", 0.9))
     r.workers.run("R1", thread="T-1")  # the owner's run
     r.workers.ask("R1", "Which DB?")
-    assert await team_route(r, "postgres", "brian", "T-9") is None  # not taken for R1
-    assert await team_route(r, "R1 postgres", "brian", "T-9") == "→ R1"
+    assert await team_route(r, "postgres", "bob", "T-9") is None  # not taken for R1
+    assert await team_route(r, "R1 postgres", "bob", "T-9") == "→ R1"
 
 
 async def test_a_bystanders_small_talk_in_the_thread_routes_normally(
     db: sqlite3.Connection,
 ) -> None:
     r = team_rig(db)  # the brain is down: no sure pick
-    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.run("R1", requested_by="bob", thread="T-1")
     r.workers.ask("R1", "Which DB?")
-    assert await team_route(r, "ok thanks", "miu", "T-1") is None
+    assert await team_route(r, "ok thanks", "carol", "T-1") is None
     assert r.workers.answers == []

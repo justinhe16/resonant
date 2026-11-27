@@ -48,7 +48,7 @@ def _record(name: str = "example", **changes: object) -> ExtensionRecord:
         manifest_sha="77" * 32,
         manifest={"version": 1, "name": name, "tools": []},
         installed_at=NOW,
-        installed_by="justin",
+        installed_by="alice",
         argv0_paths={"get_time": "/x/extensions/example/cli.py"},
     )
     return replace(rec, **changes)

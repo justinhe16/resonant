@@ -96,7 +96,7 @@ class Env:
             db,
             model=None,
             channel=self.channel,
-            owner="justin",
+            owner="alice",
             daemon_healthy=lambda: True,
             clock=self.clock,
             ext_checks=self.checks,
@@ -154,7 +154,7 @@ async def test_fail_streak_degrades(env: Env) -> None:
 
 async def test_paused_runs_no_health_command(env: Env) -> None:
     await env.tick()
-    killswitch.engage(env.db, actor="justin")
+    killswitch.engage(env.db, actor="alice")
     for _ in range(10):
         await env.tick()
     assert len(env.health.calls) == 1

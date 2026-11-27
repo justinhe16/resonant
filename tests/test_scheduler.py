@@ -63,10 +63,10 @@ from resonant.store import tasks as repo
 from resonant.store.db import iso, kv_set, open_db, transaction
 from resonant_sdk import Effect, ToolSpec
 
-OWNER = "justin"
+OWNER = "alice"
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
   maria:
@@ -357,7 +357,7 @@ async def test_e5_l3_job_runs_and_reports_to_approvers(tmp_path: Path) -> None:
         assert task["priority"] == 3 and task["principal"] == OWNER
         assert len(fake.calls) == 1
         assert h.channel.sent == [
-            (OWNER, "example/cleanup: done: removed 3 files", f"jobreport:{task['id']}:justin"),
+            (OWNER, "example/cleanup: done: removed 3 files", f"jobreport:{task['id']}:alice"),
             ("maria", "example/cleanup: done: removed 3 files", f"jobreport:{task['id']}:maria"),
         ]
         st = h.state("cleanup")
@@ -375,7 +375,7 @@ async def test_e5_definite_failure_reported_once_per_local_day(tmp_path: Path) -
         assert len(fake.calls) == 2
         day = "2026-10-13"
         assert h.channel.sent == [
-            (OWNER, "example/cleanup failed: exit 1", f"jobfail:example/cleanup:{day}:justin")
+            (OWNER, "example/cleanup failed: exit 1", f"jobfail:example/cleanup:{day}:alice")
         ]
         assert h.state("cleanup").fail_streak == 2
         assert len(h.audits("job.failed")) == 2

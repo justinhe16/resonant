@@ -41,7 +41,7 @@ TZ = "America/Los_Angeles"
 T0 = datetime(2026, 10, 19, 10, 30, tzinfo=UTC)
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
 """
@@ -349,7 +349,7 @@ async def test_no_backup_in_36h_alerts_the_owner_once_then_resolves(
         conn,
         model=None,
         channel=channel,
-        owner="justin",
+        owner="alice",
         daemon_healthy=lambda: True,
         clock=lambda: now[0],
         disk_free=lambda _p: 100 * 1024**3,

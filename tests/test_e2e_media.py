@@ -194,7 +194,7 @@ async def test_an_ask_watch_texts_once_when_claude_says_yes(
         now = utcnow()
         watch_store.create(
             b.conn,
-            principal="justin",
+            principal="alice",
             what="Pro in stock",
             check_kind="ask",
             op="yes",

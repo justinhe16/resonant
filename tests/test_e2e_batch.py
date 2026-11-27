@@ -43,7 +43,7 @@ MEMBER_PHONE = "+15557654321"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
   cofounder:
@@ -55,7 +55,7 @@ LINEAR = """\
 name: linear
 version: 1
 description: Linear issues (a test fixture).
-approvers: [justin, cofounder]
+approvers: [alice, cofounder]
 tools:
   get_issue:
     description: One Linear issue by its key.
@@ -239,7 +239,7 @@ async def start(
         ask_root=home / "ask",
         channel=daemon.imessage.channel,
         secrets=SecretStore(keychain),
-        owner="justin",
+        owner="alice",
         create_task=daemon.loop.create_task,
         claude_cmd=[sys.executable, "-I", str(FAKE), "--script", str(plan), "--notes", str(notes)],
         home=tmp_path / "claude-home",
@@ -298,7 +298,7 @@ async def test_four_linear_saves_in_one_claude_turn_ask_once_and_yes_runs_each_o
         assert {r["status"] for r in w.rows("SELECT status FROM approvals")} == {"approved"}
         assert all(r["used_at"] for r in w.rows("SELECT used_at FROM approvals"))
         (batch,) = w.rows("SELECT * FROM approval_batches")
-        assert batch["used_at"] is not None and batch["principal"] == "justin"
+        assert batch["used_at"] is not None and batch["principal"] == "alice"
         resolved = [
             json.loads(r["detail"])
             for r in w.rows("SELECT detail FROM audit_log WHERE action = 'approval.resolve'")
@@ -436,7 +436,7 @@ async def test_the_kill_switch_blocks_an_approved_batch(
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
         await _claude_batch(w, saves(*KEYS), "close these four")
-        killswitch.engage(w.conn, actor="justin")
+        killswitch.engage(w.conn, actor="alice")
         (done,) = await w.say("yes")
         assert done == "Not done: Resonant is paused (/kill), so none of the 4 changes ran."
         assert w.runs("save_issue") == []

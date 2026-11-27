@@ -93,13 +93,13 @@ async def test_only_declared_secrets_reach_a_context_handler(
     plain = Recorder({"ok": True})
     kc = keychain(**{"gh/token": SECRET, "gh/other": "other-secret-1"})
     ex, gate = build(db, {("gh", "peek"): h, ("gh", "plain"): plain}, kc)
-    i = Intent.for_tool(READ, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(READ, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert dict(h.seen[0].secrets) == {"RESONANT_SECRET_TOKEN": SECRET}
     assert h.seen[0].task_id == task_id and h.seen[0].idempotency_key == res.idempotency_key
     assert res.ok and res.data == {"echo": "[redacted]", "nested": [{"[redacted]": "k"}]}
     assert res.events == ({"type": "x", "text": "event [redacted]", "dedupe_key": "k"},)
-    j = Intent.for_tool(PLAIN, task_id=task_id, principal="justin", args={})
+    j = Intent.for_tool(PLAIN, task_id=task_id, principal="alice", args={})
     assert (await ex.execute(j, gate.allow(j), step_no=2)).ok
     assert dict(plain.seen[0].secrets) == {}
     assert SECRET not in dump_db(db)
@@ -112,7 +112,7 @@ async def test_missing_secret_is_definite_with_no_started_row(
 ) -> None:
     h = Recorder({"ok": True})
     ex, gate = build(db, {("gh", "push"): h}, keychain())
-    i = Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert not res.ok and not res.ambiguous and not h.seen
     assert res.notice == (
@@ -131,7 +131,7 @@ async def test_locked_keychain_is_definite_too(db: sqlite3.Connection, task_id: 
     kc = keychain(**{"gh/token": SECRET})
     kc.fail_with = 36
     ex, gate = build(db, {("gh", "push"): Recorder({})}, kc)
-    i = Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert not res.ok and not res.ambiguous
     assert res.notice is not None and res.notice.startswith("Not done: secret gh/token unavailable")
@@ -140,7 +140,7 @@ async def test_locked_keychain_is_definite_too(db: sqlite3.Connection, task_id: 
 async def test_no_secret_store_fails_closed(db: sqlite3.Connection, task_id: str) -> None:
     gate = FakeGate()
     ex = Executor(db, gate, {("gh", "push"): Recorder({})})
-    i = Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert not res.ok and res.notice is not None
 
@@ -148,7 +148,7 @@ async def test_no_secret_store_fails_closed(db: sqlite3.Connection, task_id: str
 async def test_replay_does_not_read_the_keychain(db: sqlite3.Connection, task_id: str) -> None:
     kc = keychain(**{"gh/token": SECRET})
     ex, gate = build(db, {("gh", "push"): Recorder({"ok": 1})}, kc)
-    i = Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={})
     assert (await ex.execute(i, gate.allow(i), step_no=1)).ok
     kc.items.clear()
     again = await ex.execute(i, gate.allow(i), step_no=1)
@@ -161,14 +161,14 @@ async def test_errors_and_stderr_tail_are_redacted(db: sqlite3.Connection, task_
     amb = Recorder(ExtAmbiguous(f"timeout {SECRET}", stderr_tail=SECRET))
     raw = Recorder(RuntimeError(json.dumps({"v": SECRET})))
     ex, gate = build(db, {("gh", "push"): fail, ("gh", "peek"): amb, ("gh", "p2"): raw})
-    i = Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert not res.ok and not res.ambiguous and res.error == "ToolFailed: exit 1 [redacted]"
-    r = Intent.for_tool(READ, task_id=task_id, principal="justin", args={})
+    r = Intent.for_tool(READ, task_id=task_id, principal="alice", args={})
     res2 = await ex.execute(r, gate.allow(r), step_no=2)
     assert not res2.ok and not res2.ambiguous  # a read: definite
     p2 = ToolSpec(name="p2", effect=Effect.WRITE, extension="gh", secrets=("token",))
-    w = Intent.for_tool(p2, task_id=task_id, principal="justin", args={})
+    w = Intent.for_tool(p2, task_id=task_id, principal="alice", args={})
     res3 = await ex.execute(w, gate.allow(w), step_no=3)
     assert res3.ambiguous and res3.error is not None and SECRET not in res3.error
     text = dump_db(db)
@@ -185,7 +185,7 @@ async def test_plain_handlers_still_work(db: sqlite3.Connection, task_id: str) -
         return {"labelled": args}
 
     ex, gate = build(db, {("gh", "plain"): label})
-    i = Intent.for_tool(PLAIN, task_id=task_id, principal="justin", args={"x": 1})
+    i = Intent.for_tool(PLAIN, task_id=task_id, principal="alice", args={"x": 1})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert res.ok and res.data == {"labelled": {"x": 1}} and res.events == ()
 
@@ -193,7 +193,7 @@ async def test_plain_handlers_still_work(db: sqlite3.Connection, task_id: str) -
 async def test_large_extension_results_are_capped(db: sqlite3.Connection, task_id: str) -> None:
     big = {"items": ["y" * 100] * 100, "s": SECRET}
     ex, gate = build(db, {("gh", "peek"): Recorder(big)}, result_max_bytes=2048)
-    i = Intent.for_tool(READ, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(READ, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert res.ok and res.data is not None and res.data["truncated"] is True
     assert res.data["bytes"] > 2048 and len(res.data["text"].encode()) <= 2048
@@ -203,13 +203,13 @@ async def test_large_extension_results_are_capped(db: sqlite3.Connection, task_i
     small = Recorder(big)
     builtin = ToolSpec(name="b", effect=Effect.READ)
     ex2, gate2 = build(db, {(None, "b"): small}, result_max_bytes=2048)
-    j = Intent.for_tool(builtin, task_id=task_id, principal="justin", args={})
+    j = Intent.for_tool(builtin, task_id=task_id, principal="alice", args={})
     out = await ex2.execute(j, gate2.allow(j), step_no=2)
     assert out.ok and out.data is not None and "truncated" not in out.data
 
 
 async def test_tool_failed_from_handler_is_definite(db: sqlite3.Connection, task_id: str) -> None:
     ex, gate = build(db, {("gh", "push"): Recorder(ToolFailed("nope"))})
-    i = Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={})
+    i = Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={})
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert not res.ok and not res.ambiguous and res.notice is None

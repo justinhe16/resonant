@@ -40,7 +40,7 @@ from resonant.store import pulse as items
 from resonant.store.db import atomic, kv_get, utcnow
 from resonant.tools import ToolRegistry
 
-OWNER = "justin"
+OWNER = "alice"
 LIVE = "x" * 64
 
 
@@ -158,7 +158,7 @@ class World:
 def settings() -> Settings:
     s = load_settings(dry_run=False)
     s.principals_path.write_text(
-        'principals:\n  justin:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
+        'principals:\n  alice:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
     )
     s.timezone = "UTC"
     s.pulse.quiet_hours = "03:00-03:01"

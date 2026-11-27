@@ -62,7 +62,7 @@ from resonant.tools.ops import (
     strip_home,
 )
 
-OWNER = "justin"
+OWNER = "alice"
 UID = 501
 T0 = datetime(2026, 10, 13, 15, 0, tzinfo=UTC)
 UV = "/opt/homebrew/bin/uv"
@@ -623,7 +623,7 @@ async def test_disk_lists_root_and_home(db: sqlite3.Connection, tmp_path: Path) 
 def test_scrub() -> None:
     raw = (
         "send to +15551234567 and (555) 123-4567 or 555.123.4567 failed; "
-        "mail justin@example.com via https://hc-ping.com/abc?x=1 and www.example.com/x"
+        "mail alice@example.com via https://hc-ping.com/abc?x=1 and www.example.com/x"
     )
     assert scrub(raw) == (
         "send to <handle> and <handle> or <handle> failed; mail <handle> via <url> and <url>"
@@ -635,7 +635,7 @@ def test_scrub() -> None:
 
 def test_log_line_is_short_and_scrubbed() -> None:
     rec = {
-        "event": "imessage send to justin failed: +15551234567",
+        "event": "imessage send to alice failed: +15551234567",
         "level": "warning",
         "logger": "resonant.gateway.imessage.channel",
         "timestamp": "2026-10-13T15:04:05.123456Z",
@@ -643,7 +643,7 @@ def test_log_line_is_short_and_scrubbed() -> None:
         "attempt": 2,
     }
     assert log_line(json.dumps(rec)) == (
-        "15:04:05 warning resonant.gateway.imessage.channel: imessage send to justin failed: "
+        "15:04:05 warning resonant.gateway.imessage.channel: imessage send to alice failed: "
         "<handle> url=<url> attempt=2"
     )
     assert len(log_line(json.dumps({"event": "x" * 1000}))) == 300

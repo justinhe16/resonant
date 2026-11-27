@@ -18,6 +18,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  names:
+    # No real people's names in tracked files (the repo is public). The denylist is salted
+    # hashes in scripts/names_denylist.json; the optional NAME_DENYLIST secret adds plain names.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python3 scripts/check_names.py
+        env:
+          NAME_DENYLIST: ${{ secrets.NAME_DENYLIST }}
+
   shell:
     runs-on: ubuntu-latest
     steps:

@@ -2009,7 +2009,7 @@ async def test_the_daemon_registers_the_runner_and_the_cleanup_job(
     from resonant.ops.fakes import FakeOpsRunner
 
     (resonant_home / "principals.yaml").write_text(
-        'principals:\n  justin:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
+        'principals:\n  alice:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
     )
     chat = FakeChatDB(tmp_path / "chat.db")
     settings = load_settings(

@@ -104,7 +104,7 @@ What goes away: the home-folder deny, the secret-file name rules (RP-9), the cro
   - `resonant ask "<question>" [--options a,b,c] [--urgent]`: blocks until you answer.
   - `resonant note "<progress>"`: adds to the run's pulse item.
   - `resonant check …` (D4).
-  - `resonant request <ext>.<tool> [--arg k=v …] [--reason "…"]` (PER-296): an extension tool the instance marks `worker_requestable`, called through the gate as the run's requester. The approval appears in the run's thread (buttons on Slack); an approver's yes runs it once and the worker gets the result (`Approved by Brian: …`, `Denied by Justin: …`), waiting like `check` (exit 3 parks the run, the result resumes it). Not requestable, or args that don't fit the tool's schema: exit 2; at most 3 open per run (the 4th: exit 5). A request that ran is a `did:` item. A restart closes an open one ("run `resonant request` again if you still need it").
+  - `resonant request <ext>.<tool> [--arg k=v …] [--reason "…"]` (PER-296): an extension tool the instance marks `worker_requestable`, called through the gate as the run's requester. The approval appears in the run's thread (buttons on Slack); an approver's yes runs it once and the worker gets the result (`Approved by Bob: …`, `Denied by Alice: …`), waiting like `check` (exit 3 parks the run, the result resumes it). Not requestable, or args that don't fit the tool's schema: exit 2; at most 3 open per run (the 4th: exit 5). A request that ran is a `did:` item. A restart closes an open one ("run `resonant request` again if you still need it").
 - **Asking:**
   - The run goes to `waiting(question)`, a new wait reason, and the session stays alive.
   - The brain texts `R4 asks: <question>`, with options if any.

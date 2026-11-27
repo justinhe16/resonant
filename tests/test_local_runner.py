@@ -32,7 +32,7 @@ from resonant.tools import ToolRegistry
 from resonant.tools.builtin import BUILTIN_SPECS
 from resonant_sdk import Event
 
-OWNER, MEMBER = "justin", "cofounder"
+OWNER, MEMBER = "alice", "cofounder"
 
 CANNED: dict[str, dict[str, Any]] = {
     "task_counts": {

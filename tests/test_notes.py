@@ -22,7 +22,7 @@ from resonant.tools import ToolRegistry, builtin, notes
 from resonant.tools.base import BuiltinContext
 from resonant_sdk import Effect, Level, ToolSpec
 
-OWNER = "justin"
+OWNER = "alice"
 
 
 class FakeGate:

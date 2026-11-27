@@ -152,7 +152,7 @@ class Harness:
         return task
 
     async def ask(self, question: str = "where is mycelium?", **kw: Any) -> tuple[Any, str]:
-        queued = self.runner.enqueue(question, principal=kw.pop("principal", "justin"), **kw)
+        queued = self.runner.enqueue(question, principal=kw.pop("principal", "alice"), **kw)
         assert isinstance(queued, Queued), queued
         out = await self.runner.step(self.task(queued.task_id), [], Ctx())
         return out, queued.task_id
@@ -193,7 +193,7 @@ def make(
         ask_root=work,
         channel=ch,
         secrets=SecretStore(keychain),
-        owner="justin",
+        owner="alice",
         timezone="America/Los_Angeles",
         claude_cmd=cmd,
         home=tmp_path / "home",
@@ -506,7 +506,7 @@ async def test_answered(db: sqlite3.Connection, tmp_path: Path) -> None:
     assert isinstance(out, Done)
     assert out.result["status"] == "answered" and out.result["untrusted"] is True
     assert out.result["proposed"] is True
-    assert h.channel.sent == [("justin", "Mycelium: ~/code/mycelium.\nProposed: none",
+    assert h.channel.sent == [("alice", "Mycelium: ~/code/mycelium.\nProposed: none",
                                f"ask:{task_id}")]  # fmt: skip
     seen = h.argv_notes()
     assert seen["creds"] == ["CLAUDE_CODE_OAUTH_TOKEN"]
@@ -585,26 +585,26 @@ async def test_timeout_kills_the_group_and_escapees(db: sqlite3.Connection, tmp_
 
 async def test_kill_switch_stops_a_running_ask(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path, scenario="hang")
-    queued = h.runner.enqueue("q", principal="justin")
+    queued = h.runner.enqueue("q", principal="alice")
     assert isinstance(queued, Queued)
     step = asyncio.create_task(h.runner.step(h.task(queued.task_id), [], Ctx()))
     for _ in range(100):
         if (h.notes / "pid.json").exists():
             break
         await asyncio.sleep(0.05)
-    killswitch.engage(db, actor="justin")
+    killswitch.engage(db, actor="alice")
     out = await asyncio.wait_for(step, 15)
     assert isinstance(out, Done) and out.result["status"] == "killed"
     assert h.channel.texts == [STOPPED]
     assert gone(h.pids()["leader"])
     # and nothing new starts while paused
-    refused = h.runner.enqueue("q", principal="justin")
+    refused = h.runner.enqueue("q", principal="alice")
     assert refused == AskRefused(PAUSED, "paused")
 
 
 async def test_cancel_kills_the_session(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path, scenario="hang")
-    queued = h.runner.enqueue("q", principal="justin")
+    queued = h.runner.enqueue("q", principal="alice")
     assert isinstance(queued, Queued)
     step = asyncio.create_task(h.runner.step(h.task(queued.task_id), [], Ctx()))
     for _ in range(100):
@@ -619,9 +619,9 @@ async def test_cancel_kills_the_session(db: sqlite3.Connection, tmp_path: Path) 
 
 async def test_paused_before_start(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path)
-    queued = h.runner.enqueue("q", principal="justin")
+    queued = h.runner.enqueue("q", principal="alice")
     assert isinstance(queued, Queued)
-    killswitch.engage(db, actor="justin")
+    killswitch.engage(db, actor="alice")
     out = await h.runner.step(h.task(queued.task_id), [], Ctx())
     assert isinstance(out, Done) and out.result["status"] == "paused"
     assert h.channel.texts == [PAUSED] and not (h.notes / "argv.json").exists()
@@ -631,8 +631,8 @@ async def test_usage_limit_backs_off_and_tells_the_owner_once(
     db: sqlite3.Connection, tmp_path: Path
 ) -> None:
     h = make(db, tmp_path, scenario="usage_limit")
-    first = h.runner.enqueue("q1", principal="justin")
-    second = h.runner.enqueue("q2", principal="justin")
+    first = h.runner.enqueue("q1", principal="alice")
+    second = h.runner.enqueue("q2", principal="alice")
     member = h.runner.enqueue("q3", principal="cofounder")
     assert isinstance(first, Queued) and isinstance(second, Queued)
     assert isinstance(member, Queued)
@@ -647,12 +647,12 @@ async def test_usage_limit_backs_off_and_tells_the_owner_once(
     out3 = await h.runner.step(h.task(member.task_id), [], Ctx())
     assert isinstance(out2, Done) and isinstance(out3, Done)
     assert not (h.notes / "argv.json").exists()
-    owner_texts = [t for p, t, _ in h.channel.sent if p == "justin"]
+    owner_texts = [t for p, t, _ in h.channel.sent if p == "alice"]
     assert len(owner_texts) == 1
     assert owner_texts[0].startswith("I'm at my Claude limit until ")
     assert owner_texts[0].endswith("I can still do approvals and /status.")
     assert [t for p, t, _ in h.channel.sent if p == "cofounder"] == [ask_mod.LIMIT_OTHER]
-    refused = h.runner.enqueue("q4", principal="justin")
+    refused = h.runner.enqueue("q4", principal="alice")
     assert isinstance(refused, AskRefused) and "usage limit until" in refused.text
     assert refused.reason == "limit" and refused.until == until  # the brain answers from these
 
@@ -691,7 +691,7 @@ async def test_concurrency_waits_without_a_worker_slot(
 ) -> None:
     h = make(db, tmp_path)
     assert h.runner.uses_claude_slot is False
-    queued = h.runner.enqueue("q", principal="justin")
+    queued = h.runner.enqueue("q", principal="alice")
     assert isinstance(queued, Queued)
     h.runner._working.add("someone-else")  # pyright: ignore[reportPrivateUsage]
     out = await h.runner.step(h.task(queued.task_id), [], Ctx())
@@ -701,15 +701,15 @@ async def test_concurrency_waits_without_a_worker_slot(
 
 async def test_daily_cap(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path, cfg={"daily_cap": 2})
-    assert isinstance(h.runner.enqueue("a", principal="justin"), Queued)
-    assert isinstance(h.runner.enqueue("b", principal="justin"), Queued)
-    third = h.runner.enqueue("c", principal="justin")
+    assert isinstance(h.runner.enqueue("a", principal="alice"), Queued)
+    assert isinstance(h.runner.enqueue("b", principal="alice"), Queued)
+    third = h.runner.enqueue("c", principal="alice")
     assert third == AskRefused("I've asked Claude 2 times today, the daily cap.", "cap")
     assert h.runner.enqueue("d", principal="cofounder") == third
     assert h.runner.asked_today() == 2
     await h.runner.idle()  # BR-11: the owner hears it once that day, through the channel
     assert h.channel.sent == [
-        ("justin", "Hit today's Claude cap (2); approvals and /status still work until midnight.",
+        ("alice", "Hit today's Claude cap (2); approvals and /status still work until midnight.",
          f"ask:cap:{utcnow().astimezone(ZoneInfo('America/Los_Angeles')).date().isoformat()}")
     ]  # fmt: skip
 
@@ -717,7 +717,7 @@ async def test_daily_cap(db: sqlite3.Connection, tmp_path: Path) -> None:
 async def test_no_daily_cap_by_default(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path)
     for i in range(40):
-        assert isinstance(h.runner.enqueue(f"q{i}", principal="justin"), Queued)
+        assert isinstance(h.runner.enqueue(f"q{i}", principal="alice"), Queued)
 
 
 async def test_the_runaway_guard_pauses_for_the_hour(
@@ -728,39 +728,39 @@ async def test_the_runaway_guard_pauses_for_the_hour(
 
     h = make(db, tmp_path, session=ClaudeSessionConfig(max_per_hour=3))
     for i in range(3):
-        assert isinstance(h.runner.enqueue(f"q{i}", principal="justin"), Queued)
+        assert isinstance(h.runner.enqueue(f"q{i}", principal="alice"), Queued)
     for _ in range(2):
-        refused = h.runner.enqueue("again", principal="justin")
+        refused = h.runner.enqueue("again", principal="alice")
         assert refused == AskRefused(
             "Claude is paused for runaway protection (3 messages this hour).", "runaway"
         )
     await h.runner.idle()
     (notice,) = h.channel.sent
-    assert notice[0] == "justin" and notice[2] is not None and notice[2].startswith("ask:runaway:")
+    assert notice[0] == "alice" and notice[2] is not None and notice[2].startswith("ask:runaway:")
     assert notice[1].startswith("Claude brain paused for runaway protection (3 msgs/hr); ")
     assert "approvals and /status still work until " in notice[1]
     # next hour: asks again (the guard counts this clock hour only)
     db.execute("UPDATE tasks SET created_at = '2020-01-01T00:00:00Z'")
     db.commit()
-    assert isinstance(h.runner.enqueue("later", principal="justin"), Queued)
+    assert isinstance(h.runner.enqueue("later", principal="alice"), Queued)
 
 
 def test_enqueue_refusals(db: sqlite3.Connection, tmp_path: Path) -> None:
     h = make(db, tmp_path)
-    assert isinstance(h.runner.enqueue("  ", principal="justin"), AskRefused)
-    assert isinstance(h.runner.enqueue("x" * 4001, principal="justin"), AskRefused)
-    bad_kind = h.runner.enqueue("q", kind=cast(Any, "shell"), principal="justin")
+    assert isinstance(h.runner.enqueue("  ", principal="alice"), AskRefused)
+    assert isinstance(h.runner.enqueue("x" * 4001, principal="alice"), AskRefused)
+    bad_kind = h.runner.enqueue("q", kind=cast(Any, "shell"), principal="alice")
     assert isinstance(bad_kind, AskRefused)
-    outside = h.runner.enqueue("q", attachments=[str(tmp_path)], principal="justin")
+    outside = h.runner.enqueue("q", attachments=[str(tmp_path)], principal="alice")
     assert isinstance(outside, AskRefused) and outside.text.startswith("Can't attach that")
     off = make(db, tmp_path / "off", cfg={"enabled": False})
-    assert isinstance(off.runner.enqueue("q", principal="justin"), AskRefused)
+    assert isinstance(off.runner.enqueue("q", principal="alice"), AskRefused)
 
 
 async def test_a_retry_only_resends(db: sqlite3.Connection, tmp_path: Path) -> None:
     ch = FakeChannel(fail_with=[ChannelSendError("down")])
     h = make(db, tmp_path, channel=ch)
-    queued = h.runner.enqueue("q", principal="justin")
+    queued = h.runner.enqueue("q", principal="alice")
     assert isinstance(queued, Queued)
     ctx = Ctx()
     out = await h.runner.step(h.task(queued.task_id), [], ctx)
@@ -779,7 +779,7 @@ async def test_a_session_left_by_a_crash_is_reaped(db: sqlite3.Connection, tmp_p
         sys.executable, "-c", "import time; time.sleep(600)", start_new_session=True
     )
     created = psutil.Process(left.pid).create_time()
-    queued = h.runner.enqueue("q", principal="justin")
+    queued = h.runner.enqueue("q", principal="alice")
     assert isinstance(queued, Queued)
     task = h.task(queued.task_id)
     cp = {**task.checkpoint, "pid": left.pid, "created": created}
@@ -810,7 +810,7 @@ def test_tool_constants_agree_with_the_runner() -> None:
 def _tool_ctx(db: sqlite3.Connection, runner: AskRunner | None) -> BuiltinContext:
     components = SimpleNamespace(runners={} if runner is None else {"ask": runner})
     state = cast(Any, SimpleNamespace(components=components))
-    principals = Principals(principals={"justin": Principal(role="owner")})
+    principals = Principals(principals={"alice": Principal(role="owner")})
     return BuiltinContext(conn=db, state=state, registry=ToolRegistry(), principals=principals)
 
 
@@ -836,7 +836,7 @@ async def test_tool_queues_for_the_calling_task(db: sqlite3.Connection, tmp_path
     assert task.channel_ref == {"chat": "x"} and task.trace_id == "t-1"
     assert task.checkpoint["requested_by"] == caller and task.checkpoint["kind"] == "research"
     plain = await tool({"question": "q"})  # no task: the owner gets it
-    assert h.task(plain["task_id"]).principal == "justin"
+    assert h.task(plain["task_id"]).principal == "alice"
 
 
 async def test_tool_refusals(db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -864,11 +864,11 @@ def test_tainted_task_may_still_ask(db: sqlite3.Connection) -> None:
     """L0 read: a tainted task's ask_claude runs without asking (the gate asks for L2/L3)."""
     registry = ToolRegistry()
     registry.register(ask_tool.ASK_CLAUDE)
-    principals = Principals(principals={"justin": Principal(role="owner")})
+    principals = Principals(principals={"alice": Principal(role="owner")})
     kv_set(db, "autonomy", "on")
     gate = PolicyGate(db, principals, registry, dry_run=True, approval_ttl_s=60)
     task_id = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
-    intent = Intent.for_tool(ask_tool.ASK_CLAUDE, task_id=task_id, principal="justin",
+    intent = Intent.for_tool(ask_tool.ASK_CLAUDE, task_id=task_id, principal="alice",
                              args={"question": "q"}, origin="tainted")  # fmt: skip
     assert isinstance(gate.evaluate(intent), Allow)
 
@@ -997,12 +997,12 @@ def test_a_watch_follow_up_is_marked_with_its_key(db: sqlite3.Connection, tmp_pa
     """PER-346: a fired watch's follow-up ask carries the notice key, so a retry finds it;
     an ordinary ask carries none."""
     h = make(db, tmp_path)
-    off = h.runner.enqueue("Watch W1 (x) fired.", principal="justin", tools=True,
+    off = h.runner.enqueue("Watch W1 (x) fired.", principal="alice", tools=True,
                            follow_up="watch/1/1")  # fmt: skip
     assert isinstance(off, AskRefused) and "tools are off" in off.text  # no tools: no follow-up
     h.runner.tools = cast(Any, object())
-    plain = h.runner.enqueue("hello?", principal="justin")
-    marked = h.runner.enqueue("Watch W1 (x) fired.", principal="justin", tools=True,
+    plain = h.runner.enqueue("hello?", principal="alice")
+    marked = h.runner.enqueue("Watch W1 (x) fired.", principal="alice", tools=True,
                               follow_up="watch/1/1")  # fmt: skip
     assert isinstance(plain, Queued) and isinstance(marked, Queued)
     assert FOLLOW_UP_KEY not in h.task(plain.task_id).checkpoint

@@ -46,7 +46,7 @@ from resonant.tools.ops import GIT, MIGRATIONS_DIR, SELF_UPDATE_OFF, Ops
 # fixtures of test_router's, used by the /kill test below
 __all__ = ["fast_router", "handlers", "principals", "registry", "tool_calls"]
 
-OWNER = "justin"
+OWNER = "alice"
 UID = 501
 T0 = datetime(2026, 11, 20, 15, 0, tzinfo=UTC)
 UV = "/opt/homebrew/bin/uv"
@@ -62,7 +62,7 @@ KICK_CORI = (LAUNCHCTL, "kickstart", "-k", f"gui/{UID}/{CORI_LABEL}")
 HELPER = (sys.executable, "-m", "resonant.ops.restart_later", "com.resonant.daemon", "3")
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
 """

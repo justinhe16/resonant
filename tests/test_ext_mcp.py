@@ -977,7 +977,7 @@ async def test_missing_secret_is_definite(runtime: McpServerRuntime) -> None:
 def settings() -> Settings:
     s = load_settings(dry_run=False)
     s.principals_path.write_text(
-        'principals:\n  justin:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
+        'principals:\n  alice:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
     )
     return s
 
@@ -1219,10 +1219,10 @@ async def test_gate_executor_and_audit(
         sleep = c.registry.get("mail", "sleep")
         assert echo is not None and sleep is not None
         asks = c.gate.evaluate(
-            Intent.for_tool(sleep, task_id=task, principal="justin", args={"seconds": 1})
+            Intent.for_tool(sleep, task_id=task, principal="alice", args={"seconds": 1})
         )
         assert isinstance(asks, NeedsApproval)  # L2 inferred asks first
-        i = Intent.for_tool(echo, task_id=task, principal="justin", args={"text": TOKEN})
+        i = Intent.for_tool(echo, task_id=task, principal="alice", args={"text": TOKEN})
         decision = c.gate.evaluate(i)
         assert isinstance(decision, Allow)
         assert isinstance(c.executor, Executor)
@@ -1232,7 +1232,7 @@ async def test_gate_executor_and_audit(
         assert "executor.start" in actions
         fail = c.registry.get("mail", "fail")
         assert fail is not None and fail.effect is Effect.WRITE
-        j = Intent.for_tool(fail, task_id=task, principal="justin", args={}, origin="explicit")
+        j = Intent.for_tool(fail, task_id=task, principal="alice", args={}, origin="explicit")
         failed = await c.executor.execute(j, c.gate.evaluate(j), step_no=2)  # type: ignore[arg-type]
         assert not failed.ok and failed.ambiguous  # a write's isError may have taken effect
     finally:

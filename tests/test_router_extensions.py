@@ -36,7 +36,7 @@ from resonant.tools.tasks import TASK_COUNTS
 from resonant_sdk import Event, Manifest, ToolSpec
 from resonant_sdk.manifest import parse_yaml
 
-OWNER, MEMBER, HELPER = "justin", "cofounder", "helper"
+OWNER, MEMBER, HELPER = "alice", "cofounder", "helper"
 
 DEMO = """\
 name: demo

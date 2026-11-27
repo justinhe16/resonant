@@ -10,11 +10,11 @@ principals:
     grants:
       example: [request, approve]       # per-extension: request and/or approve
   # PER-293 (Cori): an approver requests and approves everything, never admin.
-  # brian:
+  # bob:
   #   role: approver
   #   identities: ["slack:U22222222"]
   # A per-tool grant: these tools only (members may file tickets but not deploy).
-  # miu:
+  # carol:
   #   identities: ["slack:U33333333"]
   #   grants:
   #     dori: {request: [file_ticket, find_tickets, staging_status]}

@@ -109,7 +109,7 @@ class Env:
         assert "example" in self.host.loaded, self.host.refused
         secrets = SecretStore(FakeKeychain(items={"example/token": TOKEN, "example/other": "o"}))
         self.channel = Channel()
-        self.recovery = Recovery(self.host, self.channel, "justin", settings, secrets)
+        self.recovery = Recovery(self.host, self.channel, "alice", settings, secrets)
         self.checks = ExtensionHealth(self.host, secrets, timeout_s=20, recovery=self.recovery)
         self.now = T0
 

@@ -725,7 +725,7 @@ def _resonant_merged(db: sqlite3.Connection, repo: str, number: int) -> str:
             db,
             ap.NewApproval(
                 task_id=tid, intent_hash="h1", tool="merge_pr", effect=Effect.WRITE,
-                level=Level.L2, summary=f"merge PR #{number} in {repo}", approvers=("justin",),
+                level=Level.L2, summary=f"merge PR #{number} in {repo}", approvers=("alice",),
                 code=code, expires_at=now + timedelta(minutes=30), extension="github",
             ),
             now,
@@ -774,7 +774,7 @@ async def test_a_pr_the_run_merged_on_an_approved_check_ends_done(h: Harness) ->
             h.conn,
             ap.NewApproval(
                 task_id=run.task_id, intent_hash="c1", tool=ap.CHECK_TOOL, effect=Effect.WRITE,
-                level=Level.L2, summary="R1 wants to merge on github", approvers=("justin",),
+                level=Level.L2, summary="R1 wants to merge on github", approvers=("alice",),
                 code=new_code(ap.pending_codes(h.conn)), expires_at=now + timedelta(minutes=30),
                 requested_by="R1", action_key="github merge own/proj#41",
                 action_target="own/proj#41",
@@ -811,7 +811,7 @@ async def test_a_merged_pr_obsoletes_the_open_asks_for_it(h: Harness) -> None:
             h.conn,
             ap.NewApproval(
                 task_id=tid, intent_hash="m1", tool="merge_pr", effect=Effect.WRITE,
-                level=Level.L2, summary="merge PR #41 in own/proj", approvers=("justin",),
+                level=Level.L2, summary="merge PR #41 in own/proj", approvers=("alice",),
                 code=new_code(ap.pending_codes(h.conn)), expires_at=now + timedelta(minutes=30),
                 extension="github", action_key="github merge own/proj#41",
                 action_target="own/proj#41",

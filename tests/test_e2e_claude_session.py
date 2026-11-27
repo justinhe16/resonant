@@ -50,7 +50,7 @@ MEMBER_PHONE = "+15557654321"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
   cofounder:
@@ -61,8 +61,8 @@ principals:
 # PER-294: the same team on a fake Slack adapter only (iMessage off)
 SLACK_PRINCIPALS = """\
 principals:
-  justin: {role: owner, identities: ["slack:U1"]}
-  brian: {role: approver, identities: ["slack:U2"]}
+  alice: {role: owner, identities: ["slack:U1"]}
+  bob: {role: approver, identities: ["slack:U2"]}
 """
 FAKE = Path(fake_claude.__file__)
 TOKEN = "sk-ant-oat01-FAKETOKENVALUE0123456789"
@@ -227,7 +227,7 @@ async def start(
         ask_root=home / "ask",
         channel=daemon.imessage.channel,
         secrets=SecretStore(keychain),
-        owner="justin",
+        owner="alice",
         timezone=settings.timezone,
         create_task=daemon.loop.create_task,
         claude_cmd=[sys.executable, "-I", str(FAKE), "--script", str(plan), "--notes", str(notes)],
@@ -551,7 +551,7 @@ async def test_the_shared_server_serves_only_the_turn_bound_now(
 def _task(w: World) -> Task:
     task_id = task_store.insert_task(
         w.conn,
-        NewTask(kind="ask", runner="ask", priority=1, principal="justin",
+        NewTask(kind="ask", runner="ask", priority=1, principal="alice",
                 checkpoint={"question": "q", "kind": "general", "session": True}),
     )  # fmt: skip
     task = task_store.get_task(w.conn, task_id)
@@ -696,7 +696,7 @@ async def test_kill_stops_the_session(
         await wait_until(lambda: not _alive(pid), 2.5)  # at once: the stop never waits on itself
         await wait_until(lambda: "pid" not in session_state(w.conn), 10)
         assert session_state(w.conn)["session_id"]  # kept: it may resume after /resume
-        killswitch.release(w.conn, actor="justin")
+        killswitch.release(w.conn, actor="alice")
 
 
 async def test_kill_mid_turn_stops_it(
@@ -708,12 +708,12 @@ async def test_kill_mid_turn_stops_it(
         w.chat.add_message(handle=OWNER_PHONE, text="why is R4 slow?")
         await wait_until(lambda: (w.notes / "session.json").exists(), 10)
         pid = w.session()["pid"]
-        killswitch.engage(w.conn, actor="justin")
+        killswitch.engage(w.conn, actor="alice")
         (stopped,) = await w.more(1)
         assert stopped == "Stopped: Resonant was paused (/kill)."
         await wait_until(lambda: not _alive(pid), 10)
         assert len(w.audits("brain.session_start")) == 1  # no retry while paused
-        killswitch.release(w.conn, actor="justin")
+        killswitch.release(w.conn, actor="alice")
 
 
 async def test_the_daily_cap_notice_goes_out_once(
@@ -837,12 +837,12 @@ async def test_the_next_turn_gets_what_resonant_texted_since_the_last_one(
         # an approved merge failed after that turn: a code-built text the session didn't see
         system_texts.record(
             w.conn,
-            "justin",
+            "alice",
             "approval",
             "OK to merge PR #121 in justinhe16/resonant? [P3] yes / no",
             ref="p",
         )
-        system_texts.record(w.conn, "justin", "result", failure, ref="r")  # fmt: skip
+        system_texts.record(w.conn, "alice", "result", failure, ref="r")  # fmt: skip
         answer = await _hard(w, "What happened? Why the failure", answer="The token.")
         assert answer == "The token."
         prompt = w.session()["prompt"]
@@ -1005,7 +1005,7 @@ async def test_the_daemon_runs_the_ask_startup_before_the_loop(
 async def test_two_threads_asked_at_once_each_get_their_own_transcript(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    """Over Slack, the owner notes in two threads and Brian asks in one of them (fast-path
+    """Over Slack, the owner notes in two threads and Bob asks in one of them (fast-path
     replies, not turns); then a hard text
     in each thread, at once. The one serial session gets two turns, each headed by its thread
     and carrying only that thread's delta; each answer goes back to its thread."""
@@ -1032,12 +1032,12 @@ async def test_two_threads_asked_at_once_each_get_their_own_transcript(
         (a,) = [m for m in turns if m.endswith("status A?")]
         (b,) = [m for m in turns if m.endswith("status B?")]
         # (the session's first turn is primed first, from that thread's records)
-        assert "Thread: slack-in:1 · from: Justin (owner)\nSince we last spoke" in a
-        assert "Thread: slack-in:2 · from: Justin (owner)\nSince we last spoke" in b
-        assert "Justin: /note alpha" in a and "Brian: /approvals" in a
+        assert "Thread: slack-in:1 · from: Alice (owner)\nSince we last spoke" in a
+        assert "Thread: slack-in:2 · from: Alice (owner)\nSince we last spoke" in b
+        assert "Alice: /note alpha" in a and "Bob: /approvals" in a
         assert "Resonant: Nothing is waiting for approval." in a
         assert "beta" not in a
-        assert "Justin: /note beta" in b
+        assert "Alice: /note beta" in b
         assert "alpha" not in b and "/approvals" not in b
         answers = [m for m in fake.sent if m.text.startswith("Answer to")]
         assert sorted((m.thread or "") for m in answers) == ["slack-in:1", "slack-in:2"]

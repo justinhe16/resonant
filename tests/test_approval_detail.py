@@ -194,7 +194,7 @@ def test_slack_splits_a_long_prompt_keeping_the_fence() -> None:
     prompt = ApprovalPrompt("a1", "K4", "run on PROD", "write", "L1", NOW)
     built = blocks.approval_blocks(prompt, text)
     assert [b["type"] for b in built] == ["section"] * len(parts) + ["actions"]
-    resolved = blocks.resolved_blocks(text, "Approved by Brian")
+    resolved = blocks.resolved_blocks(text, "Approved by Bob")
     assert [b["type"] for b in resolved] == ["section"] * len(parts) + ["context"]
 
 

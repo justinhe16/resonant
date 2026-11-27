@@ -287,7 +287,7 @@ def test_only_the_ask_runners_answers_are_claude_sends() -> None:
     assert outbound.is_claude_send("ask:cap:2026-10-22")
     assert not outbound.is_claude_send("ask:ack:t1")
     assert not outbound.is_claude_send("reply:t1")
-    assert not outbound.is_claude_send("approval:a7:prompt:justin")
+    assert not outbound.is_claude_send("approval:a7:prompt:alice")
     assert not outbound.is_claude_send(None)
 
 
@@ -344,16 +344,16 @@ def test_outbound_fails_closed_when_the_prompt_fell_out_of_the_window(
 ) -> None:
     t0 = datetime(2026, 10, 19, 15, 0, tzinfo=UTC)
     later = t0 + timedelta(hours=1)
-    outbound.note(db, OWNER, t0, "approval:a7:prompt:justin")
+    outbound.note(db, OWNER, t0, "approval:a7:prompt:alice")
     outbound.note(db, OWNER, t0 + timedelta(seconds=1), "ask:t1")
     for n in range(1, outbound.KEEP + 3):
         outbound.note(db, OWNER, t0 + timedelta(minutes=n), f"reply:{n}")
     kept = db.execute("SELECT value FROM kv WHERE key = ?", (outbound.KV_PREFIX + OWNER,))
     assert len(json.loads(kept.fetchone()[0])) == outbound.KEEP
     # both the prompt and Claude's answer were pushed out: the last Claude answer still counts
-    assert outbound.claude_since(db, OWNER, {"approval:a7:prompt:justin"}, later) is True
-    outbound.note(db, OWNER, later, "approval:a7:remind:justin")
-    assert outbound.claude_since(db, OWNER, {"approval:a7:remind:justin"}, later) is False
+    assert outbound.claude_since(db, OWNER, {"approval:a7:prompt:alice"}, later) is True
+    outbound.note(db, OWNER, later, "approval:a7:remind:alice")
+    assert outbound.claude_since(db, OWNER, {"approval:a7:remind:alice"}, later) is False
     assert outbound.claude_since(db, "nobody", set(), later) is False
 
 

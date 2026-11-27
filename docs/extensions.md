@@ -541,10 +541,10 @@ The example is a noisy demo (a 5-minute incident job, an hourly fake PnL that ap
 
 ```yaml
 principals:
-  justin:    {role: owner, identities: ["imessage:+15551234567", "imessage:me@icloud.com"]}
-  brian:     {role: approver, identities: ["slack:U01"]}
+  alice:     {role: owner, identities: ["imessage:+15551234567", "imessage:me@icloud.com"]}
+  bob:       {role: approver, identities: ["slack:U01"]}
   cofounder: {identities: ["slack:U02"], grants: {my-ext: [request, approve]}}
-  miu:       {identities: ["slack:U03"], grants: {my-ext: {request: [file_ticket], approve: []}}}
+  carol:     {identities: ["slack:U03"], grants: {my-ext: {request: [file_ticket], approve: []}}}
 default: {channel: slack, grants: {my-ext: {request: [file_ticket]}}}
 ```
 

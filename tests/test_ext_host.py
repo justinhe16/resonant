@@ -33,7 +33,7 @@ MANIFEST = """\
 name: example
 version: 1
 description: time and notes
-approvers: [maria, ghost, justin]
+approvers: [maria, ghost, alice]
 secrets: [token]
 tools:
   get_time:
@@ -55,7 +55,7 @@ jobs:
 """
 PRINCIPALS = """\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:+15551234567"]
   maria:
@@ -138,14 +138,14 @@ async def test_components_merge_handlers_and_api_shows_specs(
     assert ext["write_note"]["level"] == "L3" and ext["job_long_job"]["effect"] == "read"
     # The gate's approvers come from the manifest, filtered by grants.
     assert isinstance(c.gate, PolicyGate)
-    assert c.gate.approvers("example") == ("justin", "maria")
-    assert c.gate.approvers(None) == ("justin",)
+    assert c.gate.approvers("example") == ("alice", "maria")
+    assert c.gate.approvers(None) == ("alice",)
 
 
 def test_approvers_for_fails_closed(settings: Settings, db: sqlite3.Connection) -> None:
     install_fixture(settings, db, MANIFEST, {"cli.py": CLI})
     host = host_for(settings, db)
-    assert host.approvers_for("example") == ("maria", "ghost", "justin")
+    assert host.approvers_for("example") == ("maria", "ghost", "alice")
     assert host.approvers_for("nope") == ()
 
     class Broken(ExtensionHost):
@@ -211,20 +211,20 @@ async def test_alert_sent_once_and_kept_on_transient_error(
     (settings.extensions_dir / "example" / "cli.py").write_text("x")
     host_for(settings, db)
     assert await send_alerts(db, RecordingSender(), None) == 0  # no owner yet: kept
-    assert await send_alerts(db, RecordingSender(ChannelError("down")), "justin") == 0
+    assert await send_alerts(db, RecordingSender(ChannelError("down")), "alice") == 0
     assert "example" in kv_get(db, ALERTS_KEY)
     ok = RecordingSender()
-    assert await send_alerts(db, ok, "justin") == 1
-    assert ok.sent[0][:2] == ("justin", tampered_text("example"))
+    assert await send_alerts(db, ok, "alice") == 1
+    assert ok.sent[0][:2] == ("alice", tampered_text("example"))
     assert ok.sent[0][2] is not None and ok.sent[0][2].startswith("ext-tampered:example:")
-    assert await send_alerts(db, ok, "justin") == 0 and len(ok.sent) == 1
+    assert await send_alerts(db, ok, "alice") == 0 and len(ok.sent) == 1
 
 
 async def test_refused_alert_is_dropped(settings: Settings, db: sqlite3.Connection) -> None:
     install_fixture(settings, db, MANIFEST, {"cli.py": CLI})
     (settings.extensions_dir / "example" / "cli.py").write_text("x")
     host_for(settings, db)
-    assert await send_alerts(db, RecordingSender(ChannelRefused("no id")), "justin") == 0
+    assert await send_alerts(db, RecordingSender(ChannelRefused("no id")), "alice") == 0
     assert kv_get(db, ALERTS_KEY) == {}
 
 

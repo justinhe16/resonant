@@ -740,7 +740,7 @@ def test_a_remote_snapshot_with_panels_is_accepted(db: Pg, tmp_path: Path) -> No
             conn,
             ext_store.ExtensionRecord(
                 name="ledger", source="repo:ledger", commit="a" * 40, tree_digest="d",
-                manifest_sha="m", installed_at=now, installed_by="justin",
+                manifest_sha="m", installed_at=now, installed_by="alice",
                 manifest=panel_manifest("ledger", ("paper",)),
             ),
         )  # fmt: skip

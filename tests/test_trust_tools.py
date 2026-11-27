@@ -35,7 +35,7 @@ def handlers(db: sqlite3.Connection) -> dict[str, Any]:
         conn=db,
         state=None,  # pyright: ignore[reportArgumentType]
         registry=ToolRegistry(),
-        principals=Principals.model_validate({"principals": {"justin": {"role": "owner"}}}),
+        principals=Principals.model_validate({"principals": {"alice": {"role": "owner"}}}),
         clock=lambda: NOW,
     )
     return tools.handlers(ctx)
@@ -139,7 +139,7 @@ def gate(db: sqlite3.Connection) -> PolicyGate:
     reg = ToolRegistry()
     for spec in tools.SPECS:
         reg.register(spec)
-    principals = Principals.model_validate({"principals": {"justin": {"role": "owner"}}})
+    principals = Principals.model_validate({"principals": {"alice": {"role": "owner"}}})
     return PolicyGate(
         db, principals, reg, dry_run=False, approval_ttl_s=1800, actions=summary_actions(db)
     )
@@ -152,7 +152,7 @@ def _evaluate(
     repo.set_status(db, tid, "running")
     spec = next(s for s in tools.SPECS if s.name == tool)
     return gate.evaluate(
-        Intent.for_tool(spec, task_id=tid, principal="justin", args=args, origin=origin)
+        Intent.for_tool(spec, task_id=tid, principal="alice", args=args, origin=origin)
     )
 
 

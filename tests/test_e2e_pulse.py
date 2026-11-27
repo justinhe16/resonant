@@ -58,7 +58,7 @@ TZ = "America/Los_Angeles"
 LA = ZoneInfo(TZ)
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
 """
@@ -360,14 +360,14 @@ async def test_u6_paused_sends_nothing_and_resume_carries_changes_once(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     async with world(resonant_home, chat, at(10, 9, 0)) as w:
-        killswitch.engage(w.conn, actor="justin")
+        killswitch.engage(w.conn, actor="alice")
         await w.report("dori", "inc", "Dori failing", urgency="urgent")
         await w.report("trader", "pnl", "PnL -$2k", state={"b": -2})
         await w.tick(at(10, 10))
         await w.tick(at(10, 11))
         assert w.texts() == []
         assert w.item("dori", "inc").changed and w.item("trader", "pnl").changed
-        killswitch.release(w.conn, actor="justin")
+        killswitch.release(w.conn, actor="alice")
         await w.tick(at(10, 12))
         assert w.texts() == ["btw:\n[dori] \U0001f534 Dori failing\n[trader] PnL -$2k"]
         await w.tick(at(10, 13))
@@ -399,7 +399,7 @@ async def test_u8_muted_items_are_skipped_then_told_once_after_the_mute_if_still
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     async with world(resonant_home, chat, at(10, 9, 0)) as w:
-        mute(w.conn, "dori", at(10, 12, 0), by="justin")
+        mute(w.conn, "dori", at(10, 12, 0), by="alice")
         await w.report("dori", "inc", "Dori failing", urgency="urgent")
         await w.report("dori", "short", "Brief blip", ttl="1h")
         await w.report("trader", "pnl", "PnL +$1k", state={"b": 1})
@@ -427,7 +427,7 @@ async def test_u9_a_waiting_approval_is_reminded_once_at_half_its_ttl(
     async with world(resonant_home, chat, at(10, 9, 45)) as w:
         task_id = repo.insert_task(
             w.conn,
-            NewTask(kind="chat", runner="local", priority=PRIORITY_OWNER, principal="justin"),
+            NewTask(kind="chat", runner="local", priority=PRIORITY_OWNER, principal="alice"),
         )
         repo.set_status(w.conn, task_id, "waiting", wait_reason="approval")
         ap.insert_approval(
@@ -439,7 +439,7 @@ async def test_u9_a_waiting_approval_is_reminded_once_at_half_its_ttl(
                 effect=Effect.WRITE,
                 level=Level.L2,
                 summary="restart Resonant",
-                approvers=("justin",),
+                approvers=("alice",),
                 code="A7",
                 expires_at=at(10, 10, 15),
             ),
@@ -447,7 +447,7 @@ async def test_u9_a_waiting_approval_is_reminded_once_at_half_its_ttl(
         )
         (row,) = w.conn.execute("SELECT id FROM approvals").fetchall()
         ap.add_channel_ref(w.conn, row["id"], ref="imessage-out:1", at=at(10, 9, 45),
-                           principal="justin")  # fmt: skip  # the prompt went out
+                           principal="alice")  # fmt: skip  # the prompt went out
         w.conn.commit()
         await w.tick(at(10, 9, 59))
         assert w.texts() == []  # under half its TTL
@@ -472,7 +472,7 @@ async def test_u9_other_approvals_are_not_mentioned(
     async with world(resonant_home, chat, at(*asked)) as w:
         task_id = repo.insert_task(
             w.conn,
-            NewTask(kind="chat", runner="local", priority=PRIORITY_OWNER, principal="justin"),
+            NewTask(kind="chat", runner="local", priority=PRIORITY_OWNER, principal="alice"),
         )
         repo.set_status(w.conn, task_id, "waiting", wait_reason="approval")
         ap.insert_approval(
@@ -484,7 +484,7 @@ async def test_u9_other_approvals_are_not_mentioned(
                 effect=Effect.WRITE,
                 level=Level.L2,
                 summary="restart Resonant",
-                approvers=("justin",),
+                approvers=("alice",),
                 code="A7",
                 expires_at=at(*expires),
             ),
@@ -684,7 +684,7 @@ async def test_unsent_records_are_finished_oldest_first_and_a_corrupt_one_is_dro
             pulse_job.INFLIGHT + "bad",
             {"text": "x", "items": [], "sent": False, "at": "??"},
         )
-        await pulse_job._finish_unsent(w.conn, Recording(), "justin", now, except_key="")  # type: ignore[arg-type]
+        await pulse_job._finish_unsent(w.conn, Recording(), "alice", now, except_key="")  # type: ignore[arg-type]
         assert sent == ["a-older", "z-newer"]
         assert (
             w.conn.execute(

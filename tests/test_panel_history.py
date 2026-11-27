@@ -538,7 +538,7 @@ def _save_ext(db: sqlite3.Connection, now: datetime, keep: str = "30d") -> None:
         db,
         ext_store.ExtensionRecord(
             name="example", source="repo:example", commit="a" * 40, tree_digest="d",
-            manifest_sha="m", manifest=_manifest(keep), installed_at=now, installed_by="justin",
+            manifest_sha="m", manifest=_manifest(keep), installed_at=now, installed_by="alice",
         ),
     )  # fmt: skip
 

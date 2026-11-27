@@ -81,7 +81,7 @@ def test_tool_name_pattern(name: str) -> None:
 TRADE_JEV = """
 name: trade-jev
 version: 1
-approvers: [justin]
+approvers: [alice]
 jobs:
   - id: daily-session
     schedule: "15 6 * * 1-5"
@@ -109,7 +109,7 @@ DORI = """
 name: dori
 version: 1
 uses: oncall
-approvers: [justin, cofounder]
+approvers: [alice, cofounder]
 oncall:
   triggers: {slack_channel: "#dori-alerts"}
   autonomy: {unlock_after: 10m, deny_paths: [payments/, auth/]}
@@ -198,7 +198,7 @@ def test_approvers_must_hold_grant() -> None:
     principals = Principals.model_validate(
         {
             "principals": {
-                "justin": {"role": "owner"},
+                "alice": {"role": "owner"},
                 "cofounder": {"grants": {"dori": ["request", "approve"]}},
             }
         }

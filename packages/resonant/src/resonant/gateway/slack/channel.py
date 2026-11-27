@@ -4,7 +4,7 @@ Usage::
 
     slack = SlackChannel(settings.channels.slack, principals, conn, secrets=store, gate=gate)
     await slack.start(loop.submit)   # reads the two tokens, auth.test, opens the websocket
-    await slack.send("brian", "On it: R12", thread=thread_of(task))
+    await slack.send("bob", "On it: R12", thread=thread_of(task))
     await slack.post_room("digest", "Tuesday's digest ...")
     await slack.stop()
 
@@ -76,11 +76,11 @@ principals' Slack identity on its first line, so they are notified (the edited o
 drops them). Pay gets no buttons (only a typed ``yes <code>``). A click
 becomes ``ApprovalReply(actor=resolve(slack:<clicker>), channel="slack", path="button",
 code=<the prompt's code>)`` into ``gate.resolve_reply``; only the approval's approvers count:
-anyone else gets an ephemeral "Only Justin or Brian can approve this." and nothing changes.
+anyone else gets an ephemeral "Only Alice or Bob can approve this." and nothing changes.
 Once the approval is no longer pending (a click, a typed reply on any channel, expiry), the
-message is edited to "Approved by Brian" / "Denied by Justin" / "Expired, not done" and its
+message is edited to "Approved by Bob" / "Denied by Alice" / "Expired, not done" and its
 buttons go (checked on every click and every ``sweep_s``). A second click gets "Already
-approved by Brian." (the gate's resolve is atomic: the first wins).
+approved by Bob." (the gate's resolve is atomic: the first wins).
 
 **Health.** ``health()``: ``{ok, last_read_at, last_error, connected, last_event_at,
 followed_threads, detail}``; ``self_test()`` is ``auth.test`` plus a connected socket (kv

@@ -82,7 +82,7 @@ def notifier(
     channel: DedupeChannel,
     clock: Clock | None = None,
     *,
-    recipients: tuple[str, ...] = ("justin",),
+    recipients: tuple[str, ...] = ("alice",),
     max_per_hour: int = 20,
 ) -> Notifier:
     return Notifier(
@@ -219,17 +219,17 @@ def test_a_minus_or_dash_never_unmasks_a_code_next_to_a_reply(text: str, expecte
 
 def test_mute_and_unmute(db: sqlite3.Connection) -> None:
     assert muted_until(db, "github", T0) is None
-    mute(db, "github", T0 + timedelta(hours=1), by="justin")
+    mute(db, "github", T0 + timedelta(hours=1), by="alice")
     assert muted_until(db, "github", T0) == T0 + timedelta(hours=1)
     assert muted_until(db, "github", T0 + timedelta(hours=1)) is None  # it has passed
     assert muted_until(db, "example", T0) is None
     (row,) = audit_rows(db, "ext.notify_muted")
-    assert row["extension"] == "github" and row["requested_by"] == "justin"
-    assert unmute(db, "github", by="justin", now=T0) is True
+    assert row["extension"] == "github" and row["requested_by"] == "alice"
+    assert unmute(db, "github", by="alice", now=T0) is True
     assert muted_until(db, "github", T0) is None
-    assert unmute(db, "github", by="justin", now=T0) is False
+    assert unmute(db, "github", by="alice", now=T0) is False
     with pytest.raises(ValueError, match="timezone"):
-        mute(db, "github", datetime(2026, 1, 1), by="justin")
+        mute(db, "github", datetime(2026, 1, 1), by="alice")
 
 
 # --- baseline ----------------------------------------------------------------------------
@@ -258,7 +258,7 @@ async def test_sends_notify_types_to_every_recipient_and_skips_the_rest(
     db: sqlite3.Connection,
 ) -> None:
     ch = DedupeChannel(refuse={"ghost"})
-    n = notifier(db, ch, recipients=("justin", "maria", "ghost"))
+    n = notifier(db, ch, recipients=("alice", "maria", "ghost"))
     store(
         db,
         ("ci_failed", "✗ resonant#40 CI failed (lint)", "r#40:run:1:failed"),
@@ -267,7 +267,7 @@ async def test_sends_notify_types_to_every_recipient_and_skips_the_rest(
     await make_loop(db, n).run_once()
     text = "[github] ✗ resonant#40 CI failed (lint)"
     assert ch.sent == [
-        ("justin", text, "ext:github:r#40:run:1:failed:justin"),
+        ("alice", text, "ext:github:r#40:run:1:failed:alice"),
         ("maria", text, "ext:github:r#40:run:1:failed:maria"),
     ]
     assert unrouted(db) == []  # the digest is consumed too, unsent
@@ -284,11 +284,11 @@ async def test_baseline_paused_muted_and_unknown_are_consumed_unsent(
     loop = make_loop(db, n)
     store(db, ("ci_failed", "old red", "k1"), baseline=True)
     await loop.run_once()
-    killswitch.engage(db, actor="justin")
+    killswitch.engage(db, actor="alice")
     store(db, ("ci_failed", "while paused", "k2"))
     await loop.run_once()
-    killswitch.release(db, actor="justin")
-    mute(db, "github", T0 + timedelta(hours=1), by="justin")
+    killswitch.release(db, actor="alice")
+    mute(db, "github", T0 + timedelta(hours=1), by="alice")
     store(db, ("ci_failed", "while muted", "k3"))
     await loop.run_once()
     with transaction(db):
@@ -315,15 +315,15 @@ async def test_send_error_retries_and_a_partial_send_is_never_repeated(
     db: sqlite3.Connection,
 ) -> None:
     ch = DedupeChannel()
-    n = notifier(db, ch, recipients=("justin", "maria"))
+    n = notifier(db, ch, recipients=("alice", "maria"))
     loop = make_loop(db, n)
     store(db, ("ci_failed", "red", "k1"))
-    # justin's send works, maria's fails: the event stays unrouted and is retried.
+    # alice's send works, maria's fails: the event stays unrouted and is retried.
     ch.fail["maria"] = 1
     await loop.run_once()
-    assert [p for p, _, _ in ch.sent] == ["justin"] and len(unrouted(db)) == 1
+    assert [p for p, _, _ in ch.sent] == ["alice"] and len(unrouted(db)) == 1
     await loop.run_once()
-    assert [p for p, _, _ in ch.sent] == ["justin", "maria"] and unrouted(db) == []
+    assert [p for p, _, _ in ch.sent] == ["alice", "maria"] and unrouted(db) == []
 
 
 async def test_exactly_once_across_crashes(db: sqlite3.Connection) -> None:
@@ -374,7 +374,7 @@ async def test_more_message_is_held_while_paused(db: sqlite3.Connection) -> None
     n = notifier(db, ch, clock, max_per_hour=1)
     store(db, ("ci_failed", "a", "a"), ("ci_failed", "b", "b"))
     await make_loop(db, n).run_once()
-    killswitch.engage(db, actor="justin")
+    killswitch.engage(db, actor="alice")
     clock.now += timedelta(hours=1)
     assert await n.flush() == 1
     assert ch.texts == ["[github] a"]

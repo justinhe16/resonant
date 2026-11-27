@@ -36,8 +36,8 @@ the rest::
 - **One request per action** (PER-269). A requestable tool's call is an action
   (``gate.actions.args_target``): a second run asking for the same deploy while the first's
   approval is open gets no second approval; it is told which run already asked.
-- **Results.** A code-built line for the worker: ``Approved by Brian: Done: <summary>`` plus
-  the tool's output (clipped), ``Denied by Justin: the tool didn't run.``, ``No approver
+- **Results.** A code-built line for the worker: ``Approved by Bob: Done: <summary>`` plus
+  the tool's output (clipped), ``Denied by Alice: the tool didn't run.``, ``No approver
   answered in time …``. A call that ran is reported through ``on_ran`` as a ``did:`` line
   (``reports.record_did``), even when the request's wait was cancelled meanwhile: once
   approved, the run itself is shielded.
@@ -329,7 +329,7 @@ class WorkerRequests:
         )
 
     def _prompt_summary(self, run: Run, asked: Asked, reason: str) -> str:
-        """``R4 (for Miu) asks to deploy voyager-service-prod abc: "hotfix"``. Code-built:
+        """``R4 (for Carol) asks to deploy voyager-service-prod abc: "hotfix"``. Code-built:
         the gate's summary, and the worker's reason cleaned and quoted."""
         who = run.code
         if run.requester != run.principal:

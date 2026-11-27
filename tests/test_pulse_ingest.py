@@ -75,7 +75,7 @@ def make_pulse(
     clock: Clock | None = None,
     *,
     grant: str | None = "urgent",
-    recipients: tuple[str, ...] = ("justin",),
+    recipients: tuple[str, ...] = ("alice",),
     max_per_hour: int = 20,
 ) -> Pulse:
     m = manifest(grant)
@@ -144,7 +144,7 @@ def make_loop(db: sqlite3.Connection, pulse: Pulse, ch: DedupeChannel | None = N
     notifier = Notifier(
         db,
         channel=ch or DedupeChannel(),
-        recipients=lambda _e: ("justin",),
+        recipients=lambda _e: ("alice",),
         manifest_of=lambda e: manifest() if e == "dori" else None,
         clock=Clock(),
     )
@@ -274,13 +274,13 @@ async def test_urgent_sends_once_to_every_recipient_then_marks_told(
     db: sqlite3.Connection,
 ) -> None:
     ch = DedupeChannel(refuse={"ghost"})
-    pulse = make_pulse(db, ch, recipients=("justin", "maria", "ghost"))
+    pulse = make_pulse(db, ch, recipients=("alice", "maria", "ghost"))
     report(db, state={"status": "triaging"})
     (event,) = repo.unrouted_events(db)
     await make_loop(db, pulse).run_once()
     text = "[dori] \U0001f534 Dori failing"
     assert ch.sent == [
-        ("justin", text, f"pulse:urgent:{event.id}:justin"),
+        ("alice", text, f"pulse:urgent:{event.id}:alice"),
         ("maria", text, f"pulse:urgent:{event.id}:maria"),
     ]
     assert not item(db).changed
@@ -322,7 +322,7 @@ async def test_code_like_extension_name_gets_parentheses(db: sqlite3.Connection)
     pulse = Pulse(
         db,
         channel=ch,
-        recipients=lambda _e: ("justin",),
+        recipients=lambda _e: ("alice",),
         manifest_of=lambda e: m if e == "a7" else None,
         clock=Clock(),
     )
@@ -352,11 +352,11 @@ async def test_held_when_paused_muted_or_capped_stays_pending(db: sqlite3.Connec
     clock = Clock()
     pulse = make_pulse(db, ch, clock, max_per_hour=1)
     loop = make_loop(db, pulse)
-    killswitch.engage(db, actor="justin")
+    killswitch.engage(db, actor="alice")
     report(db, "dori/a", "while paused")
     await loop.run_once()
-    killswitch.release(db, actor="justin")
-    mute(db, "dori", T0 + timedelta(hours=1), by="justin")
+    killswitch.release(db, actor="alice")
+    mute(db, "dori", T0 + timedelta(hours=1), by="alice")
     report(db, "dori/b", "while muted")
     await loop.run_once()
     clock.now = T0 + timedelta(hours=2)  # the mute is over
@@ -381,7 +381,7 @@ async def test_cap_is_shared_with_the_notifier(db: sqlite3.Connection) -> None:
     notifier = Notifier(
         db,
         channel=ch,
-        recipients=lambda _e: ("justin",),
+        recipients=lambda _e: ("alice",),
         manifest_of=lambda e: manifest() if e == "dori" else None,
         config=NotifyConfig(max_per_hour=2),
         clock=Clock(),
@@ -432,15 +432,15 @@ async def test_send_error_retries_and_a_partial_send_is_never_repeated(
     db: sqlite3.Connection,
 ) -> None:
     ch = DedupeChannel()
-    pulse = make_pulse(db, ch, recipients=("justin", "maria"))
+    pulse = make_pulse(db, ch, recipients=("alice", "maria"))
     loop = make_loop(db, pulse)
     report(db)
     ch.fail["maria"] = 1
     await loop.run_once()
-    assert [p for p, _, _ in ch.sent] == ["justin"] and len(repo.unrouted_events(db)) == 1
+    assert [p for p, _, _ in ch.sent] == ["alice"] and len(repo.unrouted_events(db)) == 1
     assert item(db).changed
     await loop.run_once()
-    assert [p for p, _, _ in ch.sent] == ["justin", "maria"]
+    assert [p for p, _, _ in ch.sent] == ["alice", "maria"]
     assert repo.unrouted_events(db) == [] and not item(db).changed
 
 
@@ -464,7 +464,7 @@ async def test_without_a_pulse_item_events_are_consumed_by_the_notifier(
     notifier = Notifier(
         db,
         channel=ch,
-        recipients=lambda _e: ("justin",),
+        recipients=lambda _e: ("alice",),
         manifest_of=lambda e: manifest() if e == "dori" else None,
         clock=Clock(),
     )
@@ -482,7 +482,7 @@ async def test_title_is_cleaned_once(db: sqlite3.Connection) -> None:
 
 
 async def test_all_recipients_refused_leaves_the_item_pending(db: sqlite3.Connection) -> None:
-    ch = DedupeChannel(refuse={"justin"})
+    ch = DedupeChannel(refuse={"alice"})
     report(db)
     await make_loop(db, make_pulse(db, ch)).run_once()
     assert ch.sent == [] and repo.unrouted_events(db) == []

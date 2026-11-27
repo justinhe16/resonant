@@ -617,7 +617,7 @@ def test_install_refuses_a_changed_manifest_before_contacting_anyone(
 def settings(loopback: None) -> Settings:
     s = load_settings(dry_run=False)
     s.principals_path.write_text(
-        'principals:\n  justin:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
+        'principals:\n  alice:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
     )
     return s
 
@@ -682,10 +682,10 @@ async def test_gate_reads_run_writes_ask(
         read = c.registry.get("linear", "list_issues")
         assert save is not None and read is not None
         ask = c.gate.evaluate(
-            Intent.for_tool(save, task_id=task, principal="justin", args={"title": "x"})
+            Intent.for_tool(save, task_id=task, principal="alice", args={"title": "x"})
         )
         assert isinstance(ask, NeedsApproval)
-        i = Intent.for_tool(read, task_id=task, principal="justin", args={"assignee": "me"})
+        i = Intent.for_tool(read, task_id=task, principal="alice", args={"assignee": "me"})
         decision = c.gate.evaluate(i)
         assert isinstance(decision, Allow)
         assert isinstance(c.executor, Executor)

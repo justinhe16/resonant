@@ -80,7 +80,7 @@ OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
 """
@@ -294,7 +294,7 @@ def attach_claude(world: World, daemon: Daemon) -> None:
         ask_root=world.root / "ask",
         channel=daemon.imessage.channel,
         secrets=SecretStore(world.keychain),
-        owner="justin",
+        owner="alice",
         create_task=daemon.loop.create_task,
         claude_cmd=[sys.executable, "-I", str(FAKE_ASK), "--script", str(world.plan)],
         home=world.root / "claude-home",
@@ -453,7 +453,7 @@ async def test_r1_chat_request_starts_a_run(
         assert "On it: R1 ·" not in started and "/cancel R1" not in started
         # EM-6: a run asked for in plain words reports in the digest, not with a text
         await until(settled(w, "R1", "ready"), 60, "R1 to finish")
-        assert w.run().ask == "fix the typo in the README" and w.run().principal == "justin"
+        assert w.run().ask == "fix the typo in the README" and w.run().principal == "alice"
         detail = (await w.say("/runs R1")).splitlines()
         assert detail[0] == "- R1 demo · ready · PR #41" and PR_URL in detail
         assert not any(opened("R1")(t) for t in w.texts())

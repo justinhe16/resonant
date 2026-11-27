@@ -69,7 +69,7 @@ def _install(db: sqlite3.Connection, manifest: dict[str, Any], now: datetime) ->
         db,
         ext_store.ExtensionRecord(
             name=manifest["name"], source=f"repo:{manifest['name']}", commit="abc1234",
-            tree_digest="d", manifest_sha="m", installed_at=now, installed_by="justin",
+            tree_digest="d", manifest_sha="m", installed_at=now, installed_by="alice",
             manifest=manifest,
         ),
     )  # fmt: skip

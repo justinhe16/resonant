@@ -37,7 +37,7 @@ def task_id(db: sqlite3.Connection) -> str:
 
 
 def make(task_id: str, spec: ToolSpec = WRITE) -> Intent:
-    return Intent.for_tool(spec, task_id=task_id, principal="justin", args={"x": 1})
+    return Intent.for_tool(spec, task_id=task_id, principal="alice", args={"x": 1})
 
 
 def actions(db: sqlite3.Connection) -> list[str]:
@@ -71,7 +71,7 @@ async def test_forged_or_reused_allow_refused(db: sqlite3.Connection, task_id: s
         await ex.execute(i, Allow(token="forged"), step_no=1)
     with pytest.raises(NotAllowedError):
         await ex.execute(i, DryRun(would="Allow"), step_no=1)
-    decision = gate.allow(Intent.for_tool(WRITE, task_id=task_id, principal="justin", args={}))
+    decision = gate.allow(Intent.for_tool(WRITE, task_id=task_id, principal="alice", args={}))
     with pytest.raises(NotAllowedError):
         await ex.execute(i, decision, step_no=1)  # token issued for different args
     assert actions(db) == ["executor.refused"] * 3
@@ -96,7 +96,7 @@ async def test_write_timeout_is_ambiguous_and_never_rerun(
     again = await ex.execute(i, gate.allow(i), step_no=1)
     assert again.ambiguous and calls == 1
     assert res.idempotency_key is not None
-    assert ex.resolve_ambiguous(res.idempotency_key, succeeded=True, actor="justin")
+    assert ex.resolve_ambiguous(res.idempotency_key, succeeded=True, actor="alice")
     replay = await ex.execute(i, gate.allow(i), step_no=1)
     assert replay.replayed and calls == 1
     assert "executor.ambiguous_resolved" in actions(db)

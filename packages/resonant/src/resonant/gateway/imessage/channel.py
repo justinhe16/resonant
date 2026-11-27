@@ -4,7 +4,7 @@ Usage::
 
     channel = IMessageChannel(settings.channels.imessage, principals, conn)
     await channel.start(loop.submit)        # starts the chat.db reader as a task
-    ref = await channel.send("justin", "done", dedupe_key=task.idempotency_key)
+    ref = await channel.send("alice", "done", dedupe_key=task.idempotency_key)
     result = await channel.self_test()      # SelfTestResult(ok, detail)
     await channel.stop()
 

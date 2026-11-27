@@ -112,7 +112,7 @@ class Env:
             db,
             model=self.model,
             channel=self.channel,
-            owner="justin" if channel else None,
+            owner="alice" if channel else None,
             daemon_healthy=lambda: self.healthy,
             db_path=tmp_path / "test.db",
             model_meta={"model": "qwen", "api": "ollama"},
@@ -216,7 +216,7 @@ async def test_model_degraded_alerts_once_then_recovers(env: Env) -> None:
     await env.tick()
     assert len(env.sent) == 1
     owner, text, key = env.sent[0]
-    assert owner == "justin"
+    assert owner == "alice"
     assert text == "hey, some issues here: model: model unreachable or not pulled"
     assert key is not None and key.startswith("health:model:")
 

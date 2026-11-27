@@ -378,7 +378,7 @@ async def test_the_shims_request_lists_tools_and_sends_key_values(tmp_path: Path
 
     async def handle(req: Request, gone: asyncio.Future[None]) -> Reply:
         seen.append(req)
-        return Reply("Approved by Brian: Done.", 0)
+        return Reply("Approved by Bob: Done.", 0)
 
     server = WorkerServer(ctl, token, handle, lambda pid: True)
     await server.start()
@@ -389,7 +389,7 @@ async def test_the_shims_request_lists_tools_and_sends_key_values(tmp_path: Path
         )  # fmt: skip
     finally:
         await server.close()
-    assert (done.returncode, done.stdout.strip()) == (0, "Approved by Brian: Done.")
+    assert (done.returncode, done.stdout.strip()) == (0, "Approved by Bob: Done.")
     assert seen == [ToolRequest("dori", "prod_deploy", (("commit", "a=b"), ("build", "7")),
                                 "hotfix")]  # fmt: skip
     none_here = worker_cli.shim_text(ctl, 5.0, sys.executable)

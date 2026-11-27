@@ -80,7 +80,7 @@ OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
 PRINCIPALS = f"""\
 principals:
-  justin:
+  alice:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
 """
@@ -221,7 +221,7 @@ class Running:
                 kind="script",
                 runner="extscript",
                 priority=PRIORITY_OWNER,
-                principal="justin",
+                principal="alice",
                 checkpoint={"calls": list(calls)},
             )
         )
@@ -493,7 +493,7 @@ async def test_e3_show_my_prs_reaches_github_through_claudes_tools(
         # Claude's tool list: github's chat tools, none of its jobs.
         assert r.daemon.imessage is not None and r.daemon.imessage.brain is not None
         offered = {
-            t.name for t in r.daemon.imessage.brain.tools_for("justin") if t.extension == "github"
+            t.name for t in r.daemon.imessage.brain.tools_for("alice") if t.extension == "github"
         }
         assert offered == {
             "merge_pr", "merge_pr_anyway", "pr", "prs", "recent_prs", "rerun_failed", "pr_diff",
@@ -890,7 +890,7 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
     assert {m.handle for m in osa.sent} == {OWNER_PHONE}
 
     # Muted: a new failure is stored and held, never sent (not even after the mute ends).
-    mute(d.conn, "github", utcnow() + timedelta(hours=1), by="justin")
+    mute(d.conn, "github", utcnow() + timedelta(hours=1), by="alice")
     gh.set_pr40("s5", gh_run(7, "s5", "failure"))
     await watch(d, 5)
     await d.loop.run_once()
@@ -940,7 +940,7 @@ async def test_e1_e2_e9_example_install_restart_commands_and_repo_update(
 ) -> None:
     settings = settings_for(resonant_home, chat)
     # The shipped manifests name the approver `owner`, as go-live step 4 names the owner.
-    (resonant_home / "principals.yaml").write_text(PRINCIPALS.replace("justin:", "owner:"))
+    (resonant_home / "principals.yaml").write_text(PRINCIPALS.replace("alice:", "owner:"))
     checkout = checkout_with_example(tmp_path / "checkout")
     keychain = FakeKeychain()
     ops = FakeOpsRunner()

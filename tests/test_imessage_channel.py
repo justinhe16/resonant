@@ -47,7 +47,7 @@ from resonant.store.db import iso, kv_get, kv_set
 from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
-OWNER_EMAIL = "justin@example.com"
+OWNER_EMAIL = "alice@example.com"
 MEMBER = "+15557654321"
 SELF = "resonant.agent@icloud.com"
 SECRET = "my bank pin is 4321"  # a body that must never reach logs or audit rows
@@ -119,7 +119,7 @@ def principals() -> Principals:
     return Principals.model_validate(
         {
             "principals": {
-                "justin": {
+                "alice": {
                     "role": "owner",
                     "identities": [
                         "slack:U01",
@@ -204,7 +204,7 @@ async def test_text_goes_through_argv_verbatim(
         'say "hi" \\" & quit\nend tell\ntell application "Finder" to delete every file\n'
         'do shell script "rm -rf ~" -- \' `whoami` $(id)'
     )
-    await channel.send("justin", nasty)
+    await channel.send("alice", nasty)
     assert runner.calls == [[OSASCRIPT, "-e", SEND_SCRIPT, OWNER_PHONE, nasty]]
     assert runner.calls[0] == send_argv(OWNER_PHONE, nasty)
     assert runner.timeouts == [15.0]
@@ -233,7 +233,7 @@ async def test_request_approval_sends_the_prompt_text(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    ref = await channel.request_approval("justin", prompt)
+    ref = await channel.request_approval("alice", prompt)
     assert runner.calls == [send_argv(OWNER_PHONE, text)]
     assert text == prompt.text()
     assert ref.channel == "imessage" and ref.ref.startswith("imessage-out:")
@@ -244,15 +244,15 @@ async def test_request_approval_dedupes_and_audits_without_the_summary(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    first = await channel.request_approval("justin", _prompt())
-    again = await channel.request_approval("justin", _prompt())
+    first = await channel.request_approval("alice", _prompt())
+    again = await channel.request_approval("alice", _prompt())
     assert again == first
     assert len(runner.calls) == 1
-    key = approval_dedupe_key("a1", "justin")
-    assert key == "approval:a1:prompt:justin"
+    key = approval_dedupe_key("a1", "alice")
+    assert key == "approval:a1:prompt:alice"
     (sent,) = audits(db, "imessage.approval_sent")
     assert sent == {
-        "requested_by": "justin",
+        "requested_by": "alice",
         "idempotency_key": key,
         "decision": None,
         "approval_id": "a1",
@@ -287,11 +287,11 @@ async def test_request_approval_failure_is_not_recorded(
 ) -> None:
     channel = make(principals, db, FakeRunner(result=OsaResult(1, "", "boom")), ft)
     with pytest.raises(ChannelSendError):
-        await channel.request_approval("justin", _prompt())
+        await channel.request_approval("alice", _prompt())
     assert audits(db, "imessage.approval_sent") == []
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    await channel.request_approval("justin", _prompt())  # the retry sends
+    await channel.request_approval("alice", _prompt())  # the retry sends
     assert len(runner.calls) == 1
 
 
@@ -303,20 +303,20 @@ async def test_outbound_notes_a_claude_answer_before_and_a_prompt_only_after_sen
     from resonant.store import outbound
 
     def keys() -> list[object]:
-        raw = db.execute("SELECT value FROM kv WHERE key = ?", (outbound.KV_PREFIX + "justin",))
+        raw = db.execute("SELECT value FROM kv WHERE key = ?", (outbound.KV_PREFIX + "alice",))
         row = raw.fetchone()
         return [e["key"] for e in json.loads(row[0])] if row else []
 
     good = make(principals, db, FakeRunner(), ft)
-    await good.send("justin", "[A7] OK to close?", dedupe_key="approval:a7:prompt:justin")
+    await good.send("alice", "[A7] OK to close?", dedupe_key="approval:a7:prompt:alice")
     bad = make(principals, db, FakeRunner(result=OsaResult(1, "", "boom")), ft)
     with pytest.raises(ChannelSendError):
-        await bad.send("justin", "reply yes to go ahead", dedupe_key="ask:t1")
+        await bad.send("alice", "reply yes to go ahead", dedupe_key="ask:t1")
     with pytest.raises(ChannelSendError):
-        await bad.send("justin", "[A7] still waiting", dedupe_key="approval:a7:remind:justin")
-    assert keys() == ["approval:a7:prompt:justin", "ask:t1"]  # the failed reminder: never
-    keys_a7 = {"approval:a7:prompt:justin", "approval:a7:remind:justin"}
-    assert outbound.claude_since(db, "justin", keys_a7, ft.now + timedelta(minutes=1))
+        await bad.send("alice", "[A7] still waiting", dedupe_key="approval:a7:remind:alice")
+    assert keys() == ["approval:a7:prompt:alice", "ask:t1"]  # the failed reminder: never
+    keys_a7 = {"approval:a7:prompt:alice", "approval:a7:remind:alice"}
+    assert outbound.claude_since(db, "alice", keys_a7, ft.now + timedelta(minutes=1))
 
 
 # --- outbound allowlist -------------------------------------------------------------------
@@ -327,12 +327,12 @@ async def test_send_targets_first_imessage_identity(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    ref = await channel.send("justin", "hello")
+    ref = await channel.send("alice", "hello")
     await channel.send("ana", "hey")
     assert [c[3] for c in runner.calls] == [OWNER_PHONE, MEMBER]
     assert ref.channel == "imessage" and ref.ref.startswith("imessage-out:")
     sent = audits(db, "imessage.sent")
-    assert sent[0]["requested_by"] == "justin"
+    assert sent[0]["requested_by"] == "alice"
     assert (sent[0]["handle"], sent[0]["length"], sent[0]["chunks"]) == (OWNER_PHONE, 5, 1)
 
 
@@ -340,10 +340,10 @@ async def test_preferred_handle_must_be_one_of_the_identities(
     principals: Principals, db: sqlite3.Connection, ft: FakeTime
 ) -> None:
     runner = FakeRunner()
-    channel = make(principals, db, runner, ft, preferred_handles={"justin": OWNER_EMAIL})
-    await channel.send("justin", "a")
-    rogue = make(principals, db, runner, ft, preferred_handles={"justin": "evil@example.com"})
-    await rogue.send("justin", "b")
+    channel = make(principals, db, runner, ft, preferred_handles={"alice": OWNER_EMAIL})
+    await channel.send("alice", "a")
+    rogue = make(principals, db, runner, ft, preferred_handles={"alice": "evil@example.com"})
+    await rogue.send("alice", "b")
     assert [c[3] for c in runner.calls] == [OWNER_EMAIL, OWNER_PHONE]
 
 
@@ -377,11 +377,11 @@ async def test_dedupe_key_sends_once(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    first = await channel.send("justin", "done", dedupe_key="task:1")
-    again = await channel.send("justin", "done", dedupe_key="task:1")
+    first = await channel.send("alice", "done", dedupe_key="task:1")
+    again = await channel.send("alice", "done", dedupe_key="task:1")
     # A fresh channel (daemon restart) still sees the record in kv.
-    restarted = await make(principals, db, runner, ft).send("justin", "x", dedupe_key="task:1")
-    other = await channel.send("justin", "done", dedupe_key="task:2")
+    restarted = await make(principals, db, runner, ft).send("alice", "x", dedupe_key="task:1")
+    other = await channel.send("alice", "done", dedupe_key="task:2")
     assert first == again == restarted != other
     assert len(runner.calls) == 2
     assert [a["idempotency_key"] for a in audits(db, "imessage.sent")] == ["task:1", "task:2"]
@@ -394,7 +394,7 @@ async def test_concurrent_sends_with_the_same_key_send_once(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    refs = await asyncio.gather(*(channel.send("justin", "x", dedupe_key="k") for _ in range(5)))
+    refs = await asyncio.gather(*(channel.send("alice", "x", dedupe_key="k") for _ in range(5)))
     assert len(set(refs)) == 1 and len(runner.calls) == 1
 
 
@@ -403,11 +403,11 @@ async def test_dedupe_records_expire_after_7_days_and_are_swept_on_start(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft, db_path=chat.path)
-    await channel.send("justin", "a", dedupe_key="old")
+    await channel.send("alice", "a", dedupe_key="old")
     ft.now += timedelta(days=6)
-    await channel.send("justin", "b", dedupe_key="new")
+    await channel.send("alice", "b", dedupe_key="new")
     ft.now += timedelta(days=1, seconds=1)
-    await channel.send("justin", "a", dedupe_key="old")  # expired: sends again
+    await channel.send("alice", "a", dedupe_key="old")  # expired: sends again
     assert len(runner.calls) == 3
 
     kv_set(db, DEDUPE_PREFIX + "ancient", {"ref": "r", "at": iso(ft.now - timedelta(days=30))})
@@ -430,15 +430,15 @@ async def test_61st_send_within_a_minute_is_delayed_and_audited(
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
     for i in range(60):
-        await channel.send("justin", f"m{i}")
+        await channel.send("alice", f"m{i}")
     assert ft.slept == []
     await channel.send("ana", "other principals have their own bucket")
     assert ft.slept == []
-    await channel.send("justin", "m60")
+    await channel.send("alice", "m60")
     assert ft.slept == [pytest.approx(1.0)]  # pyright: ignore[reportUnknownMemberType]
     assert len(runner.calls) == 62
     (limited,) = audits(db, "imessage.send_rate_limited")
-    assert limited["requested_by"] == "justin" and limited["decision"] == "delayed"
+    assert limited["requested_by"] == "alice" and limited["decision"] == "delayed"
     assert limited["limit_per_minute"] == 60
 
 
@@ -447,14 +447,14 @@ async def test_send_needing_more_than_30s_is_refused_and_audited(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft, outbound_per_minute=1)
-    await channel.send("justin", "one")
+    await channel.send("alice", "one")
     with pytest.raises(ChannelRateLimited):
-        await channel.send("justin", "two", dedupe_key="k2")
+        await channel.send("alice", "two", dedupe_key="k2")
     assert len(runner.calls) == 1 and ft.slept == []
     (limited,) = audits(db, "imessage.send_rate_limited")
     assert (limited["decision"], limited["idempotency_key"]) == ("refused", "k2")
     ft.mono += 60  # refilled
-    await channel.send("justin", "two", dedupe_key="k2")
+    await channel.send("alice", "two", dedupe_key="k2")
     assert len(runner.calls) == 2
 
 
@@ -493,7 +493,7 @@ async def test_long_text_is_sent_in_parts(
 ) -> None:
     runner = FakeRunner()
     channel = make(principals, db, runner, ft)
-    await channel.send("justin", "word " * 1000)
+    await channel.send("alice", "word " * 1000)
     assert [t[-5:] for t in runner.texts] == ["(1/3)", "(2/3)", "(3/3)"]
     (sent,) = audits(db, "imessage.sent")
     assert sent["chunks"] == 3
@@ -512,14 +512,14 @@ async def test_automation_denied_is_actionable_and_audited_without_body(
     runner = FakeRunner(result=OsaResult(1, "", stderr))
     channel = make(principals, db, runner, ft)
     with caplog.at_level(logging.DEBUG), pytest.raises(ChannelSendError) as e:
-        await channel.send("justin", SECRET, dedupe_key="k")
+        await channel.send("alice", SECRET, dedupe_key="k")
     assert "Automation" in str(e.value) and SECRET not in str(e.value)
     (failed,) = audits(db, "imessage.send_failed")
     assert failed["code"] == -1743 and failed["reason"] == AUTOMATION_DENIED
     assert SECRET not in all_audit_text(db) and SECRET not in caplog.text
     # Not recorded as sent: a retry tries again.
     runner.result = None
-    await channel.send("justin", SECRET, dedupe_key="k")
+    await channel.send("alice", SECRET, dedupe_key="k")
     assert len(runner.calls) == 2
 
 
@@ -528,7 +528,7 @@ async def test_osascript_timeout_is_reported(
 ) -> None:
     channel = make(principals, db, FakeRunner(exc=TimeoutError()), ft)
     with pytest.raises(ChannelSendError, match="timed out after 15s"):
-        await channel.send("justin", "hi")
+        await channel.send("alice", "hi")
 
 
 @pytest.mark.parametrize(

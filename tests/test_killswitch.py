@@ -34,13 +34,13 @@ def test_pause_hooks_run_after_commit_and_never_undo_the_switch(resonant_home: P
 
     removers = [killswitch.add_pause_hook(broken), killswitch.add_pause_hook(hook)]
     try:
-        killswitch.engage(conn, actor="justin")
-        killswitch.release(conn, actor="justin")
+        killswitch.engage(conn, actor="alice")
+        killswitch.release(conn, actor="alice")
     finally:
         for remove in removers:
             remove()
     assert seen == [(True, True), (False, False)]  # each saw the committed state
-    killswitch.engage(conn, actor="justin")
+    killswitch.engage(conn, actor="alice")
     assert len(seen) == 2  # removed
     assert killswitch.is_paused(conn)
 
@@ -117,7 +117,7 @@ def test_ext_validate(resonant_home: Path) -> None:
     assert ok.exit_code == 0, ok.output
     assert "get_time" in ok.output and "write_note" in ok.output and "ok" in ok.output
 
-    (resonant_home / "principals.yaml").write_text("principals:\n  justin: {role: owner}\n")
+    (resonant_home / "principals.yaml").write_text("principals:\n  alice: {role: owner}\n")
     bad = runner.invoke(app, ["ext", "validate", str(repo / "extensions/example")])
     assert bad.exit_code == 1  # example lists approver 'owner', which doesn't exist here
 

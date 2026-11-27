@@ -7,7 +7,7 @@ other e2e files mostly play the owner on iMessage; these play a team thread.
 
 The world is Cori-shaped: the real daemon (router, gate, loop, ``ClaudeRunner`` with the fake
 worker, tool bridge, executor) over ``e2e.FakeChannel("slack")`` only, with an owner
-(justin), an approver (brian) and a member (miu, a read-only github grant, so she reaches
+(alice), an approver (bob) and a member (carol, a read-only github grant, so she reaches
 Claude); ``gate.tainted_writes: allow``; ``github/token`` minted per call by the instance's
 GitHub App (``FakeGitHubApi``) for the real ``extensions/github`` over the fake ``gh``; and
 Cori's own ``config/cori/brain-rules.md``. The brain is ``e2e/fake_claude.py`` acting out a
@@ -61,13 +61,13 @@ from resonant.wiring import tool_access
 
 __all__ = ["chat"]  # the fixture
 
-JUSTIN, BRIAN, MIU = "U1", "U2", "U3"
+ALICE, BOB, CAROL = "U1", "U2", "U3"
 TEAM = f"""\
 principals:
-  justin: {{role: owner, identities: ["slack:{JUSTIN}"]}}
-  brian: {{role: approver, identities: ["slack:{BRIAN}"]}}
-  miu:
-    identities: ["slack:{MIU}"]
+  alice: {{role: owner, identities: ["slack:{ALICE}"]}}
+  bob: {{role: approver, identities: ["slack:{BOB}"]}}
+  carol:
+    identities: ["slack:{CAROL}"]
     grants: {{github: {{request: [pr]}}}}
 """
 RULES = Path(__file__).resolve().parents[1] / "config/cori/brain-rules.md"
@@ -176,7 +176,7 @@ def attach_brain(
         ask_root=w.root / "ask",
         channel=daemon.imessage.channel,
         secrets=SecretStore(w.keychain),
-        owner="justin",
+        owner="alice",
         create_task=daemon.loop.create_task,
         claude_cmd=[
             sys.executable,
@@ -207,7 +207,7 @@ def pr_state() -> dict[str, Any]:
     approved and CLEAN. Any App-minted token is accepted."""
     pr = {
         "number": 159, "title": "Voyager onboarding", "url": f"https://github.com/{PR_REPO}/pull/159",
-        "state": "OPEN", "isDraft": False, "author": {"login": "brian"},
+        "state": "OPEN", "isDraft": False, "author": {"login": "bob"},
         "headRefName": "onboarding", "headRefOid": HEAD, "baseRefName": "main",
         "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
         "statusCheckRollup": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
@@ -327,7 +327,7 @@ async def test_robot_surf_three_tickets_one_start_line_each_and_the_reply_as_wri
                  delay=4.0, answer=reply)  # fmt: skip
         where = thread(1)
         said = await c.ask(
-            JUSTIN, "robot-surf DORI-1173, DORI-1174 and DORI-1175", where,
+            ALICE, "robot-surf DORI-1173, DORI-1174 and DORI-1175", where,
             lambda s: reply in s and len(start_lines(s)) == 3, "three start lines and the reply",
         )  # fmt: skip
         assert said.count(reply) == 1  # exactly as Claude wrote it, nothing appended
@@ -338,7 +338,7 @@ async def test_robot_surf_three_tickets_one_start_line_each_and_the_reply_as_wri
         no_noise(said)
         runs = c.runs()
         assert [r.ask for r in runs] == [SURF.format(t=f"DORI-117{i}") for i in (3, 4, 5)]
-        assert all(r.principal == "justin" for r in runs)
+        assert all(r.principal == "alice" for r in runs)
         assert passed(c) == 1  # checked once, passed: never flagged, never redone
 
 
@@ -354,7 +354,7 @@ async def test_a_retry_after_failed_runs_starts_new_runs(
     async with cori(tmp_path, resonant_home, chat, monkeypatch, scenario="error") as c:
         where = thread(2)
         c.claude(calls=[surf("DORI-1173")], answer="Started R1 (DORI-1173); I'll post here.")
-        await c.ask(JUSTIN, "robot-surf DORI-1173", where,
+        await c.ask(ALICE, "robot-surf DORI-1173", where,
                     lambda s: any(t.startswith("R1 (") and " failed: " in t for t in s),
                     "R1's failure")  # fmt: skip
         assert c.runs()[0].status == "failed"
@@ -365,7 +365,7 @@ async def test_a_retry_after_failed_runs_starts_new_runs(
         assert len(failures) == 1 and not failures[0].startswith("Couldn't"), failures
         reply = "I started R2 (DORI-1173) again; I'll post the PR here."
         c.claude(calls=[surf("DORI-1173")], answer=reply)
-        said = await c.ask(JUSTIN, "retry DORI-1173", where,
+        said = await c.ask(ALICE, "retry DORI-1173", where,
                            lambda s: reply in s and len(start_lines(s)) == 1,
                            "R2's start line and the reply")  # fmt: skip
         assert start_lines(said)[0].startswith("On it: starting R2 (")
@@ -383,8 +383,8 @@ async def test_a_retry_after_failed_runs_starts_new_runs(
 async def test_an_approver_merges_a_pr_no_run_opened_through_the_github_extension(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Brian asks Cori to merge a PR a person opened (``merge_run`` has no run for it): the
-    brain reads it, then ``github.merge_pr`` runs on Brian's word (L2 after a tainting read,
+    """Bob asks Cori to merge a PR a person opened (``merge_run`` has no run for it): the
+    brain reads it, then ``github.merge_pr`` runs on Bob's word (L2 after a tainting read,
     ``gate.tainted_writes: allow``) with a token the App minted for that repo alone."""
     async with cori(tmp_path, resonant_home, chat, monkeypatch) as c:
         reply = "Merged PR #159 in voyager-web."
@@ -393,7 +393,7 @@ async def test_an_approver_merges_a_pr_no_run_opened_through_the_github_extensio
             {"name": "merge_pr", "args": {"repo": PR_REPO, "number": 159, "head_sha": HEAD}},
         ], answer=reply)  # fmt: skip
         said = await c.ask(
-            BRIAN,
+            BOB,
             f"merge https://github.com/{PR_REPO}/pull/159",
             thread(3),
             lambda s: any(t.startswith(reply) for t in s),
@@ -403,13 +403,13 @@ async def test_an_approver_merges_a_pr_no_run_opened_through_the_github_extensio
         assert said == [f"{reply}\nDone: merge PR #159 in {PR_REPO}"]
         no_noise(said)
         pr_read, merged = c.seen()["results"]
-        assert '"author":"brian"' in pr_read and merged.startswith("done:")
+        assert '"author":"bob"' in pr_read and merged.startswith("done:")
         merges = [x for x in c.gh_calls() if x["argv"][:2] == ["pr", "merge"]]
         assert len(merges) == 1 and merges[0]["argv"][2] == "159" and merges[0]["token_ok"]
         (ev,) = [r for r in c.conn.execute(
             "SELECT decision, requested_by FROM audit_log WHERE action = 'gate.evaluate' "
             "AND tool = 'merge_pr'")]  # fmt: skip
-        assert ev["decision"] == "Allow" and ev["requested_by"] == "brian"
+        assert ev["decision"] == "Allow" and ev["requested_by"] == "bob"
         mints = [m for m in c.w.api.mints if m["repositories"] == ["voyager-web"]]
         assert mints and mints[-1]["permissions"]["contents"] == "write"
         assert c.conn.execute("SELECT 1 FROM approvals").fetchone() is None  # nobody asked
@@ -429,10 +429,10 @@ async def test_a_bare_yes_in_a_thread_with_nothing_pending_goes_to_the_brain(
         where = thread(4)
         question = "DORI-1173 is in voyager-web. Want me to start a worker on it?"
         c.claude(answer=question)
-        await c.ask(JUSTIN, "can you look at DORI-1173", where, has(question), "the question")
+        await c.ask(ALICE, "can you look at DORI-1173", where, has(question), "the question")
         reply = "Started R1 (DORI-1173); I'll post the PR here."
         c.claude(calls=[surf("DORI-1173")], answer=reply)
-        said = await c.ask(JUSTIN, "yes", where, has(reply), "the reply to the yes")
+        said = await c.ask(ALICE, "yes", where, has(reply), "the reply to the yes")
         no_noise(said)
         assert c.seen()["prompt"].rstrip().endswith("yes")  # Claude got the yes itself
         assert [r.code for r in c.runs()] == ["R1"]
@@ -453,13 +453,13 @@ async def test_honest_replies_go_out_unchanged(
             ("start them after the deploy", "Once that's done, I'll start them."),
         ], start=10):  # fmt: skip
             c.claude(answer=reply)
-            said = await c.ask(JUSTIN, text, thread(n), has(reply), repr(reply))
+            said = await c.ask(ALICE, text, thread(n), has(reply), repr(reply))
             assert said == [reply]
         assert c.runs() == [] and passed(c) == 2
         reply = "Started R1; I'll post the PR here."
         c.claude(calls=[surf("DORI-1173")], answer=reply)
         # the owner asks for a change, so the bare "Started …" is checked as a claim too
-        said = await c.ask(JUSTIN, "start a worker on DORI-1173", thread(12),
+        said = await c.ask(ALICE, "start a worker on DORI-1173", thread(12),
                            lambda s: reply in s and len(start_lines(s)) == 1,
                            "R1's start line and the reply")  # fmt: skip
         assert [t for t in said if t != reply and not t.startswith("R1 ")] == start_lines(said)
@@ -481,7 +481,7 @@ async def test_an_empty_claim_is_redone_then_strict_replaces_it_and_lenient_send
     claim = "PER-301 has been closed."
     async with cori(tmp_path, resonant_home, chat, monkeypatch, reply_guard=mode) as c:
         c.claude(answer=claim)
-        said = await c.ask(JUSTIN, "close PER-301", thread(20), lambda s: bool(s), "a reply")
+        said = await c.ask(ALICE, "close PER-301", thread(20), lambda s: bool(s), "a reply")
         lenient = mode == "lenient"
         assert said == [claim if lenient else guard.CLAIM_FALLBACK]
         spans = c.guard_spans()
@@ -498,16 +498,16 @@ async def test_an_empty_claim_is_redone_then_strict_replaces_it_and_lenient_send
 async def test_a_member_cant_start_a_run(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PER-293: miu reaches Claude (she has a read grant) but start_run isn't hers: the call
+    """PER-293: carol reaches Claude (she has a read grant) but start_run isn't hers: the call
     is refused by code, no run is made, and she gets Claude's polite no. ``/run`` says who
     can start work."""
     async with cori(tmp_path, resonant_home, chat, monkeypatch) as c:
         assert c.daemon.stack is not None and c.daemon.stack.brain is not None
-        names = {s.name for s in c.daemon.stack.brain.tools_for("miu")}
+        names = {s.name for s in c.daemon.stack.brain.tools_for("carol")}
         assert "pr" in names and "start_run" not in names and "merge_pr" not in names
-        reply = "Only Justin or Brian can start work. Want me to look the ticket up instead?"
+        reply = "Only Alice or Bob can start work. Want me to look the ticket up instead?"
         c.claude(calls=[surf("DORI-1173")], answer=reply)
-        said = await c.ask(MIU, "robot-surf DORI-1173", thread(30), has(reply), "the reply")
+        said = await c.ask(CAROL, "robot-surf DORI-1173", thread(30), has(reply), "the reply")
         assert said == [reply]
         (result,) = c.seen()["results"]
         assert "start_run" in result and not result.startswith("done:")
@@ -518,7 +518,7 @@ async def test_a_member_cant_start_a_run(
             ).fetchone()
             is None
         )
-        said = await c.ask(MIU, f"/run {REPO} fix the login bug", thread(31), lambda s: bool(s),
+        said = await c.ask(CAROL, f"/run {REPO} fix the login bug", thread(31), lambda s: bool(s),
                            "the refusal")  # fmt: skip
-        assert said[0].startswith("Only Justin or Brian can start work"), said
+        assert said[0].startswith("Only Alice or Bob can start work"), said
         assert c.runs() == []

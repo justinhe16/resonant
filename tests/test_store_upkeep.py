@@ -405,7 +405,7 @@ class Harness:
 async def harness(home: Path, *, dry_run: bool = False, **settings: Any) -> AsyncGenerator[Harness]:
     s = load_settings(home=home, timezone="America/Los_Angeles", dry_run=dry_run, **settings)
     s.principals_path.write_text(
-        'principals:\n  justin:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
+        'principals:\n  alice:\n    role: owner\n    identities: ["imessage:+15551234567"]\n'
     )
     conn = open_db(s.db_path)
     loop = Loop(conn, {}, s.loop, SlotPool(2, 1))

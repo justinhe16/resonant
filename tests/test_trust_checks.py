@@ -26,7 +26,7 @@ from resonant.trust.checks import CHECK_TOOL, TrustChecks, check_summary
 from resonant_sdk import Event
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
-OWNER = "justin"
+OWNER = "alice"
 HANDLE = "+15551234567"
 TTL_S = 1800.0
 

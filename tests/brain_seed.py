@@ -12,7 +12,7 @@ from resonant.store import tasks as repo
 from resonant.store.db import iso, transaction
 from resonant_sdk import Event, ToolSpec
 
-OWNER = "justin"
+OWNER = "alice"
 PRIORITY = 10
 
 

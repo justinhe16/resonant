@@ -37,9 +37,9 @@ from resonant.tools.base import BuiltinContext
 
 PRINCIPALS = """\
 principals:
-  justin: {role: owner, identities: ["slack:U1"]}
-  brian: {role: approver, identities: ["slack:U2"]}
-  miu: {identities: ["slack:U3"]}
+  alice: {role: owner, identities: ["slack:U1"]}
+  bob: {role: approver, identities: ["slack:U2"]}
+  carol: {identities: ["slack:U3"]}
 """
 TZ = "America/New_York"
 # Friday 2026-11-20 12:00 in New York
@@ -47,7 +47,7 @@ NOW = datetime(2026, 11, 20, 17, 0, tzinfo=UTC)
 MONDAY_9 = datetime(2026, 11, 23, 14, 0, tzinfo=UTC)  # 09:00 in New York
 THREAD = {
     "channel": "slack",
-    "principal": "brian",
+    "principal": "bob",
     "identity": "slack:U2",
     "thread": "C0GENERAL:1700000000.000100",
     "ref": "C0GENERAL:1700000000.000100",
@@ -147,7 +147,7 @@ async def call(
 async def add(c: Components, db: sqlite3.Connection, **args: Any) -> dict[str, Any]:
     args.setdefault("schedule", "0 9 * * 1")
     args.setdefault("prompt", "check flaky CI and file tickets")
-    return await call(c, "add_job", args, task_of(db, "brian"))
+    return await call(c, "add_job", args, task_of(db, "bob"))
 
 
 async def tick(db: sqlite3.Connection, c: Components, runner: Any, ch: Recorder, at: datetime):
@@ -193,7 +193,7 @@ async def test_brians_words_create_a_job_the_reply_says_when(
     )
     job = store.get(db, "J1")
     assert job is not None
-    assert (job.created_by, job.output, job.state) == ("brian", "thread", "active")
+    assert (job.created_by, job.output, job.state) == ("bob", "thread", "active")
     assert job.channel_ref == THREAD and job.last_due == NOW
 
 
@@ -213,25 +213,23 @@ async def test_outputs(components: Components, db: sqlite3.Connection) -> None:
     assert (await add(components, db, output="#digest"))["output"] == "room:digest"
     assert (await add(components, db, output="dm"))["output"] == "dm"
     # no thread (a DM or iMessage): the default is a DM
-    unthreaded = task_of(db, "brian", ref=None)
+    unthreaded = task_of(db, "bob", ref=None)
     out = await call(components, "add_job", {"schedule": "0 9 * * *", "prompt": "x"}, unthreaded)
     assert out["output"] == "dm"
 
 
-def test_miu_is_refused_brian_is_asked(components: Components, db: sqlite3.Connection) -> None:
+def test_carol_is_refused_bob_is_asked(components: Components, db: sqlite3.Connection) -> None:
     args = {"schedule": "0 9 * * 1", "prompt": "check flaky CI"}
     for spec in job_tools.SPECS:
         intent = Intent.for_tool(
             spec,
-            task_id=task_of(db, "miu"),
-            principal="miu",
+            task_id=task_of(db, "carol"),
+            principal="carol",
             args=args if spec is job_tools.ADD_JOB else {"id": "J1"},
         )
         assert isinstance(components.gate.evaluate(intent), Deny), spec.name
     asked = components.gate.evaluate(
-        Intent.for_tool(
-            job_tools.ADD_JOB, task_id=task_of(db, "brian"), principal="brian", args=args
-        )
+        Intent.for_tool(job_tools.ADD_JOB, task_id=task_of(db, "bob"), principal="bob", args=args)
     )
     assert isinstance(asked, NeedsApproval)
     assert "every Monday at 09:00" in (asked.summary or "")
@@ -275,7 +273,7 @@ async def test_a_due_job_starts_exactly_one_run_and_skips_while_busy(
     assert (await tick(db, components, runner, ch, at))["started"] == 1
     assert (await tick(db, components, runner, ch, at + timedelta(seconds=30))) == {"quiet": True}
     (started,) = runner.calls
-    assert started["principal"] == "brian" and started["report"] == "now"
+    assert started["principal"] == "bob" and started["report"] == "now"
     assert started["channel_ref"] == THREAD
     assert started["job"] == store.RunLink("J1", None)
     job = store.get(db, "J1")
@@ -351,13 +349,13 @@ async def test_a_removed_creator_runs_as_the_owner(
     job = store.get(db, "J1")
     assert job is not None
     gone = components.principals.model_validate(
-        {"principals": {"justin": {"role": "owner", "identities": ["slack:U1"]}}}
+        {"principals": {"alice": {"role": "owner", "identities": ["slack:U1"]}}}
     )
-    assert rj.principal_for(job, gone) == "justin"
+    assert rj.principal_for(job, gone) == "alice"
     runner = FakeRunner(db)
     await rj.tick(db, MONDAY_9, runner=runner, principals=gone, channel=Recorder())  # type: ignore[arg-type]
     (started,) = runner.calls
-    assert started["principal"] == "justin" and started["channel_ref"] is None
+    assert started["principal"] == "alice" and started["channel_ref"] is None
 
 
 async def test_a_refused_start_is_recorded(components: Components, db: sqlite3.Connection) -> None:
@@ -429,7 +427,7 @@ async def test_job_note_persists_into_the_next_prompt(
     assert "Already seen (skip these): PR#2, PR#1, PR#3" in nxt
     # a run that isn't a job's has nothing to save to
     other = runs_store.create(
-        db, repo="", ask="x", principal="justin", session_id="s", max_seconds=60
+        db, repo="", ask="x", principal="alice", session_id="s", max_seconds=60
     )
     reply = await desk.handle(other.code, JobNote("x"), gone)
     assert reply is not None and reply.exit == EXIT_USAGE and rj.run_context(db, other.code) is None
@@ -444,7 +442,7 @@ def test_memory_and_seen_are_capped(db: sqlite3.Connection) -> None:
         prompt="p",
         repo=None,
         output="dm",
-        created_by="brian",
+        created_by="bob",
         channel_ref=None,
         now=NOW,
     )
@@ -461,10 +459,10 @@ def test_memory_and_seen_are_capped(db: sqlite3.Connection) -> None:
 async def test_no_jobs_records_nothing(
     components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
 ) -> None:
-    deps = CoreDeps(settings, db, components, Recorder(), "justin")  # type: ignore[arg-type]
+    deps = CoreDeps(settings, db, components, Recorder(), "alice")  # type: ignore[arg-type]
     core = rj.registered_jobs_job(deps)
     assert core is not None and core.quiet_idle and core.schedule == "* * * * *"
-    assert rj.registered_jobs_job(CoreDeps(settings, db, components, None, "justin")) is None
+    assert rj.registered_jobs_job(CoreDeps(settings, db, components, None, "alice")) is None
     sched = Scheduler.from_components(
         settings,
         db,
@@ -499,7 +497,7 @@ async def test_a_jobs_end_text_goes_to_its_room(db: sqlite3.Connection) -> None:
     from resonant.runners.claude import ClaudeRunner
 
     def run_for(link: store.RunLink | None) -> runs_store.Run:
-        run = runs_store.create(db, repo="", ask="x", principal="brian", session_id="s",
+        run = runs_store.create(db, repo="", ask="x", principal="bob", session_id="s",
                                 max_seconds=60)  # fmt: skip
         if link is not None:
             store.link_run(db, run.code, link)
@@ -517,7 +515,7 @@ async def test_a_jobs_end_text_goes_to_its_room(db: sqlite3.Connection) -> None:
     await ClaudeRunner._send_end(me, run_for(store.RunLink("J2")), "R2 done")  # type: ignore[arg-type]
     await ClaudeRunner._send_end(me, run_for(None), "R3 done")  # type: ignore[arg-type]
     assert ch.rooms == [("digest", "R1 done")]
-    assert [(p, t) for p, t, _ in ch.sent] == [("brian", "R2 done"), ("brian", "R3 done")]
+    assert [(p, t) for p, t, _ in ch.sent] == [("bob", "R2 done"), ("bob", "R3 done")]
 
     class Refusing(Recorder):
         async def post_room(self, key: str, text: str, **_: Any) -> Any:
@@ -526,7 +524,7 @@ async def test_a_jobs_end_text_goes_to_its_room(db: sqlite3.Connection) -> None:
     no_room = Refusing()
     me = SimpleNamespace(conn=db, channel=no_room, _send_run=sender(no_room))
     await ClaudeRunner._send_end(me, run_for(store.RunLink("J1", "digest")), "R4 done")  # type: ignore[arg-type]
-    assert [(p, t) for p, t, _ in no_room.sent] == [("brian", "R4 done")]
+    assert [(p, t) for p, t, _ in no_room.sent] == [("bob", "R4 done")]
 
 
 def test_the_approval_shows_the_whole_prompt(
@@ -536,8 +534,8 @@ def test_the_approval_shows_the_whole_prompt(
     heading = job_tools.summary_action(
         Intent.for_tool(
             job_tools.ADD_JOB,
-            task_id=task_of(db, "brian"),
-            principal="brian",
+            task_id=task_of(db, "bob"),
+            principal="bob",
             args={"schedule": "0 9 * * 1", "prompt": long},
         )
     )
@@ -551,7 +549,7 @@ async def test_a_linked_run_counts_as_busy_and_starts_dont_overlap(
     await add(components, db)
     job = store.get(db, "J1")
     assert job is not None and not rj.busy(db, job)
-    run = runs_store.create(db, repo="", ask="x", principal="brian", session_id="s", max_seconds=60)
+    run = runs_store.create(db, repo="", ask="x", principal="bob", session_id="s", max_seconds=60)
     store.link_run(db, run.code, store.RunLink("J1"))  # started, but never recorded
     assert rj.busy(db, job)
     runs_store.finish(db, run.code, "done")
@@ -566,7 +564,7 @@ async def test_a_linked_run_counts_as_busy_and_starts_dont_overlap(
             channel=None,
             now=NOW,
             manual=True,
-            by="justin",
+            by="alice",
         )
     finally:
         rj._starting.discard("J1")  # pyright: ignore[reportPrivateUsage]
@@ -576,9 +574,9 @@ async def test_a_linked_run_counts_as_busy_and_starts_dont_overlap(
 async def test_manual_runs_audit_who(components: Components, db: sqlite3.Connection) -> None:
     await add(components, db)
     components.runners["claude"] = FakeRunner(db)  # type: ignore[assignment]
-    await call(components, "run_job_now", {"id": "J1"}, task_of(db, "justin"))
+    await call(components, "run_job_now", {"id": "J1"}, task_of(db, "alice"))
     (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'regjob.started'")
-    assert '"by": "justin"' in row[0] and '"manual": true' in row[0]
+    assert '"by": "alice"' in row[0] and '"manual": true' in row[0]
 
 
 async def test_a_paused_instance_with_no_jobs_records_nothing(
@@ -614,7 +612,7 @@ def test_the_heartbeat_reads_the_next_job_from_the_real_table(db: sqlite3.Connec
     assert next_registered_job(db, NOW) is None
     for name, expr in (("weekly", "0 9 * * 1"), ("daily", "0 8 * * *"), ("off", "0 7 * * *")):
         store.create(db, name=name, schedule=expr, tz=TZ, prompt="p", repo=None, output="dm",
-                     created_by="brian", channel_ref=None, now=NOW)  # fmt: skip
+                     created_by="bob", channel_ref=None, now=NOW)  # fmt: skip
     store.set_state(db, "J3", "paused", NOW, expect=("active",))
     assert next_registered_job(db, NOW) == ("J2", datetime(2026, 11, 21, 13, 0, tzinfo=UTC))
 
@@ -638,23 +636,23 @@ def test_a_seed_is_added_once_and_a_deleted_one_stays_deleted(
     settings: Settings, db: sqlite3.Connection
 ) -> None:
     s = seeded(settings, SEED)
-    assert rj.seed(db, s, owner="justin", now=NOW) == ["J1"]
+    assert rj.seed(db, s, owner="alice", now=NOW) == ["J1"]
     job = store.get(db, "J1")
     assert job is not None
     assert (job.name, job.schedule, job.tz, job.output, job.created_by, job.repo) == (
-        "weekly improvement scan", "0 8 * * 1", TZ, "room:digest", "justin", None
+        "weekly improvement scan", "0 8 * * 1", TZ, "room:digest", "alice", None
     )  # fmt: skip
     assert job.channel_ref is None and job.state == "active"
-    assert rj.seed(db, s, owner="justin", now=NOW) == []  # the next start
+    assert rj.seed(db, s, owner="alice", now=NOW) == []  # the next start
     store.set_state(db, "J1", "deleted", NOW, expect=("active",))
-    assert rj.seed(db, s, owner="justin", now=NOW + timedelta(days=1)) == []
+    assert rj.seed(db, s, owner="alice", now=NOW + timedelta(days=1)) == []
     assert db.execute("SELECT COUNT(*) FROM registered_jobs").fetchone()[0] == 1
     (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'regjob.seeded'")
     assert '"seed": "weekly-scan"' in row["detail"]
 
 
 def test_no_seeds_or_no_owner_adds_nothing(settings: Settings, db: sqlite3.Connection) -> None:
-    assert rj.seed(db, settings, owner="justin", now=NOW) == []
+    assert rj.seed(db, settings, owner="alice", now=NOW) == []
     assert rj.seed(db, seeded(settings, SEED), owner=None, now=NOW) == []
     assert db.execute("SELECT COUNT(*) FROM registered_jobs").fetchone()[0] == 0
 
@@ -672,13 +670,13 @@ def test_a_seed_that_cant_be_added_is_refused_and_tried_again(
     settings: Settings, db: sqlite3.Connection, change: dict[str, Any], why: str
 ) -> None:
     s = seeded(settings, {**SEED, **change})
-    assert rj.seed(db, s, owner="justin", now=NOW) == []
+    assert rj.seed(db, s, owner="alice", now=NOW) == []
     (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'regjob.seed_refused'")
     assert why in row["detail"]
-    assert rj.seed(db, s, owner="justin", now=NOW) == []  # not recorded: tried every start
+    assert rj.seed(db, s, owner="alice", now=NOW) == []  # not recorded: tried every start
     assert len(db.execute("SELECT 1 FROM audit_log WHERE action = 'regjob.seed_refused'")
                .fetchall()) == 2  # fmt: skip
-    assert rj.seed(db, seeded(settings, SEED), owner="justin", now=NOW) == ["J1"]  # fixed
+    assert rj.seed(db, seeded(settings, SEED), owner="alice", now=NOW) == ["J1"]  # fixed
 
 
 @pytest.mark.parametrize(

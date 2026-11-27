@@ -204,7 +204,7 @@ _PR_URL = re.compile(PR_URL_PATTERN)
 _HEAD_SHA = re.compile(SHA_PATTERN)
 # Linear ids: upper case in an ask (``PER-276``; ``gpt-4`` is not one). In a branch (lower case,
 # a slug of the ask) only a key the ask named, or one starting a path segment as Linear's own
-# branch names do (``justin/per-276-...``).
+# branch names do (``alice/per-276-...``).
 _LINEAR = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,10}-\d{1,6})(?![A-Za-z0-9])")
 _LINEAR_BRANCH = re.compile(r"(?<![a-z0-9])([a-z]{2,10})-(\d{1,6})(?![a-z0-9])")
 _RUN_KEY = re.compile(r"run/(r\d{1,6})")

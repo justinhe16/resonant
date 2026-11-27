@@ -720,7 +720,7 @@ def since_last(
     when there is nothing. Data, not instructions: it is code-built from Resonant's records.
 
     PER-294: ``conversation`` is the thread's delta only; its messages are named by sender
-    (``speaker``: ``Brian:``) and, when more than ``limit`` items are new, the block starts with
+    (``speaker``: ``Bob:``) and, when more than ``limit`` items are new, the block starts with
     ``OLDER_NOTE``. Without a conversation it is exactly as before (``Owner:``)."""
     from_at = since
     if after_event_id is not None and (cursor := get_event(conn, after_event_id)) is not None:

@@ -2155,7 +2155,7 @@ class AskRunner:
         return named(principals.display)
 
     def _who(self, principal: str) -> str:
-        """``Brian (approver)``: a sender's name and role, for a turn's header (PER-294)."""
+        """``Bob (approver)``: a sender's name and role, for a turn's header (PER-294)."""
         role = self.principals.role(principal) if self.principals is not None else None
         role = role or ("owner" if principal == self.owner else "member")
         return f"{self._speaker()(principal)} ({role})"

@@ -69,7 +69,7 @@ def make_pulse(db: sqlite3.Connection, ch: Channel) -> Pulse:
     return Pulse(
         db,
         channel=ch,
-        recipients=lambda _e: ("justin",),
+        recipients=lambda _e: ("alice",),
         manifest_of=lambda e: m if e == "example" else None,
         clock=utcnow,
     )
