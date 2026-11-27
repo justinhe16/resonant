@@ -1007,3 +1007,46 @@ def test_a_watch_follow_up_is_marked_with_its_key(db: sqlite3.Connection, tmp_pa
     assert isinstance(plain, Queued) and isinstance(marked, Queued)
     assert FOLLOW_UP_KEY not in h.task(plain.task_id).checkpoint
     assert h.task(marked.task_id).checkpoint[FOLLOW_UP_KEY] == "watch/1/1"
+
+
+def test_a_run_follow_up_carries_its_depth(db: sqlite3.Connection, tmp_path: Path) -> None:
+    """PER-354: an ended run's follow-up ask is marked with its key and carries its chain
+    depth, which a run it starts or continues takes on; a watch's carries none."""
+    from resonant.store.runs import FOLLOW_UP_DEPTH_KEY, chain_depth
+
+    h = make(db, tmp_path)
+    h.runner.tools = cast(Any, object())
+    run = h.runner.enqueue("R1 (x) ended: ready.", principal="alice", tools=True,
+                           tainted=True, taint_hops=0, follow_up="run/R1/t",
+                           follow_up_depth=2)  # fmt: skip
+    watch = h.runner.enqueue("Watch W1 (x) fired.", principal="alice", tools=True,
+                             follow_up="watch/1/1")  # fmt: skip
+    assert isinstance(run, Queued) and isinstance(watch, Queued)
+    cp = h.task(run.task_id).checkpoint
+    assert cp[FOLLOW_UP_KEY] == "run/R1/t" and cp[FOLLOW_UP_DEPTH_KEY] == 2
+    assert cp["tainted"] is True and chain_depth(cp) == 2
+    assert FOLLOW_UP_DEPTH_KEY not in h.task(watch.task_id).checkpoint
+
+
+def test_a_follow_up_asks_continuation_keeps_its_depth(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """PER-354: the turn that feeds a decided approval back to a follow-up ask carries its
+    depth on, so an approval in the middle never resets the chain."""
+    from resonant.runners.continuation import Fed
+    from resonant.store.runs import FOLLOW_UP_DEPTH_KEY
+
+    h = make(db, tmp_path)
+    h.runner.tools = cast(Any, object())
+    for depth, want in ((2, 2), (None, None)):
+        first = h.runner.enqueue("R1 (x) ended: ready.", principal="alice", tools=True,
+                                 tainted=True, taint_hops=0,
+                                 follow_up=None if depth is None else "run/R1/t",
+                                 follow_up_depth=depth)  # fmt: skip
+        assert isinstance(first, Queued)
+        task = h.task(first.task_id)
+        fed = [Fed("start_run", {}, "ran", "ok")]
+        answer = cast(Any, SimpleNamespace(path="yes", reply=""))
+        cont = h.runner._continue(task, dict(task.checkpoint), fed, "k", 0, answer)  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(cont, Queued), cont
+        assert h.task(cont.task_id).checkpoint.get(FOLLOW_UP_DEPTH_KEY) == want

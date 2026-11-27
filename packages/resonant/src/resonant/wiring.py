@@ -618,6 +618,8 @@ def build_stack(
         requests=requests,
         # PER-323: a run's milestones in its conversation (default: thread on Slack instances)
         milestones_mode=settings.runs.milestones_for(settings.channels),
+        # PER-354: a run's follow-up is one brain ask when it ends (the ask runner is below)
+        asks=lambda: _ask_runner(components),
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude

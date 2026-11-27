@@ -991,7 +991,7 @@ def test_migration_037_keeps_old_watches_and_their_ids(tmp_path: Any) -> None:
             (what,),
         )
     raw.execute("DELETE FROM brain_watches WHERE what = 'b'")  # the high-water mark is 2
-    assert migrate(raw, every) == 37
+    assert migrate(raw, every) == 38
     old = store.get(raw, 1)
     assert old is not None and (old.what, old.then, old.channel_ref, old.follow_up) == (
         "a",
