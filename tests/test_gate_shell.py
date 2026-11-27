@@ -546,6 +546,14 @@ def test_a_grant_matches_the_same_action_however_its_reissued(
         # cd's own side effects: OLDPWD, cd -
         (bash("cd /r && cd -", "/ask"), bash("cd -", "/r")),
         (bash("cd /r && echo $OLDPWD", "/ask"), bash("echo $OLDPWD", "/r")),
+        (bash("cd /r && ls ~-", "/ask"), bash("ls ~-", "/r")),
+        (bash('cd /r && "cd" -', "/ask"), bash('"cd" -', "/r")),
+        (bash("cd /r && c''d -", "/ask"), bash("c''d -", "/r")),
+        # bash splits words on spaces and tabs only
+        (bash("echo a b", "/r"), bash("echo a\xa0b", "/r")),
+        (bash("echo a b", "/r"), bash("echo a\x0cb", "/r")),
+        # trailing blanks of an unterminated heredoc's body
+        (bash("cat <<EOF\nx  ", "/r"), bash("cat <<EOF\nx", "/r")),
         ({"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d1"},
          {"tool": "Edit", "command": "/r/a.py", "cwd": "/x", "digest": "d2"}),
     ],

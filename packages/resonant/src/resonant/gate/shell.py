@@ -1053,11 +1053,15 @@ _LEAD_CD = re.compile(r"[ \t]*cd[ \t]+(/[^\s'\"$`\\~;&|<>(){}*?\[\]!#]*)[ \t]*&&
 # What the rest after a dropped hop may not hold anywhere, quoted or not (no quote parsing to
 # get wrong): something that runs even when the cd failed (``;``, ``|``, ``&``, a new line),
 # an expansion or escape that could tell where it started (``$OLDPWD``, ``$(...)``, a
-# backtick, ``\``), a redirect or heredoc, or another ``cd`` (``cd -``).
-_HOP_UNSAFE = re.compile(r"[;|&\n\r$`\\<>]|(^|\s)cd(\s|$)")
-# A command made only of plain words: no quotes, expansions, escapes, comments, operators or
-# new lines, so its blanks only separate words and may be collapsed.
-_PLAIN = re.compile(r"[^'\"$`\\#;&|<>()\n\r{}]*")
+# backtick, ``\``, ``~-``), a redirect or heredoc, or another ``cd`` (``cd -``; checked with
+# quotes removed too: ``"cd" -``, ``c''d -``).
+_HOP_UNSAFE = re.compile(r"[;|&\n\r$`\\<>~]")
+_CD_WORD = re.compile(r"(^|\s)cd(\s|$)")
+# A command made only of plain words: printable characters and spaces or tabs, no quotes,
+# expansions, escapes, comments or operators, so its spaces and tabs only separate words
+# and may be collapsed (bash splits on nothing else: ``\xa0`` or ``\f`` is part of a word).
+_PLAIN = re.compile(r"(?:[ \t]|[^\s\x00-\x1f\x7f-\x9f'\"$`\\#;&|<>(){}])*")
+_BLANKS = re.compile(r"[ \t]+")
 
 
 def grant_form(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -1076,7 +1080,8 @@ def grant_form(args: Mapping[str, Any]) -> dict[str, Any]:
         where, rest = cwd, command
         while (m := _LEAD_CD.match(rest)) is not None:
             after = rest[m.end() :]
-            if not after.strip(" \t") or _HOP_UNSAFE.search(after):
+            if (not after.strip(" \t") or _HOP_UNSAFE.search(after)
+                    or _CD_WORD.search(re.sub(r"['\"]", "", after))):  # fmt: skip
                 break
             where, rest = os.path.normpath(m.group(1)), after
         return {"tool": tool, "at": where, "run": _settled(rest)}
@@ -1086,14 +1091,15 @@ def grant_form(args: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _settled(text: str) -> str:
-    """``text`` as a grant compares it: leading blanks dropped (they never sit in a quote);
-    trailing ones too unless a backslash could escape one; and runs of blanks as one space
-    only in a command of plain words."""
+    """``text`` as a grant compares it: leading spaces and tabs dropped (they never sit in a
+    quote); trailing ones too unless a backslash could escape one or they could end a
+    heredoc's body (a new line); and runs of spaces and tabs as one space only in a command
+    of plain words."""
     text = text.lstrip(" \t")
-    if "\\" not in text:
+    if not any(c in text for c in "\\\n\r"):
         text = text.rstrip(" \t")
     if _PLAIN.fullmatch(text):
-        return " ".join(text.split())
+        return _BLANKS.sub(" ", text)
     return text
 
 
