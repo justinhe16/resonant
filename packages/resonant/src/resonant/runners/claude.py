@@ -1962,7 +1962,14 @@ class ClaudeRunner:
             await self._finish_cancelled(run.code)
         return Cancelled(run.code)
 
-    async def continue_run(self, code: str, *, announce: bool = False) -> Continued | Refused:
+    async def continue_run(
+        self,
+        code: str,
+        *,
+        announce: bool = False,
+        channel_ref: dict[str, Any] | None = None,
+        requested_by: str | None = None,
+    ) -> Continued | Refused:
         """PER-344: pick up a run that a limit stopped (the time limit, the per-run disk cap or
         the disk running nearly full), from its kept work: the same run code, Claude session
         (``--resume``), worktree and branch, with a fresh time budget (the time used plus
@@ -1978,7 +1985,14 @@ class ClaudeRunner:
         (cleaned up after ``runner.keep_days``); or the disk is still under the free-space
         floor. Who may continue a run is the caller's (the gate: an L3 global builtin, the
         owner and approvers only). ``announce``: the run says ``Continuing R5 (…)`` in its
-        thread itself (the brain continued it, not ``/continue``)."""
+        thread itself (the brain continued it, not ``/continue``).
+
+        ``channel_ref`` and ``requested_by`` (PER-351): the thread the continue was asked in
+        and who asked (None: the run's principal). The run moves there: its later updates,
+        questions, end and merge go to that thread, addressed to the continuer
+        (``runs.channel_ref``/``requested_by``, the new task's ``channel_ref``), and its old
+        thread gets one pointer (``status.moved_line``). Continued from the same thread,
+        nothing is said there. No ``channel_ref`` (no asking task): it stays where it was."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         if self._paused():
@@ -2018,15 +2032,21 @@ class ClaudeRunner:
         why = LIMIT_WORDS[limit]
         prompt = CONTINUE_PROMPT.format(why=why, tidy=CONTINUE_TIDY if limit != "time" else "")
         budget = int(run.session_seconds) + self.max_session_s
+        old_ref = run_ref(self.conn, run)
+        moved = channel_ref is not None
+        ref = channel_ref if moved else old_ref
+        asker = None if requested_by == run.principal else requested_by
         with atomic(self.conn):
             if not runs.reopen(self.conn, run.code, max_seconds=budget, resume_prompt=prompt):
                 return Refused(f"{run.code} isn't failed any more; nothing to continue.")
+            if moved:  # PER-351: it reports where it was continued
+                runs.move(self.conn, run.code, channel_ref=ref, requested_by=asker)
         spec = NewTask(
             kind=TASK_KIND,
             runner=RUNNER_NAME,
             priority=PRIORITY_OWNER,
             principal=run.principal,
-            channel_ref=None if task is None else task.channel_ref,  # the run's thread
+            channel_ref=ref,  # the run's thread (PER-351: the continuer's)
             checkpoint={
                 "run": run.code,
                 "title": f"continue {run.code} · {run.repo or 'no repo'}",
@@ -2038,16 +2058,40 @@ class ClaudeRunner:
         )
         try:
             task_id = self._create_task(spec)
-        except Exception:  # as it was: failed on its limit, still continuable
-            runs.finish(self.conn, run.code, "failed", failure=run.failure, step="reply",
-                        max_seconds=run.max_seconds, resume_prompt=run.resume_prompt)  # fmt: skip
+        except Exception:  # as it was: failed on its limit, still continuable, in its thread
+            with atomic(self.conn):
+                runs.finish(self.conn, run.code, "failed", failure=run.failure, step="reply",
+                            max_seconds=run.max_seconds,
+                            resume_prompt=run.resume_prompt)  # fmt: skip
+                if moved:
+                    runs.move(self.conn, run.code, channel_ref=run.channel_ref,
+                              requested_by=run.requested_by)  # fmt: skip
             raise
         runs.update(self.conn, run.code, task_id=task_id)
         self.reports.set_report(run.code, "now")  # asked for by name: its end is texted
         with atomic(self.conn):
             audit(self.conn, "run.continued", run=run.code, task_id=task_id, limit=limit,
                   continued=n)  # fmt: skip
+        if moved:
+            await self._point_to_new_thread(run, n)
         return Continued(run.code, run.repo, why, max(1, self.max_session_s // 60))
+
+    async def _point_to_new_thread(self, before: Run, n: int) -> None:
+        """PER-351: a run continued from another thread leaves its old thread one pointer,
+        sent as it was addressed before the move (``before``). Nothing when it had no thread
+        or the continue came from that same thread."""
+        old = run_thread(self.conn, before)
+        now = self._thread(self._must_get(before.code))
+        if old is None or (
+            now is not None and (now.channel, now.thread) == (old.channel, old.thread)
+        ):
+            return
+        key = f"run:{before.code}:moved:c{n}"
+        try:
+            await self._send_run(before, status.moved_line(before.code), dedupe_key=key)
+        except ChannelError as e:
+            log.warning("run moved line not sent", extra={"run": before.code,
+                                                          "error": type(e).__name__})  # fmt: skip
 
     def _work_kept(self, run: Run) -> bool:
         """PER-344: the run's worktree (or scratch dir) and run dir are still on disk, with

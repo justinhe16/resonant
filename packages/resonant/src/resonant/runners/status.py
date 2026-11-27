@@ -108,6 +108,11 @@ def continue_line(code: str, title: str | None, why: str) -> str:
     return f"{head}: it was stopped by {why}."
 
 
+def moved_line(code: str) -> str:
+    """PER-351: the one pointer a continued run leaves in its old thread."""
+    return f"{code} continued in another thread."
+
+
 def names_text(names: Sequence[str]) -> str:
     """``A``, ``A or B``, ``A, B or C``; ``an approver`` for none."""
     if not names:

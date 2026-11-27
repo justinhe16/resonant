@@ -286,6 +286,132 @@ async def test_a_brain_continued_run_says_continuing_in_its_thread(
     assert h.run("R1").status == "ready"
 
 
+# --- PER-351: a continued run reports in the thread that continued it -----------------------
+
+
+THREAD_A = {"channel": "slack", "thread": "C0TEAM:100.1", "ref": "C0TEAM:100.1",
+            "principal": "owner"}  # fmt: skip
+THREAD_B = {"channel": "slack", "thread": "C0TEAM:200.2", "ref": "C0TEAM:200.5",
+            "principal": "owner"}  # fmt: skip
+
+
+def record_threads(h: Harness) -> list[tuple[str, str, str | None]]:
+    """Every send as ``(principal, text, thread)``; the harness's ``Chan`` keeps no thread."""
+    seen: list[tuple[str, str, str | None]] = []
+    send = h.chan.send
+
+    async def recording(principal: str, text: str, *, thread: Any = None,
+                        dedupe_key: str | None = None) -> Any:  # fmt: skip
+        before = len(h.chan.sent)
+        out = await send(principal, text, thread=thread, dedupe_key=dedupe_key)
+        if len(h.chan.sent) > before:  # not a deduped repeat
+            seen.append((principal, text, None if thread is None else thread.thread))
+        return out
+
+    h.chan.send = recording  # type: ignore[method-assign]
+    return seen
+
+
+async def stopped_in(h: Harness, ref: dict[str, Any], requested_by: str | None = None) -> None:
+    res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now",
+                                   channel_ref=ref, requested_by=requested_by)  # fmt: skip
+    assert not isinstance(res, Refused)
+    await h.drain()
+    assert h.run("R1").status == "failed"
+    h.runner.max_session_s = 60
+
+
+async def test_a_run_continued_from_another_thread_reports_there(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    await stopped_in(h, THREAD_A)
+    sent = record_threads(h)
+
+    res = await h.runner.continue_run("R1", announce=True, channel_ref=THREAD_B,
+                                      requested_by="owner")  # fmt: skip
+    assert isinstance(res, Continued), res
+    run = h.run("R1")
+    assert run.channel_ref == THREAD_B and run.requested_by is None
+    task = task_store.get_task(db, cast(str, run.task_id))
+    assert task is not None and task.channel_ref == THREAD_B
+    # the old thread gets one pointer, at once
+    assert sent == [("owner", "R1 continued in another thread.", "C0TEAM:100.1")]
+
+    await h.drain()
+    assert h.run("R1").status == "ready"
+    later = sent[1:]
+    assert later and all(thread == "C0TEAM:200.2" for _, _, thread in later), later
+    texts = [t for _, t, _ in later]
+    assert "Continuing R1 (fix the flaky test): it was stopped by the time limit." in texts
+    assert any(opened("R1")(t) for t in texts)
+    assert sum(thread == "C0TEAM:100.1" for _, _, thread in sent) == 1
+
+
+async def test_a_run_continued_from_its_own_thread_stays_and_says_nothing_more(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    await stopped_in(h, THREAD_A)
+    sent = record_threads(h)
+
+    res = await h.runner.continue_run("R1", announce=True, channel_ref=dict(THREAD_A),
+                                      requested_by="owner")  # fmt: skip
+    assert isinstance(res, Continued), res
+    assert sent == []  # no pointer
+    await h.drain()
+    assert h.run("R1").channel_ref == THREAD_A
+    assert sent and all(thread == "C0TEAM:100.1" for _, _, thread in sent), sent
+    assert "R1 continued in another thread." not in [t for _, t, _ in sent]
+    assert any(opened("R1")(t) for _, t, _ in sent)
+
+
+async def test_a_members_run_continued_by_the_owner_moves_to_the_owner(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    theirs = {**THREAD_A, "principal": "cofounder"}
+    await stopped_in(h, theirs, requested_by="cofounder")
+    assert h.run("R1").requester == "cofounder"
+    sent = record_threads(h)
+
+    res = await h.runner.continue_run("R1", channel_ref=THREAD_B, requested_by="owner")
+    assert isinstance(res, Continued), res
+    assert h.run("R1").requester == "owner"
+    # the pointer goes to the old thread as it was addressed: to the member who asked there
+    assert sent == [("cofounder", "R1 continued in another thread.", "C0TEAM:100.1")]
+    await h.drain()
+    assert all((who, thread) == ("owner", "C0TEAM:200.2") for who, _, thread in sent[1:])
+
+
+async def test_a_continue_with_no_thread_keeps_the_runs_thread(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    await stopped_in(h, THREAD_A)
+    sent = record_threads(h)
+    assert isinstance(await h.runner.continue_run("R1"), Continued)
+    assert h.run("R1").channel_ref == THREAD_A and sent == []
+    await h.drain()
+    assert sent and all(thread == "C0TEAM:100.1" for _, _, thread in sent)
+
+
+async def test_a_continue_that_cant_queue_leaves_the_run_in_its_old_thread(
+    tmp_path: Path, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = build(tmp_path, db, scenario="hang_then_ok", max_session_s=1)
+    await stopped_in(h, THREAD_A)
+
+    def broken(spec: NewTask) -> str:
+        raise RuntimeError("no task")
+
+    monkeypatch.setattr(h.runner, "_create_task", broken)
+    with pytest.raises(RuntimeError):
+        await h.runner.continue_run("R1", channel_ref=THREAD_B, requested_by="owner")
+    run = h.run("R1")
+    assert run.status == "failed" and run.channel_ref == THREAD_A and run.requested_by is None
+
+
 # --- the tool and the command ----------------------------------------------------------------
 
 
@@ -309,12 +435,21 @@ class FakeContinue:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, bool]] = []
+        self.moved: list[tuple[dict[str, Any] | None, str | None]] = []
 
     async def setup_missing(self) -> str | None:
         return None
 
-    async def continue_run(self, code: str, *, announce: bool = False) -> Continued | Refused:
+    async def continue_run(
+        self,
+        code: str,
+        *,
+        announce: bool = False,
+        channel_ref: dict[str, Any] | None = None,
+        requested_by: str | None = None,
+    ) -> Continued | Refused:
         self.calls.append((code, announce))
+        self.moved.append((channel_ref, requested_by))
         if code == "R9":
             return Refused("No run R9.")
         return Continued(code, "proj", "the time limit", 45)
@@ -412,3 +547,18 @@ def test_slash_continue_parses_a_run_code() -> None:
 def test_the_continue_prompt_is_code_built() -> None:
     text = claude_mod.CONTINUE_PROMPT.format(why="the time limit", tidy="")
     assert text.startswith(CONTINUE_HEAD + ": it hit the time limit.")
+
+
+async def test_the_tool_moves_the_run_to_the_thread_it_was_continued_in(
+    tool_parts: tuple[Any, FakeContinue], db: sqlite3.Connection
+) -> None:
+    components, fake = tool_parts
+    handler = components.handlers[(None, "continue_run")]
+    ref = {**THREAD_B, "principal": "lead"}
+    task = insert_task(db, NewTask(kind="chat", runner="local", priority=1, principal="lead",
+                                   channel_ref=ref))  # fmt: skip
+    ctx = CallContext(secrets={}, idempotency_key="k-t", task_id=task, origin="inferred")
+    assert (await handler({"code": "R1"}, ctx))["continued"] is True
+    no_thread = CallContext(secrets={}, idempotency_key="k-n", task_id=_task(db, "owner"))
+    assert (await handler({"code": "R1"}, no_thread))["continued"] is True
+    assert fake.moved == [(ref, "lead"), (None, None)]
