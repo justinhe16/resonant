@@ -1230,6 +1230,70 @@ async def test_unpushed_commits_say_couldnt_push(tmp_path: Path, db: sqlite3.Con
     assert await asyncio.to_thread(Path(run.workspace).is_dir)  # the work is kept
 
 
+def push_pr_branch(h: Harness, branch: str = "feature", commits: int = 2) -> None:
+    """Someone's open PR: ``branch`` on the remote, ``commits`` beyond main."""
+    seed = h.root / "seed-proj"
+    git(seed, "checkout", "-q", "-b", branch)
+    for i in range(commits):
+        (seed / f"pr-{i}.txt").write_text(f"pr change {i}\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-q", "-m", f"PR change {i}")
+    git(seed, "push", "-q", str(h.remotes["proj"]), branch)
+
+
+async def test_a_checked_out_pr_with_nothing_added_is_no_changes(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-355: a session asked about a PR checks its branch out (its run branch now holds
+    the PR's commits), finds nothing to fix and pushes nothing. The PR's commits aren't its
+    work: the run ends no_changes with its summary, not "couldn't push"."""
+    h = build(tmp_path, db, scenario="nochanges", extra=["--pr-branch", "feature"])
+    push_pr_branch(h)
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "no_changes", run.failure
+    assert h.chan.texts() == ["R1 (fix the flaky test) made no changes: Nothing to change."]
+    assert sorted(h.branches()) == ["feature", "main"]  # nothing pushed
+
+
+async def test_a_commit_on_a_checked_out_pr_is_its_own(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-355: only the session's own commit counts as unpushed work, not the PR's two."""
+    h = build(tmp_path, db, extra=["--pr-branch", "feature", "--no-push"])
+    push_pr_branch(h)
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed"
+    assert run.failure == f"couldn't push: 1 commit saved on {run.branch} (/runs R1)"
+
+
+async def test_a_refused_push_fails_with_gits_reason(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-355: the remote refuses the session's push; the run fails with git's reason in
+    one line, and where its commit is."""
+    h = build(tmp_path, db, extra=["--push-shown"])
+    hook = h.remotes["proj"] / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\necho 'error: GH013: refusing to allow a GitHub App to create or update"
+        " workflow without workflows permission' >&2\nexit 1\n"
+    )
+    hook.chmod(0o755)
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed"
+    assert run.failure == (
+        "couldn't push: refusing to allow a GitHub App to create or update workflow without"
+        f" workflows permission; 1 commit saved on {run.branch} (/runs R1)"
+    )
+    assert h.chan.texts()[0].splitlines()[0] == f"R1 (fix the flaky test) {run.failure}"
+    assert h.branches() == ["main"]
+
+
 # --- the reaper ------------------------------------------------------------------------------
 
 SLEEPER = "import time; time.sleep(600)"

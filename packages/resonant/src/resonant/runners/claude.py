@@ -192,6 +192,7 @@ from resonant.runners.live import (
     LiveInput,
     session_url,
 )
+from resonant.runners.push_refusal import PushWatch
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.runners.reports import (
     HELD_KINDS,
@@ -316,6 +317,7 @@ LOCK_POLL_S = 0.25
 # a push run's session left commits it couldn't push: the run fails with this reason, and
 # the reply leads with it (PER-271: not "made no changes")
 COULDNT_PUSH = "couldn't push: "
+PUSH_WHY_MAX = 160  # git's reason for a refused push, in the failure (PER-355)
 # PER-344: how a limit's failure reason starts (code-built, the head of ``runs.failure``): a run
 # stopped by one keeps its work and can be continued (``continue_run``). The cache cap and the
 # turn and dollar limits aren't among them: a fresh session would hit the same wall.
@@ -1169,6 +1171,7 @@ class ClaudeRunner:
         self.milestone_quiet_s = milestone_quiet_s
         self._loud: set[str] = set()  # codes past the quiet window: milestones post at once
         self._milestone_locks: dict[str, asyncio.Lock] = {}
+        self._pushes: dict[str, PushWatch] = {}  # PER-355: each run's own git pushes
         self.api_port = api_port
         self.bridge = bridge
         self.resonant_home = resonant_home or default_resonant_home()
@@ -2493,6 +2496,16 @@ class ClaudeRunner:
         if new and run.code in self._loud:
             self._spawn(self._post_milestones(run.code))
 
+    def _watch_pushes(self, run: Run, pushes: PushWatch, msg: dict[str, Any]) -> None:
+        """Feed one stream message to the session's push watch (PER-355). Never raises."""
+        try:
+            if msg.get("type") == "assistant":
+                pushes.calls(msg)
+            else:
+                pushes.results(msg)
+        except Exception:
+            log.exception("push watch failed", extra={"run": run.code})
+
     async def _post_milestones(self, code: str) -> None:
         """Post run ``code``'s milestones not yet said, in its conversation, each once (the
         channel dedupes ``status:<task>:milestone:<kind>``). Only while the run is running,
@@ -3288,6 +3301,7 @@ class ClaudeRunner:
             counted = False
             seen = self._side_effect_context(run, p)
             tracker = milestones.Tracker()  # PER-323
+            pushes = self._pushes.setdefault(run.code, PushWatch())  # PER-355: per run
             async for raw, truncated in read_lines(proc.stdout):
                 last_line = time.monotonic()
                 writer.write(raw, truncated)
@@ -3298,8 +3312,10 @@ class ClaudeRunner:
                 if kind == "assistant" and msg is not None:
                     self._detect(run, msg, seen)
                     self._track(run, tracker, msg)
+                    self._watch_pushes(run, pushes, msg)
                 elif kind == "user" and msg is not None:
                     self._track(run, tracker, msg)
+                    self._watch_pushes(run, pushes, msg)
                 elif kind == "control_response" and msg is not None:
                     live.feed(msg)
                 elif kind == "result" and msg is not None:
@@ -3671,11 +3687,15 @@ class ClaudeRunner:
                     with atomic(self.conn):
                         audit(self.conn, "run.done_merged", run=run.code, merged=len(names))
                     return self._must_get(run.code)
-                if unpushed := await self.workspace.local_commits(p):  # PER-271
-                    raise RunnerError(
-                        f"{COULDNT_PUSH}{_plural(unpushed, 'commit')} saved on {p.branch} "
-                        f"(/runs {run.code})"
-                    )
+                # PER-271: commits of its own (PER-355: not a PR's it checked out) it didn't
+                # push; git's reason when its push was refused
+                if unpushed := await self.workspace.local_commits(p):
+                    saved = f"{_plural(unpushed, 'commit')} saved on {p.branch} (/runs {run.code})"
+                    watch = self._pushes.get(run.code)
+                    if watch is not None and watch.refused:
+                        why = _clip(clean_external(w.redactor.text(watch.refused)), PUSH_WHY_MAX)
+                        saved = f"{why}; {saved}"
+                    raise RunnerError(f"{COULDNT_PUSH}{saved}")
                 raise NoChanges("the session pushed nothing")
             raise RunnerError(
                 f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
@@ -4149,6 +4169,7 @@ class ClaudeRunner:
         reply (once), and tell the loop how the task ended. ``watching`` and ``note`` are
         the auto-merge's (it will merge once CI is green; why it won't)."""
         self._forks.pop(run.code, None)
+        self._pushes.pop(run.code, None)
         await self._announced(run.code)  # PER-341: the start line comes first
         await self._end_milestones(run.code)
         if run.status == "cancelled":
