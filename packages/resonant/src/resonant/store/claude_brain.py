@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any, cast
 
+from resonant.gate.shell import grant_form
 from resonant.store.db import atomic, iso, kv_get, kv_set
 
 SESSION_KV = "brain.claude_session"
@@ -58,9 +59,11 @@ COUNT_WINDOW = 1000
 
 
 def grant_key(args: Mapping[str, Any]) -> str:
-    """What a grant matches: the tool, the exact command (or path and edit digest) and the
-    directory. Never the display fields."""
-    keep = {k: args.get(k) for k in ("tool", "command", "cwd", "digest")}
+    """What a grant matches: the action that runs (``gate.shell.grant_form``: the tool, the
+    command and the directory it runs in, or a file's path and edit digest), so the approved
+    turn re-issuing it after an earlier ``cd`` moved the shell, or with or without a leading
+    ``cd <dir> &&``, still spends it (PER-353). Never the display fields."""
+    keep = grant_form(args)
     return hashlib.sha256(json.dumps(keep, sort_keys=True).encode()).hexdigest()
 
 

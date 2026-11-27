@@ -1,6 +1,6 @@
 # github extension
 
-GitHub for Resonant: your open pull requests with CI and review state, any PR's diff, reviews and comments (an org's, anyone's), a quiet watch that feeds Resonant's hourly progress rollup (merges, PRs that went quiet, review requests), a morning summary that appears in the briefing's Updates section, and three approved writes: re-run failed CI, merge, and comment. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
+GitHub for Resonant: your open pull requests with CI and review state, any PR's diff, reviews and comments (an org's, anyone's), a quiet watch that feeds Resonant's hourly progress rollup (merges, PRs that went quiet, review requests), a morning summary that appears in the briefing's Updates section, and four approved writes: re-run failed CI, merge, comment, and close. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
 
 | Name | Kind | Level | What it does |
 |---|---|---|---|
@@ -13,6 +13,7 @@ GitHub for Resonant: your open pull requests with CI and review state, any PR's 
 | `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
 | `merge_pr_anyway {repo, number, head_sha}` | tool | L2, commit | `merge_pr` when a person said to merge it anyway: failing or running checks don't stop it, and the result's `warning` names them. Every other rule holds, and a *required* check (branch protection) still refuses it. |
 | `comment_pr {repo, number, body}` | tool | L3 | Posts `body` (at most 1000 characters, Resonant's cap on an arg) as a conversation comment on the PR; the number is checked to be a PR first. Acts, then reports; an approval prompt shows the whole body (PER-336). |
+| `close_pr {repo, number, comment}` | tool | L2, commit | Closes the PR without merging it (a duplicate, abandoned work), then posts `comment` (at most 1000 characters; blank posts none) on its conversation. It must be an open PR; the close goes first, so a failed run changed nothing, and a comment that fails after the close is the result's `warning`. Runs when you ask for it; otherwise asks a plain yes showing the whole comment. With `gate.tainted_writes: allow` an approver's close runs like `merge_pr` does, so nobody closes PRs through the brain's shell (PER-353). |
 | `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed`, `review_requested`, `pr_active`, `pr_merged` and `pr_closed` events. None of them texts on its own (GH-2): the hourly rollup reads them. |
 | `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. When all three counts are 0 it is reported `quiet` (BF-1), so the briefing leaves it out instead of saying `0 open PRs, 0 failing CI, 0 awaiting your review`. Needs the manifest's `report: {max_urgency: low}` grant. |
 | health | every 30 min | | `gh api user` succeeds (with an App token: `gh api installation/repositories`). |
@@ -22,10 +23,10 @@ GitHub for Resonant: your open pull requests with CI and review state, any PR's 
 A **fine-grained personal access token**, read-only, limited to the repos you want watched:
 - Repository permissions: Metadata, Contents, Pull requests, Checks and Actions, all **read**.
 
-The two write tools need more, and **only** they do. Leave the token read-only if you don't want them: they then fail cleanly (`Couldn't merge PR #12 in owner/repo: the github token needs … access (see the github extension README). Nothing changed.`) and everything else keeps working. To enable them, edit the token and add:
+The write tools need more, and **only** they do. Leave the token read-only if you don't want them: they then fail cleanly (`Couldn't merge PR #12 in owner/repo: the github token needs … access (see the github extension README). Nothing changed.`) and everything else keeps working. To enable them, edit the token and add:
 - `rerun_failed`: Actions **read and write**.
 - `merge_pr`, `merge_pr_anyway`: Contents **read and write**, Pull requests **read and write**, Actions **read** (the check rollup reads workflow runs).
-- `comment_pr`: Pull requests **read and write**.
+- `comment_pr`, `close_pr`: Pull requests **read and write**.
 
 Fine-grained tokens can't read check runs (the `ci` state then reads `none` or misses checks), and they only see the repos and orgs they were granted. For an org's repos, prefer the GitHub App below.
 
@@ -84,6 +85,8 @@ Cancelled, skipped and in-progress runs are ignored. A re-run keeps its run id, 
 ## The writes
 
 `rerun_failed` looks at the PR's current head commit and, per workflow, at its latest run on that commit. Each failed one (failure, timed out, startup failure) gets `gh run rerun <id> --failed`. A workflow that's queued or running, including one already re-running, is left alone. If there's nothing to re-run it fails with `nothing to rerun on resonant#40 (a1b2c3d): …` and changes nothing.
+
+`close_pr` reads the PR first and refuses, changing nothing, when the number isn't a PR or the PR is already merged or closed. It then runs `gh pr close <n> --repo <repo>` (never `--delete-branch`) and posts the comment through the same REST call as `comment_pr`. After updating to this version, run `resonant ext update github` so the installed copy offers it.
 
 `merge_pr` takes the head SHA you're approving (the `pr` tool shows it), so the approval binds to that exact commit. It refuses, changing nothing, when:
 - the PR's head is no longer that SHA (new commits since you approved),

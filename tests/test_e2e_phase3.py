@@ -497,7 +497,7 @@ async def test_e3_show_my_prs_reaches_github_through_claudes_tools(
         }
         assert offered == {
             "merge_pr", "merge_pr_anyway", "pr", "prs", "recent_prs", "rerun_failed", "pr_diff",
-            "pr_comments", "comment_pr",
+            "pr_comments", "comment_pr", "close_pr",
         }  # fmt: skip
 
 
@@ -667,7 +667,7 @@ async def test_e2_e14_github_commands_over_imessage(
         lines = listing.splitlines()
         assert lines[0] == "Extensions (1):"
         assert lines[1].startswith("github · enabled · a1b2c3d4 digest ")
-        assert " · 9 tools" in lines[1]
+        assert " · 10 tools" in lines[1]
         assert lines[2].startswith("- digest (L0) · next ")
         assert lines[3].startswith("- watch (L0) · next ")
         assert lines[4] == "core · built in"  # core jobs too, next due from config

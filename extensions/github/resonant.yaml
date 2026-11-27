@@ -1,4 +1,5 @@
-# github: pull requests' CI, reviews and diffs, plus three approved writes (rerun, merge, comment).
+# github: pull requests' CI, reviews and diffs, plus four approved writes (rerun, merge, comment,
+# close).
 # Stdlib Python plus the gh CLI. The token (resonant secret set github/token, or minted per call by
 # the instance's GitHub App: extensions.secret_sources, PER-336) reaches this extension on fd 4 and
 # gh through a private 0600 hosts.yml in a GH_CONFIG_DIR; it is never in any env or argv. A
@@ -107,6 +108,20 @@ tools:
     args: {repo: string, number: integer, body: string}
     secrets: [token]
     github_app: {repo: repo, permissions: {pull_requests: write}}
+    timeout_s: 60
+  close_pr:
+    description: >-
+      Close a pull request without merging it (a duplicate, abandoned work), posting comment
+      on its conversation (say why; an empty comment posts none).
+    run: python3 cli.py close_pr --repo {repo} --number {number} --comment={comment}
+    effect: write
+    level: L2                          # runs when you ask for it; otherwise asks a plain yes
+    commit: true
+    approval_summary: "close PR #{number} in {repo}"
+    approval_detail: comment
+    args: {repo: string, number: integer, comment: string}
+    secrets: [token]
+    github_app: {repo: repo, permissions: {pull_requests: write}}   # comment_pr's reach
     timeout_s: 60
 
 jobs:
