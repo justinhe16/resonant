@@ -31,6 +31,14 @@ WaitReason = Literal["usage_reset", "question"]
 
 ACTIVE: tuple[Status, ...] = ("queued", "running", "waiting")
 
+# PER-354: a run's follow-up (``start_run``'s ``follow_up``), at most this long, and how deep a
+# chain of follow-ups goes: a run a person started is depth 0; a follow-up ask carries its run's
+# depth + 1 (``checkpoint.follow_up_depth``) and a run that ask starts or continues gets it. A
+# run at FOLLOW_UP_DEPTH_MAX queues no ask when it ends, and start_run refuses a follow-up there.
+FOLLOW_UP_MAX = 500
+FOLLOW_UP_DEPTH_MAX = 3
+FOLLOW_UP_DEPTH_KEY = "follow_up_depth"
+
 _COLUMNS = frozenset(
     {
         "task_id", "status", "step", "branch", "base_branch", "base_sha", "head_sha",
@@ -38,7 +46,7 @@ _COLUMNS = frozenset(
         "wait_seconds", "waiting_since", "cost_usd", "tokens_in", "tokens_out", "exit_code",
         "pr_number", "pr_url", "files_changed", "flagged_paths", "summary", "failure",
         "started_at", "ended_at", "workspace", "checkout", "wait_reason", "last_note",
-        "resume_prompt", "remote_url", "max_seconds",
+        "resume_prompt", "remote_url", "max_seconds", "follow_up_depth",
     }
 )  # fmt: skip
 
@@ -92,6 +100,10 @@ class Run:
     # questions, trust checks and outcome go to that thread, addressed to the requester.
     channel_ref: dict[str, Any] | None = None
     requested_by: str | None = None
+    # PER-354 (migration 038): what to do when the run ends (one brain ask in its current
+    # thread, as its current requester) and how deep in a follow-up chain it was started.
+    follow_up: str | None = None
+    follow_up_depth: int = 0
 
     @property
     def requester(self) -> str:
@@ -168,6 +180,8 @@ def _row(r: sqlite3.Row) -> Run:
         remote_url=r["remote_url"] if "remote_url" in r.keys() else None,  # noqa: SIM118
         channel_ref=_ref(r["channel_ref"]) if "channel_ref" in r.keys() else None,  # noqa: SIM118
         requested_by=r["requested_by"] if "requested_by" in r.keys() else None,  # noqa: SIM118
+        follow_up=r["follow_up"] if "follow_up" in r.keys() else None,  # noqa: SIM118
+        follow_up_depth=r["follow_up_depth"] if "follow_up_depth" in r.keys() else 0,  # noqa: SIM118
     )
 
 
@@ -192,9 +206,12 @@ def create(
     max_budget_usd: float | None = None,
     channel_ref: Mapping[str, Any] | None = None,
     requested_by: str | None = None,
+    follow_up: str | None = None,
+    follow_up_depth: int = 0,
 ) -> Run:
     """Insert a queued run and give it the next code. Never reuses a code. ``channel_ref``
-    and ``requested_by`` (PER-294): the thread it was asked in and who asked."""
+    and ``requested_by`` (PER-294): the thread it was asked in and who asked. ``follow_up``
+    and ``follow_up_depth`` (PER-354): what to do when it ends, and its depth in a chain."""
     ts = now_iso()
     with atomic(conn):
         row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'runs'").fetchone()
@@ -209,6 +226,11 @@ def create(
             cols["channel_ref"] = json.dumps(dict(channel_ref))
         if requested_by is not None:
             cols["requested_by"] = requested_by
+        # migration 038's likewise
+        if follow_up is not None:
+            cols["follow_up"] = follow_up
+        if follow_up_depth:
+            cols["follow_up_depth"] = follow_up_depth
         names, marks = ", ".join(cols), ", ".join("?" * len(cols))
         conn.execute(
             f"INSERT INTO runs ({names}) VALUES ({marks})",  # noqa: S608 - fixed column names
@@ -217,6 +239,41 @@ def create(
     run = get(conn, f"R{seq}")
     assert run is not None
     return run
+
+
+def chain_depth(checkpoint: Mapping[str, Any] | None) -> int:
+    """PER-354: the follow-up depth a task's checkpoint carries (0: not a follow-up ask)."""
+    depth = None if checkpoint is None else checkpoint.get(FOLLOW_UP_DEPTH_KEY)
+    return depth if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0 else 0
+
+
+FOLLOW_UP_ASK_SHOWN = 80  # the run's ask in the follow-up prompt
+FOLLOW_UP_END_SHOWN = 600  # its summary or failure
+
+
+def _flat(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def follow_up_prompt(run: Run) -> str:
+    """PER-354: the follow-up ask's message, code-built: ``R5 (<ask>) ended: <how>. You asked
+    yourself to do this when it ended: <follow_up>``. ``how`` is the status, the PR and the
+    run's summary or failure (Claude's words: outside data; the ask is tainted)."""
+    pr = f" PR #{run.pr_number}{f' {run.pr_url}' if run.pr_url else ''}" if run.pr_number else ""
+    how = {
+        "ready": f"ready for review,{pr}" if pr else "ready",
+        "merged": f"merged,{pr}" if pr else "merged",
+        "no_changes": "with no changes",
+        "failed": "failed",
+        "done": "done",
+    }.get(run.status, run.status.replace("_", " "))
+    end = run.failure if run.status == "failed" else run.summary
+    detail = f" ({_flat(end, FOLLOW_UP_END_SHOWN)})" if end and end.strip() else ""
+    return (
+        f"{run.code} ({_flat(run.ask, FOLLOW_UP_ASK_SHOWN)}) ended: {how}{detail}. "
+        f"You asked yourself to do this when it ended: {run.follow_up or ''}"
+    )
 
 
 def get(conn: sqlite3.Connection, code: str) -> Run | None:

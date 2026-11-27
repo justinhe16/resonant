@@ -539,6 +539,24 @@ async def test_two_runs_started_in_one_turn_are_one_post(
         assert passed(c) == 1
 
 
+async def test_a_run_with_a_follow_up_is_still_in_the_one_runs_line(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-354's ``follow_up`` on ``start_run`` doesn't change who says the run started: the
+    reply's one line, no start line of its own."""
+    reply = "Started a review run; I'll merge it if the review is clean."
+    call = surf("DORI-1174")
+    call["args"]["follow_up"] = "Merge the PR if the review says LGTM."
+    async with cori(tmp_path, resonant_home, chat, monkeypatch) as c:
+        c.claude(calls=[call], answer=reply)
+        said = await c.ask(ALICE, "review and merge it", thread(43),
+                           lambda s: any(t.startswith(reply) for t in s), "the reply")  # fmt: skip
+        (run,) = c.runs()
+        assert said[0] == f"{reply}\nStarted R1 ({run.repo})."
+        assert run.follow_up == "Merge the PR if the review says LGTM."
+        assert start_lines(said) == []
+
+
 @pytest.mark.parametrize("slow", [False, True])
 async def test_the_ack_is_sent_only_when_the_reply_is_slow(
     tmp_path: Path,

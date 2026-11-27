@@ -201,6 +201,7 @@ from resonant.store.audit import audit
 from resonant.store.claude_brain import add_grant
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.store.outbound import ACK_KEY, CLAUDE_KEY
+from resonant.store.runs import FOLLOW_UP_DEPTH_KEY, chain_depth
 from resonant.store.tasks import get_task
 from resonant.toolcore import CallScope, PinnedCall, batch_items
 from resonant.tools.files import ReadScope, default_roots, resonant_secrets
@@ -253,7 +254,9 @@ class _Convo:
         return SINCE_KV if self.plain(owner) else f"{SINCE_KV}:{self.key}"
 
 
-FOLLOW_UP_KEY = "watch_follow_up"  # PER-346: a fired watch's follow-up ask (its notice key)
+# PER-346: a fired watch's follow-up ask (its notice key, ``watch/<id>/<n>``); PER-354: an ended
+# run's too (``run/<code>/<ended_at>``), with its chain depth under FOLLOW_UP_DEPTH_KEY
+FOLLOW_UP_KEY = "watch_follow_up"
 DEFER_S = 5.0  # a busy ask (concurrency) looks again this soon
 # PER-256: a session turn that ended like this, with nothing changed and nothing asked, means
 # Claude is down: the owner hears so once and the turn is tried again.
@@ -393,7 +396,11 @@ TOOL_NOTES = (
     "as it's done. For cancel_run, continue_run and merge_run pass the run code (like R3) "
     "from the message; continue_run is 'continue R12' for a run the time or disk limit "
     "stopped; "
-    "if you can't tell which run is meant, call list_runs and ask which. answer_worker "
+    "if you can't tell which run is meant, call list_runs and ask which. When you promise a "
+    "later step ('I'll merge it if the review says LGTM', 'I'll post here when it's done'), "
+    "attach it: start_run's follow_up when a run is involved (you get one turn in this "
+    "thread when it ends), else create_watch with then: follow_up. Don't promise without "
+    "one. answer_worker "
     "answers a run's question, message_worker is 'tell R4 to ...', run_activity is 'what's R4 "
     "doing'. Repos: list_repos, add_repo, forget_repo, create_repo (private unless the owner "
     "says public), add_ci, merge_ci_pr. Trust rules: `scope` is a system, repo or area "
@@ -1147,6 +1154,7 @@ class AskRunner:
         ack: str | None = None,
         continues: dict[str, Any] | None = None,
         follow_up: str | None = None,
+        follow_up_depth: int | None = None,
     ) -> Queued | AskRefused:
         """Queue an ask for ``principal`` (who gets the answer). Refused, with a code-built
         reason, when ask_claude is off, paused, at its usage limit or daily cap, or an
@@ -1163,7 +1171,11 @@ class AskRunner:
         ``checkpoint.continuation``); its message may be longer and it never waits on
         ``queue_max``: it carries on a turn that was already counted. ``follow_up`` (PER-346,
         code only): a fired watch's follow-up turn, kept as ``checkpoint.watch_follow_up``
-        (the watch's notice key), so a retried fire finds the ask it already queued."""
+        (the watch's notice key), so a retried fire finds the ask it already queued; PER-354: an
+        ended run's (``run/<code>/<ended_at>``), with ``follow_up_depth`` (kept as
+        ``checkpoint.follow_up_depth``, also on a follow-up ask's approval continuation): a run
+        this turn starts or continues gets that depth, which bounds the chain
+        (``store.runs.FOLLOW_UP_DEPTH_MAX``)."""
         if not self.cfg.enabled:
             return AskRefused("ask_claude is off (brain.ask_claude.enabled).", "off")
         question = question.strip()
@@ -1223,6 +1235,8 @@ class AskRunner:
             cp["continuation"] = continues
         if follow_up is not None:
             cp[FOLLOW_UP_KEY] = follow_up
+        if follow_up_depth:  # a follow-up ask, or a turn that carries one on (a continuation)
+            cp[FOLLOW_UP_DEPTH_KEY] = follow_up_depth
         task_id = self._create_task(
             NewTask(
                 kind=TASK_KIND,
@@ -1859,7 +1873,8 @@ class AskRunner:
         before = source.origin_event_id if source is not None else None
         # PER-294: the conversation this turn is in: the asking task's thread, else its
         # principal's own (the owner's, with no threads: exactly as before).
-        # PER-346: a watch's follow-up has no asking task: the turn's own thread.
+        # PER-346: a watch's follow-up has no asking task: the turn's own thread (PER-354: an
+        # ended run's follow-up too).
         follow = source is None and cp.get(FOLLOW_UP_KEY) is not None
         convo = _Convo.of(task if follow else source, self.owner)
         owner = convo.principal
@@ -2699,6 +2714,8 @@ class AskRunner:
             tainted=tainted,
             taint_hops=hops,
             continues=continues,
+            # PER-354: a follow-up ask's continuation keeps its depth (the chain stays bounded)
+            follow_up_depth=chain_depth(cp) or None,
         )
 
     @staticmethod
