@@ -1292,14 +1292,16 @@ class AskRunner:
         job.add_done_callback(self._acks.discard)
 
     def _has_answer(self, task_id: str) -> bool:
-        """The task has answered (or ended): its checkpoint holds the reply."""
+        """The task has answered (or ended): its checkpoint holds the reply. Or its turn
+        asked for a change (``batch``, PER-264): the approval prompt is coming, and an ack
+        just before it would only be noise."""
         try:
             task = get_task(self.conn, task_id)
         except sqlite3.Error:
             return False
         return task is None or isinstance(task.checkpoint.get("reply"), str) or task.status in (
             "done", "failed", "cancelled",
-        )  # fmt: skip
+        ) or bool(task.checkpoint.get("batch"))  # fmt: skip
 
     def _capped(self) -> AskRefused | None:
         """The daily cap (``daily_cap``, 0: none) and the runaway guard

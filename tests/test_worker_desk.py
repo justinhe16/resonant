@@ -31,10 +31,19 @@ from resonant.runners.worker_cli import (
     EXIT_OK,
     EXIT_PENDING,
     EXIT_USAGE,
+    Ask,
+    AskDone,
     Reply,
     ToolRequest,
+    parse_request,
 )
-from resonant.runners.worker_desk import REQUEST_RESTARTED, REQUEST_TIMEOUT, WorkerDesk
+from resonant.runners.worker_desk import (
+    ANSWERED_IN_APP,
+    REQUEST_RESTARTED,
+    REQUEST_TIMEOUT,
+    RelayRefused,
+    WorkerDesk,
+)
 from resonant.runners.worker_requests import WorkerRequests
 from resonant.store import approvals as ap
 from resonant.store import questions as qs
@@ -494,3 +503,34 @@ async def test_a_restart_after_the_approval_says_it_may_have_run(db: sqlite3.Con
     assert q.status == "timed_out" and q.answer is not None and "it may have run" in q.answer
     h.executor.release.set()
     await h.desk.aclose()
+
+
+# --- resonant ask --done (PER-264) -----------------------------------------------------------
+
+
+async def test_ask_done_closes_a_question_answered_in_the_claude_app(
+    db: sqlite3.Connection,
+) -> None:
+    h = Harness(db, block_s=5.0)
+    code = h.run("bob")
+    gone: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    asking = asyncio.ensure_future(h.desk.handle(code, Ask("Which DB?"), gone))
+    for _ in range(300):
+        if qs.open_for_run(db, code, "ask"):
+            break
+        await asyncio.sleep(0.01)
+    asked = len(h.channel.sent)
+    done = await h.desk.handle(code, parse_request({"cmd": "ask_done"}), gone)
+    assert done is not None and (done.text, done.exit) == (
+        "Closed your open question: Resonant stopped waiting for a text.", EXIT_OK
+    )  # fmt: skip
+    (q,) = qs.for_run(db, code)
+    assert (q.status, q.answer) == ("answered", ANSWERED_IN_APP)
+    assert q.delivered_at is not None and not h.desk.has_deliveries(code)  # nothing to resume
+    released = await asyncio.wait_for(asking, 2)  # the blocked CLI call is let go
+    assert released is not None and released.exit == EXIT_OK
+    assert len(h.channel.sent) == asked  # nothing texted
+    with pytest.raises(RelayRefused, match="no open question"):
+        h.desk.answer_question(code, "pg")  # a late text finds nothing open
+    again = await h.desk.handle(code, AskDone(), gone)
+    assert again is not None and again.text == "No open question to close."

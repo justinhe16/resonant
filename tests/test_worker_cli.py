@@ -25,6 +25,7 @@ from resonant.runners.claude import Refused
 from resonant.runners.worker_cli import (
     EXIT_UNREACHABLE,
     Ask,
+    AskDone,
     Reply,
     Request,
     ToolRequest,
@@ -153,6 +154,11 @@ async def test_an_unanswered_question_times_out(tmp_path: Path, db: sqlite3.Conn
     [q] = qs.for_run(db, code)
     assert q.status == "timed_out" and q.delivered_at is not None
     assert h.argv_log(code)[1]["prompt"].startswith(f'Your question "Which DB?": {ASK_TIMEOUT}')
+    # PER-264: the requester hears it timed out (once), in the run's thread
+    await until(lambda: any("got no answer in time" in t for _p, t in h.chan.sent))
+    timed = [t for _p, t in h.chan.sent if "got no answer in time" in t]
+    assert timed == [f"{code}'s question got no answer in time; it carries on without one: "
+                     "Which DB?"]  # fmt: skip
 
 
 async def test_a_repeated_ask_joins_the_open_one(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -394,6 +400,36 @@ async def test_the_shims_request_lists_tools_and_sends_key_values(tmp_path: Path
                                 "hotfix")]  # fmt: skip
     none_here = worker_cli.shim_text(ctl, 5.0, sys.executable)
     assert "REQUESTABLE = []" in none_here
+
+
+async def test_the_shims_ask_done_sends_ask_done(tmp_path: Path) -> None:
+    """PER-264: ``resonant ask --done`` reaches the socket as ``AskDone``; a bare ``ask`` is a
+    usage error."""
+    ctl = worker_cli.make_ctl_dir(tmp_path / "w", "R1")
+    token = worker_cli.write_token(ctl)
+    shim = worker_cli.write_shim(tmp_path / "bin", ctl, 5.0, sys.executable)
+
+    def run(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=30)
+
+    bare = await asyncio.to_thread(run, "ask")
+    assert bare.returncode == 2 and "ask --done" in bare.stdout
+    both = await asyncio.to_thread(run, "ask", "Which DB?", "--done")
+    assert both.returncode == 2 and "takes no question" in both.stdout
+    seen: list[Request] = []
+
+    async def handle(req: Request, gone: asyncio.Future[None]) -> Reply:
+        seen.append(req)
+        return Reply("No open question to close.", 0)
+
+    server = WorkerServer(ctl, token, handle, lambda pid: True)
+    await server.start()
+    try:
+        done = await asyncio.to_thread(run, "ask", "--done")
+    finally:
+        await server.close()
+    assert (done.returncode, done.stdout.strip()) == (0, "No open question to close.")
+    assert seen == [AskDone()]
 
 
 def test_descends_from_needs_the_same_leader() -> None:

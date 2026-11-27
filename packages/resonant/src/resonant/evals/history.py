@@ -89,7 +89,7 @@ RUN_TOOLS = frozenset(
     {"list_runs", "run_activity", "read_transcript", "merge_run", "cancel_run",
      "message_worker", "answer_worker", "projects", "open_items", "start_run", "continue_run"}
 )  # fmt: skip
-NOTE_TOOLS = frozenset({"list_notes", "add_note", "delete_note", "clear_notes"})
+NOTE_TOOLS = frozenset({"list_notes", "add_note", "delete_note", "clear_notes", "undo_note"})
 REMINDER_TOOLS = frozenset({"list_reminders", "add_reminder", "cancel_reminder"})
 FACT_TOOLS = frozenset({"list_facts", "remember", "forget"})
 FILE_TOOLS = frozenset(

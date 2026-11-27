@@ -11,7 +11,6 @@ examples:
   - what's on my Linear
   - make a Linear ticket for the flaky login test
   - add a comment on ENG-123 saying it's fixed
-approvers: [owner]
 secrets: [token]
 
 mcp:

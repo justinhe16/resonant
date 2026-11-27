@@ -21,7 +21,8 @@ Events and their defaults (``trust.notify_level``, EM-4):
   (``extensions/rollup.py``) lists the run under ``Still working on`` when something else
   does. A new ``did:`` side effect is still news. ``urgent`` (``resonant note --urgent``):
   now, at most ``NOTE_TEXTS_PER_HOUR`` texts per run an hour (the rest only update the
-  digest line).
+  digest line). The count is kept in kv (``run.note_texts:<code>``, PER-264), so a restart
+  doesn't reset it; the run's end drops it.
 - ``restart`` and ``update`` (GD-1: a worker's ``resonant restart``/``update`` that went
   through): now, with ``R4 restarted Resonant (abc1234)``; a ``notify_digest`` rule (on
   ``restart``/``update``, scope ``resonant`` or the run's repo) lowers them. Matched with
@@ -75,7 +76,6 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -105,6 +105,7 @@ TITLE_PART_MAX = 120
 NOTE_IN_TITLE = 80  # the running line stays under the store's 200-character title
 SCRATCH_SYSTEM = "scratch"
 _REPORT_KEY = "run.report:"  # kv: a run's report preference, set at start
+_NOTE_TEXTS_KEY = "run.note_texts:"  # kv: when the run's immediate texts went, this hour
 _DID_KEY = "run.did:"  # kv: a run's side effects, oldest first
 _SEEN_KEY = "run.seen:"  # kv: side effects detected in a run's commands (TR-1), oldest first
 DETECTED_KEEP = 20
@@ -434,6 +435,18 @@ def end_title(
             return f"{run.code} finished · {_part(run.repo) or 'no repo'}"
 
 
+def _times(raw: object) -> list[datetime]:
+    """The stored send times (a malformed entry is skipped: it never blocks a text)."""
+    out: list[datetime] = []
+    for v in cast(list[object], raw) if isinstance(raw, list) else []:
+        if isinstance(v, str):
+            try:
+                out.append(datetime.fromisoformat(v))
+            except ValueError:
+                continue
+    return out
+
+
 class WorkerReports:
     """The reporting side of :class:`~resonant.runners.claude.ClaudeRunner` (see the module
     docstring). ``notify_level`` is ``trust.notify_level`` (a seam for tests)."""
@@ -450,7 +463,6 @@ class WorkerReports:
         self.clock = clock
         self.tz = tz
         self._notify_level = notify_level
-        self._note_texts: dict[str, deque[datetime]] = {}
 
     # -- preference and policy --
 
@@ -564,14 +576,13 @@ class WorkerReports:
     def _take_text(self, code: str) -> bool:
         """One of the run's ``NOTE_TEXTS_PER_HOUR`` immediate texts, or False (audited)."""
         now = self.clock()
-        sent = self._note_texts.setdefault(code, deque())
-        while sent and now - sent[0] >= timedelta(hours=1):
-            sent.popleft()
-        if len(sent) >= NOTE_TEXTS_PER_HOUR:
-            with atomic(self.conn):
+        key = _NOTE_TEXTS_KEY + code
+        with atomic(self.conn):
+            sent = [t for t in _times(kv_get(self.conn, key)) if now - t < timedelta(hours=1)]
+            if len(sent) >= NOTE_TEXTS_PER_HOUR:
                 audit(self.conn, "run.note_held", run=code, reason="capped")
-            return False
-        sent.append(now)
+                return False
+            kv_set(self.conn, key, [t.isoformat() for t in (*sent, now)])
         return True
 
     def also_line(self, run: Run, *, skip: Sequence[str] = ()) -> str | None:
@@ -593,7 +604,8 @@ class WorkerReports:
 
     def forget(self, code: str) -> None:
         """The run ended: drop its note counter."""
-        self._note_texts.pop(code, None)
+        with atomic(self.conn):
+            self.conn.execute("DELETE FROM kv WHERE key = ?", (_NOTE_TEXTS_KEY + code,))
 
     def audit_report(self, run: Run, event: str, level: Level) -> None:
         with atomic(self.conn):

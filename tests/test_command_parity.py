@@ -30,6 +30,7 @@ CHAT_WRITES = {
     "add_note",
     "clear_notes",
     "delete_note",
+    "undo_note",  # PER-264: restores the last note delete (L3, the owner's own store)
     "add_reminder",
     "cancel_reminder",
     "restart_ollama",

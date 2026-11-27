@@ -219,6 +219,7 @@ REAL_WRITES: frozenset[str] = frozenset(
         "add_note",
         "delete_note",
         "clear_notes",
+        "undo_note",
         "add_reminder",
         "cancel_reminder",
         "remember",
@@ -900,7 +901,6 @@ name: github
 version: 1
 description: Your GitHub pull requests; open PRs, CI failures and fixes, review requests.
 examples: ["any of my PRs failing CI?", "show PR 40 in justinhe16/resonant"]
-approvers: [owner]
 tools:
   prs:
     description: >-
@@ -947,7 +947,6 @@ description: >-
   Your Linear issues, projects and teams; what's assigned to you, search, new tickets,
   updates and comments.
 examples: ["what's on my linear", "make a linear ticket for the login bug"]
-approvers: [owner]
 mcp:
   servers:
     linear:
@@ -998,7 +997,6 @@ name: trade-jev
 version: 1
 description: The trade-jev trading bot on the Mini; start it, stop it, see its status.
 examples: ["start trade-jev", "is trade-jev running?"]
-approvers: [owner]
 tools:
   trade_jev_status:
     description: Whether trade-jev is running, since when, and its last log line.

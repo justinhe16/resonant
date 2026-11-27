@@ -69,6 +69,7 @@ def test_specs_and_levels() -> None:
         "add_note": (Effect.WRITE, Level.L3),
         "delete_note": (Effect.WRITE, Level.L3),
         "clear_notes": (Effect.WRITE, Level.L1),
+        "undo_note": (Effect.WRITE, Level.L3),
     }
     assert all(s.extension is None and not s.secrets for s in notes.SPECS)
     assert all(s in builtin.BUILTIN_SPECS for s in notes.SPECS)
@@ -181,6 +182,77 @@ async def test_clear_soft_deletes_all(
     assert (await call(handlers, "clear_notes"))["cleared"] == 0
     with pytest.raises(ToolFailed):
         await handlers["clear_notes"]({"all": True})
+
+
+# --- undo (PER-264) ---------------------------------------------------------------------
+
+
+async def test_undo_restores_the_last_unnote(
+    db: sqlite3.Connection, handlers: dict[str, ToolHandler]
+) -> None:
+    for t in ("a", "b"):
+        await call(handlers, "add_note", text=t)
+    await call(handlers, "delete_note", id=2)
+    out = await call(handlers, "undo_note")
+    assert out == {"restored": 1, "ids": [2], "what": "unnote"}
+    listed = await call(handlers, "list_notes")
+    assert [n["id"] for n in listed["notes"]] == [2, 1]
+    assert all(r["deleted_at"] is None for r in rows(db))
+
+
+async def test_undo_restores_a_clear_but_not_an_earlier_delete(
+    db: sqlite3.Connection, handlers: dict[str, ToolHandler]
+) -> None:
+    for t in ("a", "b", "c"):
+        await call(handlers, "add_note", text=t)
+    await call(handlers, "delete_note", id=1)
+    await call(handlers, "clear_notes")
+    out = await call(handlers, "undo_note")
+    assert out["restored"] == 2 and sorted(out["ids"]) == [2, 3] and out["what"] == "clear"
+    assert [n["id"] for n in (await call(handlers, "list_notes"))["notes"]] == [3, 2]
+    assert rows(db)[0]["deleted_at"] is not None  # note 1's own delete stands
+
+
+async def test_undo_refuses_to_undo_an_undo(handlers: dict[str, ToolHandler]) -> None:
+    await call(handlers, "add_note", text="a")
+    await call(handlers, "delete_note", id=1)
+    await call(handlers, "undo_note")
+    with pytest.raises(ToolFailed, match="an undo can't be undone"):
+        await call(handlers, "undo_note")
+    assert (await call(handlers, "list_notes"))["total"] == 1  # still restored
+    await call(handlers, "delete_note", id=1)  # a new delete is undoable again
+    assert (await call(handlers, "undo_note"))["restored"] == 1
+
+
+async def test_undo_with_nothing_to_undo(handlers: dict[str, ToolHandler]) -> None:
+    with pytest.raises(ToolFailed, match="no note delete to undo"):
+        await call(handlers, "undo_note")
+    await call(handlers, "add_note", text="a")
+    await call(handlers, "delete_note", id=1)
+    await call(handlers, "clear_notes")  # cleared nothing: the delete is still the last one
+    assert (await call(handlers, "undo_note"))["ids"] == [1]
+    with pytest.raises(ToolFailed):
+        await handlers["undo_note"]({"x": 1})
+
+
+async def test_undo_skips_a_note_deleted_again_since(
+    db: sqlite3.Connection, handlers: dict[str, ToolHandler]
+) -> None:
+    await call(handlers, "add_note", text="a")
+    await call(handlers, "delete_note", id=1)
+    later = "2999-01-01T00:00:00.000+00:00"
+    db.execute(
+        "UPDATE memory SET value = json_set(value, '$.deleted_at', ?) WHERE key = '1'", (later,)
+    )
+    assert (await call(handlers, "undo_note"))["restored"] == 0
+    assert rows(db)[0]["deleted_at"] == later
+
+
+def test_undo_report_line() -> None:
+    from resonant.toolcore.reports import REPORTS
+
+    assert REPORTS["undo_note"]({"restored": 2}) == "Restored 2 notes."
+    assert REPORTS["undo_note"]({"restored": 1}) == "Restored 1 note."
 
 
 async def test_other_memory_scopes_untouched(

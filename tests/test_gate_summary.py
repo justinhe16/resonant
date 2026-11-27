@@ -201,6 +201,7 @@ BUILTIN_PROMPTS = {
     ),
     "add_note": ({"text": "buy milk"}, 'OK to add a note: "buy milk"? [X6] yes / no'),
     "delete_note": ({"id": 3}, "OK to delete note 3? [X6] yes / no"),
+    "undo_note": (dict[str, int](), "OK to undo the last note delete? [X6] yes / no"),
     "add_reminder": (
         {"at": "2026-10-21T09:00:00-07:00", "text": "call mom"},
         'OK to remind you at 2026-10-21T09:00:00-07:00: "call mom"? [X6] yes / no',

@@ -50,7 +50,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `description` | string, ≤ 120 chars, optional | One line saying what the extension is for. The install screen shows it (since PER-256 no model routes by it). |
 | `examples` | ≤ 3 lines of ≤ 80 chars, optional | Example requests; shown to humans only (PER-256 deleted the router few-shots). |
 | `uses` | slug, optional | A first-party extension this one configures. It allows exactly one extra block with that name. |
-| `approvers` | list of principals | Who may approve this extension's actions when the gate asks (L1, inferred L2, or anything above L0 under the kill switch). Each must hold the `approve` grant for this extension in `principals.yaml`. |
+| `approvers` | list of principals | Members who may also approve this extension's actions when the gate asks (L1, inferred L2, or anything above L0 under the kill switch). Each must hold the `approve` grant for this extension in `principals.yaml`. The owner (and any `approver` role) is implied: don't list it. |
 | `jobs` | list | Scheduled commands, described in §6. |
 | `tools` | map | Command-backed tools, described in §4. |
 | `mcp` | `{servers: {<id>: …}}`, optional | MCP servers (local over stdio, or remote over https) and the typed list of tools each may expose, described in §4. |

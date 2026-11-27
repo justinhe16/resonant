@@ -19,8 +19,10 @@ run's live session leader or a descendant of it. A token copied out of a run is 
 any other process.
 
 The protocol is one JSON line each way. Request: ``{"token", "cmd", ...}`` with ``cmd`` one
-of ``ask``/``note``/``check``/``restart``/``update`` (GD-1: restart Resonant, or pull its main,
-sync and restart; the run is stopped by the restart and resumed after it), ``job_note``
+of ``ask``/``ask_done``/``note``/``check``/``restart``/``update`` (``ask_done``, PER-264:
+``resonant ask --done``: the owner answered the open question in the Claude app; GD-1:
+``restart`` restarts Resonant, ``update`` pulls its main,
+syncs and restarts; the run is stopped by the restart and resumed after it), ``job_note``
 (PER-298: ``{"payload": "<the JSON object>"}``, a registered job's memory and seen keys) or
 ``request`` (PER-296: ``{"tool": "<ext>.<tool>", "args": {k: v}, "reason"}``, an extension
 tool the instance marks ``worker_requestable``, called through the gate as the run's
@@ -100,6 +102,12 @@ class Ask:
 
 
 @dataclass(frozen=True)
+class AskDone:
+    """``resonant ask --done`` (PER-264): the owner answered the run's open question in the
+    Claude app (Remote Control), so Resonant stops waiting for a text."""
+
+
+@dataclass(frozen=True)
 class Note:
     text: str
     urgent: bool = False
@@ -145,7 +153,7 @@ class ToolRequest:
         return f"{self.extension}.{self.tool}"
 
 
-Request = Ask | Note | Check | SelfOp | JobNote | ToolRequest
+Request = Ask | AskDone | Note | Check | SelfOp | JobNote | ToolRequest
 
 
 @dataclass(frozen=True)
@@ -201,6 +209,8 @@ def parse_request(obj: Any) -> Request:
         if len(options) > MAX_OPTIONS:
             raise BadRequest(f"too many options (at most {MAX_OPTIONS})")
         return Ask(_text(req, "question", MAX_QUESTION), tuple(options), _flag(req, "urgent"))
+    if cmd == "ask_done":
+        return AskDone()
     if cmd == "note":
         return Note(_text(req, "text", MAX_NOTE), _flag(req, "urgent"))
     if cmd == "check":
@@ -222,7 +232,9 @@ def parse_request(obj: Any) -> Request:
         return _tool_request(req)
     if cmd == "job_note":
         return _job_note(req)
-    raise BadRequest("unknown command; use ask, note, check, job-note, request, restart or update")
+    raise BadRequest(
+        "unknown command; use ask, ask --done, note, check, job-note, request, restart or update"
+    )
 
 
 def _tool_request(req: dict[str, Any]) -> ToolRequest:
@@ -349,6 +361,9 @@ _SHIM_SOURCE = r'''
       Ask the owner something only they can decide. Waits for the answer (up to about
       8 minutes); if there is none yet, finish what you can and end your turn: the
       session is resumed with the answer.
+  resonant ask --done
+      The owner answered your open question here in the Claude app: Resonant stops
+      waiting for (and texting about) it.
   resonant note "<progress>" [--urgent]
       Report meaningful progress. --urgent only for what the owner must see now.
       Start it with "did:" for a side effect outside your branch and PR (a merge with gh,
@@ -388,7 +403,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
     a = sub.add_parser("ask", help="ask the owner and wait for the answer")
-    a.add_argument("question", nargs="+")
+    a.add_argument("question", nargs="*")
+    a.add_argument("--done", action="store_true", help="the owner answered in the Claude app")
     a.add_argument("--options", default="", help="comma-separated choices")
     a.add_argument("--urgent", action="store_true")
     n = sub.add_parser("note", help="report progress")
@@ -415,7 +431,15 @@ def main():
     if args.cmd is None:
         p.print_help()
         return 2
-    if args.cmd == "ask":
+    if args.cmd == "ask" and args.done and args.question:
+        print("Usage error: resonant ask --done takes no question.")
+        return 2
+    elif args.cmd == "ask" and args.done:
+        req = {"cmd": "ask_done"}
+    elif args.cmd == "ask" and not args.question:
+        print("Usage error: resonant ask \"<question>\" (or resonant ask --done).")
+        return 2
+    elif args.cmd == "ask":
         opts = [o.strip() for o in args.options.split(",") if o.strip()]
         req = {"cmd": "ask", "question": " ".join(args.question), "options": opts,
                "urgent": args.urgent}

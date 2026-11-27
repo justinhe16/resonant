@@ -977,6 +977,28 @@ async def test_ack_is_skipped_when_the_task_answered_first() -> None:
     assert sent == [ask_mod.SHARED_ACK]
 
 
+def test_no_ack_when_the_turn_asked_for_an_approval() -> None:
+    """PER-264: a slow turn that asked for a change (its ``batch``) ends in the approval
+    prompt; the ack ("On it…") would land just before it, so it is skipped."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from resonant.runners import ask as ask_mod
+
+    def task(cp: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(checkpoint=cp, status="running")
+
+    stub = cast(Any, SimpleNamespace(conn=None))
+    cases: list[tuple[dict[str, Any], bool]] = [
+        ({"question": "q"}, False),
+        ({"batch": [{"approval_id": "a"}]}, True),
+        ({"batch": []}, False),
+    ]
+    for cp, answered in cases:
+        with mock.patch.object(ask_mod, "get_task", return_value=task(cp)):
+            assert ask_mod.AskRunner._has_answer(stub, "t1") is answered  # pyright: ignore[reportPrivateUsage]
+
+
 def test_a_run_started_counts_as_a_change_for_the_guard() -> None:
     # Cori 2026-11-25: "Started R10, R11 and R12 …" was swapped for the guard's fallback when
     # the runs had no report line. PER-352: a started run is a report line (one runs line).
