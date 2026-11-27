@@ -202,7 +202,7 @@ from resonant.store.audit import audit
 from resonant.store.claude_brain import add_grant
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.store.outbound import ACK_KEY, CLAUDE_KEY
-from resonant.store.runs import FOLLOW_UP_DEPTH_KEY
+from resonant.store.runs import FOLLOW_UP_DEPTH_KEY, chain_depth
 from resonant.store.tasks import get_task
 from resonant.toolcore import CallScope, PinnedCall, batch_items
 from resonant.tools.files import ReadScope, default_roots, resonant_secrets
@@ -1179,8 +1179,9 @@ class AskRunner:
         code only): a fired watch's follow-up turn, kept as ``checkpoint.watch_follow_up``
         (the watch's notice key), so a retried fire finds the ask it already queued; PER-354: an
         ended run's (``run/<code>/<ended_at>``), with ``follow_up_depth`` (kept as
-        ``checkpoint.follow_up_depth``): a run this turn starts or continues gets that depth,
-        which bounds the chain (``store.runs.FOLLOW_UP_DEPTH_MAX``)."""
+        ``checkpoint.follow_up_depth``, also on a follow-up ask's approval continuation): a run
+        this turn starts or continues gets that depth, which bounds the chain
+        (``store.runs.FOLLOW_UP_DEPTH_MAX``)."""
         if not self.cfg.enabled:
             return AskRefused("ask_claude is off (brain.ask_claude.enabled).", "off")
         question = question.strip()
@@ -1240,8 +1241,8 @@ class AskRunner:
             cp["continuation"] = continues
         if follow_up is not None:
             cp[FOLLOW_UP_KEY] = follow_up
-            if follow_up_depth is not None:
-                cp[FOLLOW_UP_DEPTH_KEY] = follow_up_depth
+        if follow_up_depth:  # a follow-up ask, or a turn that carries one on (a continuation)
+            cp[FOLLOW_UP_DEPTH_KEY] = follow_up_depth
         task_id = self._create_task(
             NewTask(
                 kind=TASK_KIND,
@@ -2709,6 +2710,8 @@ class AskRunner:
             tainted=tainted,
             taint_hops=hops,
             continues=continues,
+            # PER-354: a follow-up ask's continuation keeps its depth (the chain stays bounded)
+            follow_up_depth=chain_depth(cp) or None,
         )
 
     @staticmethod
