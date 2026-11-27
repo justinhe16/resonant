@@ -10,7 +10,8 @@ line before the reply. The rules here are the same for every instance and channe
   prose, with no negation and nothing still to come in it (``couldn't``, ``asked``,
   ``I'll``, ``once``), has the line's action word (a 4-letter prefix match:
   ``merge`` / ``merged``) and every number or code the line names (``#64``, ``R12``,
-  ``DORI-1173``); a line with none needs two thirds of its other words too. Anything else
+  ``DORI-1173``, each a whole token); a line with none, or a sentence that names other
+  numbers or codes too, needs two thirds of its other words as well. Anything else
   stays, so a change the prose doesn't mention is never hidden.
 - **Runs a turn started or continued get one line** (:func:`runs_line`), listing those the
   prose doesn't name by code: ``Started R13 (voyager-ios) and R14 (voyager-web).`` The run
@@ -35,7 +36,8 @@ _NO_REPO = "no repo (scratch dir)"
 
 # the label, then an extension's ``linear:`` (its name isn't the action)
 _LABEL = re.compile(r"^(?:Done|Did|Approved)\s*:\s*(?:[a-z][\w-]*:\s+)?", re.IGNORECASE)
-_TOKEN = re.compile(r"[a-z]+-\d+|#?\d+|[a-z]+")
+# an id is one token, prefix and all (``r12``, ``dori-1173``, ``#64``): ``12 files`` isn't R12
+_TOKEN = re.compile(r"[a-z]+-\d+|[a-z]+\d+|#?\d+|[a-z]+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
 _NEGATION = re.compile(
     r"\b(?:not|never|nothing|couldn'?t|can'?t|cannot|didn'?t|won'?t|wasn'?t|isn'?t|"
@@ -116,7 +118,11 @@ def covered(line: str, prose: str | None) -> bool:
         stems = {t[:PREFIX] for t in said if t.isalpha()}
         if verb[:PREFIX] not in stems or not ids <= said_ids:
             continue
-        if ids or sum(w[:PREFIX] in stems for w in words) >= WORD_SHARE * len(words):
+        # a sentence about other things too (``created DORI-6 and linked DORI-5``) needs the
+        # line's words as well, like a line that names no id
+        if ids and said_ids <= ids:
+            return True
+        if words and sum(w[:PREFIX] in stems for w in words) >= WORD_SHARE * len(words):
             return True
     return False
 

@@ -743,7 +743,10 @@ class ClaudeTools:
                     shell.path = m.group(1).strip()
         ran = write and not error and decision in ("gate", "granted")
         if ran and call is not None and policy is not None:
-            said = plain_line(given.get("description")) if name == "Bash" else None
+            # Claude Code's own description, only when nothing outside came in: the record
+            # isn't the words of a session that read untrusted content (PER-352)
+            said = plain_line(given.get("description")) if name == "Bash" and not self.tainted \
+                else None  # fmt: skip
             self.progress.append(policy.did(call.args, text, said))
 
     def _view(self) -> Task:

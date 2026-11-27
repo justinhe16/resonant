@@ -47,6 +47,8 @@ def test_a_line_the_prose_reports_is_covered(line: str, prose: str) -> None:
         (MERGED, "Looked at #64; CI is green."),  # the number, not the action
         (REDEPLOY, "Staging is fine."),  # too few of its words
         (MERGED, "I'll merge #64 once CI is green."),  # still to come
+        ("Done: create issue DORI-5", "I created DORI-6 and linked DORI-5."),  # another id
+        ("Did: restart R12", "Restarted 12 files."),  # 12 isn't R12
         (MERGED, "Asked the owner to merge #64."),  # waiting on someone
         ('Done: linear: save issue id="RES-12"', "Linear shows RES-12."),  # not the action
         ("Done: restart", "Restarted."),  # nothing to match it on but one word
@@ -121,5 +123,6 @@ def test_without_prose_every_line_stays_and_runs_are_still_one_line() -> None:
 def test_the_progress_line_keeps_what_the_prose_left_out() -> None:
     did = ["close duplicate PR 63", "close duplicate PR 161", "edited ~/notes.md"]
     assert did_line(did, "Closed #63 and #161 as duplicates.") == "Did: edited ~/notes.md"
-    assert did_line(did[:2], "Closed #63 and #161.") is None
+    assert did_line(did[:2], "Closed #63 and #161 as duplicates.") is None
+    assert did_line(did[:1], "Closed #63.") is None
     assert did_line(did[:1], None) == "Did: close duplicate PR 63"
