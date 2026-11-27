@@ -411,8 +411,11 @@ class ShellPolicy:
             return UNKNOWN_CWD  # a cd we can't follow: nothing relative is trusted after it
         return parsed.cwd
 
-    def did(self, args: Mapping[str, Any], output: str) -> str:
-        """A change that ran, in a few code-built words for the progress line."""
+    def did(self, args: Mapping[str, Any], output: str, said: str | None = None) -> str:
+        """A change that ran, in a few code-built words for the progress line. ``said``: the
+        command's plain description (Claude Code's own, cleaned: ``gate.summary.plain_line``)
+        for a command with no words of its own here; never the raw command (PER-352: a shell
+        line, ``&&`` and all, isn't a report)."""
         tool, verb = args.get("tool"), args.get("verb")
         shown, cwd = str(args.get("shown") or "?"), str(args.get("dir") or args.get("cwd") or "")
         repo = args.get("repo")
@@ -430,7 +433,10 @@ class ShellPolicy:
             return f"opened PR #{m.group(1)}{where}" if m else f"opened a PR{where}"
         if verb == "git-commit":
             return f"committed{where}"
-        return f"ran `{_clip(shown, 60)}`{where}"
+        if said:
+            lead = said[:1].lower() if said[1:2].islower() else said[:1]
+            return f"{lead}{_clip(said[1:], 79)}{where}"
+        return f"ran a command{where}"
 
     # -- files --
 

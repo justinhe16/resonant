@@ -947,14 +947,14 @@ async def test_brain_rules_follow_the_ask_prompt_and_a_bad_file_warns_once(
     assert warns == [f"⚠ Brain instructions {rules} is over 8 KB: sessions start without them."]
 
 
-async def test_ack_is_skipped_when_a_run_already_announced_in_the_thread() -> None:
-    """The shared thread's ``On it.`` isn't sent after a run's own start line."""
+async def test_ack_is_skipped_when_the_task_answered_first() -> None:
+    """PER-352: the ack goes only when no reply is out by its time; an answered task (or one
+    whose reply is saved) gets none."""
     import asyncio
     from types import SimpleNamespace
     from unittest import mock
 
     from resonant.runners import ask as ask_mod
-    from resonant.runners.ask_tools import mark_announced
 
     sent: list[str] = []
 
@@ -962,33 +962,31 @@ async def test_ack_is_skipped_when_a_run_already_announced_in_the_thread() -> No
         sent.append(text)
 
     stub = SimpleNamespace(
-        _answered=set(), _acks=set(), conn=None, channel=SimpleNamespace(send=send),
-        _has_answer=lambda _t: False,  # pyright: ignore[reportUnknownLambdaType]
+        _answered={"t-answered"}, _acks=set(), conn=None, channel=SimpleNamespace(send=send),
+        _has_answer=lambda t: t == "t-saved",  # pyright: ignore[reportUnknownLambdaType]
     )  # fmt: skip
     with (
         mock.patch.object(ask_mod, "get_task", return_value=None),
         mock.patch.object(ask_mod, "thread_of", return_value=None),
     ):
-        ask_mod.AskRunner._ack_later(  # pyright: ignore[reportPrivateUsage]
-            cast(Any, stub), "t-quiet", "owner", ask_mod.SHARED_ACK, 0.0
-        )
-        mark_announced("t-announced")
-        ask_mod.AskRunner._ack_later(  # pyright: ignore[reportPrivateUsage]
-            cast(Any, stub), "t-announced", "owner", ask_mod.SHARED_ACK, 0.0
-        )
+        for task_id in ("t-quiet", "t-answered", "t-saved"):
+            ask_mod.AskRunner._ack_later(  # pyright: ignore[reportPrivateUsage]
+                cast(Any, stub), task_id, "owner", ask_mod.SHARED_ACK, 0.0
+            )
         await asyncio.gather(*stub._acks)
     assert sent == [ask_mod.SHARED_ACK]
 
 
-def test_a_run_that_announced_itself_counts_as_a_change_for_the_guard() -> None:
-    # Cori 2026-11-25: "Started R10, R11 and R12 …" after three announced start_runs was
-    # swapped for the guard's fallback: the runs had no report line, so nothing had "run".
+def test_a_run_started_counts_as_a_change_for_the_guard() -> None:
+    # Cori 2026-11-25: "Started R10, R11 and R12 …" was swapped for the guard's fallback when
+    # the runs had no report line. PER-352: a started run is a report line (one runs line).
     from types import SimpleNamespace
 
     from resonant.runners.ask import AskRunner
 
-    quiet = SimpleNamespace(reports=[], progress=[], announced=0)
-    started = SimpleNamespace(reports=[], progress=[], announced=3)
+    quiet = SimpleNamespace(reports=[], progress=[])
+    started = SimpleNamespace(reports=["On it: R10 · web. Up to 45m. /runs to check."],
+                              progress=[])  # fmt: skip
     assert not AskRunner._ran(cast(Any, quiet))  # pyright: ignore[reportPrivateUsage]
     assert AskRunner._ran(cast(Any, started))  # pyright: ignore[reportPrivateUsage]
 

@@ -854,7 +854,8 @@ class LocalRunner:
             if done.path in ("done", "replay"):
                 used.extend(done.tools_used)
         meta["batch_ran"] = len(used)
-        reply = clip_reply("\n".join([*effects, *lines]), BATCH_REPLY_CHARS)
+        # PER-352: a line said once (``Approved; Claude runs it now.`` for each command)
+        reply = clip_reply("\n".join(dict.fromkeys([*effects, *lines])), BATCH_REPLY_CHARS)
         return Answer(reply, "done" if used else "failed", used, meta=meta)
 
     def _paused(self) -> bool:

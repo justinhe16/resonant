@@ -14,8 +14,8 @@ Cori's own ``config/cori/brain-rules.md``. The brain is ``e2e/fake_claude.py`` a
 plan through the real MCP relay. ``runner.update_voice`` stays ``template`` (code-built run
 lines). Nothing touches the real ~/.resonant, ~/code, Keychain, GitHub or claude.
 
-1. robot-surf three tickets: one start line per run, the reply as written, no ``On it.`` after
-   (#193, #195).
+1. robot-surf three tickets: one post, the reply as written, no ``On it.`` before a fast
+   reply (#193, #195; PER-352: no start line per run).
 2. A retry after failed runs starts new runs; Cori's rule to retry reaches Claude (#190).
 3. An approver merges a PR no run opened: ``github.merge_pr``, App-minted (PER-335/336).
 4. A bare ``yes`` in a thread with nothing pending goes to the brain (#193).
@@ -23,6 +23,8 @@ lines). Nothing touches the real ~/.resonant, ~/code, Keychain, GitHub or claude
    (#190, #195); ``brain.reply_guard: lenient`` sends a flagged reply in Claude's words
    (PER-340).
 6. A member can't start a run (PER-293).
+7. PER-352, Cori's 2026-11-26/27 threads: two runs started in one turn are one post; a slow
+   turn's ``On it.`` comes once, a fast one has none; approved commands aren't repeated.
 """
 
 from __future__ import annotations
@@ -313,30 +315,25 @@ def no_noise(said: list[str]) -> None:
 # --- 1. "robot-surf DORI-1173, DORI-1174 and DORI-1175" ---------------------------------------
 
 
-async def test_robot_surf_three_tickets_one_start_line_each_and_the_reply_as_written(
+async def test_robot_surf_three_tickets_one_post_and_the_reply_as_written(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#193: each run posts its own start line once, the reply carries no second copy, and
-    the shared thread's ``On it.`` isn't sent after the runs announced (Claude is still
-    writing when the ack is due). #195: an announced start is a change that ran, so the
-    reply isn't swapped for the guard's fallback."""
+    """PER-352 (was #193's one start line per run): runs a Claude brain turn starts post no
+    start line of their own; the reply is the one post, and its prose names every run, so
+    nothing is appended. A fast reply has no ``On it.`` before it. #195: a run started is a
+    change that ran, so the reply isn't swapped for the guard's fallback."""
     # first person, so the guard's claim check applies whatever the owner's words were
     reply = "I started R1 (DORI-1173), R2 (DORI-1174), R3 (DORI-1175); I'll post PRs here."
-    async with cori(tmp_path, resonant_home, chat, monkeypatch, ack_after_s=2.0) as c:
-        c.claude(calls=[surf("DORI-1173"), surf("DORI-1174"), surf("DORI-1175")],
-                 delay=4.0, answer=reply)  # fmt: skip
+    async with cori(tmp_path, resonant_home, chat, monkeypatch) as c:
+        c.claude(calls=[surf("DORI-1173"), surf("DORI-1174"), surf("DORI-1175")], answer=reply)
         where = thread(1)
-        said = await c.ask(
-            ALICE, "robot-surf DORI-1173, DORI-1174 and DORI-1175", where,
-            lambda s: reply in s and len(start_lines(s)) == 3, "three start lines and the reply",
-        )  # fmt: skip
-        assert said.count(reply) == 1  # exactly as Claude wrote it, nothing appended
-        lines = start_lines(said)
-        assert [t.split(" ")[3] for t in lines] == ["R1", "R2", "R3"]  # once each
-        assert all("/robot-surf DORI-117" in t for t in lines)
-        assert said.index(reply) > max(said.index(t) for t in lines)
+        said = await c.ask(ALICE, "robot-surf DORI-1173, DORI-1174 and DORI-1175", where,
+                           has(reply), "the reply")  # fmt: skip
+        assert said[0] == reply and said.count(reply) == 1  # first, exactly as Claude wrote it
+        assert start_lines(said) == [] and not [t for t in said if t.startswith("Started R")]
         no_noise(said)
         runs = c.runs()
+        assert [r.code for r in runs] == ["R1", "R2", "R3"]
         assert [r.ask for r in runs] == [SURF.format(t=f"DORI-117{i}") for i in (3, 4, 5)]
         assert all(r.principal == "alice" for r in runs)
         assert passed(c) == 1  # checked once, passed: never flagged, never redone
@@ -365,10 +362,8 @@ async def test_a_retry_after_failed_runs_starts_new_runs(
         assert len(failures) == 1 and not failures[0].startswith("Couldn't"), failures
         reply = "I started R2 (DORI-1173) again; I'll post the PR here."
         c.claude(calls=[surf("DORI-1173")], answer=reply)
-        said = await c.ask(ALICE, "retry DORI-1173", where,
-                           lambda s: reply in s and len(start_lines(s)) == 1,
-                           "R2's start line and the reply")  # fmt: skip
-        assert start_lines(said)[0].startswith("On it: starting R2 (")
+        said = await c.ask(ALICE, "retry DORI-1173", where, has(reply), "the reply")
+        assert said[0] == reply and start_lines(said) == []  # PER-352: the reply says it
         no_noise(said)
         r1, r2 = c.runs()
         assert r1.ask == r2.ask and r2.code == "R2"
@@ -399,8 +394,8 @@ async def test_an_approver_merges_a_pr_no_run_opened_through_the_github_extensio
             lambda s: any(t.startswith(reply) for t in s),
             "the reply",
         )
-        # Claude's words as written, with the change's report line under them
-        assert said == [f"{reply}\nDone: merge PR #159 in {PR_REPO}"]
+        # PER-352: Claude's words as written; they say the merge, so no ``Done: merge …``
+        assert said == [reply]
         no_noise(said)
         pr_read, merged = c.seen()["results"]
         assert '"author":"bob"' in pr_read and merged.startswith("done:")
@@ -459,10 +454,9 @@ async def test_honest_replies_go_out_unchanged(
         reply = "Started R1; I'll post the PR here."
         c.claude(calls=[surf("DORI-1173")], answer=reply)
         # the owner asks for a change, so the bare "Started …" is checked as a claim too
-        said = await c.ask(ALICE, "start a worker on DORI-1173", thread(12),
-                           lambda s: reply in s and len(start_lines(s)) == 1,
-                           "R1's start line and the reply")  # fmt: skip
-        assert [t for t in said if t != reply and not t.startswith("R1 ")] == start_lines(said)
+        said = await c.ask(ALICE, "start a worker on DORI-1173", thread(12), has(reply),
+                           "the reply")  # fmt: skip
+        assert said[0] == reply and start_lines(said) == []  # PER-352: the reply says it
         no_noise(said)
         assert passed(c) == 3
 
@@ -522,3 +516,43 @@ async def test_a_member_cant_start_a_run(
                            "the refusal")  # fmt: skip
         assert said[0].startswith("Only Alice or Bob can start work"), said
         assert c.runs() == []
+
+
+# --- 7. PER-352: fewer, non-redundant replies ---------------------------------------------------
+
+
+async def test_two_runs_started_in_one_turn_are_one_post(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-26: "spawn a review agent on them" posted R13's start line, R14's, then the
+    summary. Now the reply is the one post, and the runs its prose doesn't name by code are
+    one code-built line under it (no ``/runs to check, /cancel R5 to stop``)."""
+    reply = "Started two review runs on the PRs I kept; each comments its verdict on the PR."
+    async with cori(tmp_path, resonant_home, chat, monkeypatch) as c:
+        c.claude(calls=[surf("DORI-1174"), surf("DORI-1175")], answer=reply)
+        said = await c.ask(ALICE, "spawn a review agent on them", thread(40),
+                           lambda s: any(t.startswith(reply) for t in s), "the reply")  # fmt: skip
+        repo = c.runs()[0].repo
+        assert said[0] == f"{reply}\nStarted R1 ({repo}) and R2 ({repo})."
+        assert start_lines(said) == []
+        no_noise(said)
+        assert passed(c) == 1
+
+
+@pytest.mark.parametrize("slow", [False, True])
+async def test_the_ack_is_sent_only_when_the_reply_is_slow(
+    tmp_path: Path,
+    resonant_home: Path,
+    chat: FakeChatDB,
+    monkeypatch: pytest.MonkeyPatch,
+    slow: bool,
+) -> None:
+    """2026-11-26/27: ``On it.`` then the answer seconds later. The ack waits
+    ``brain.claude_session.ack_after_s`` (8 s by default; 3 s here) and goes only when no
+    reply is out by then: a fast reply arrives alone, a slow one after one ``On it.``."""
+    reply = "Both reviews are still going. I'll post here when they finish."
+    async with cori(tmp_path, resonant_home, chat, monkeypatch, ack_after_s=3.0) as c:
+        c.claude(answer=reply, delay=5.0 if slow else 0)
+        said = await c.ask(ALICE, "how are the reviews going?", thread(41 + slow), has(reply),
+                           "the reply")  # fmt: skip
+        assert said == ([ask_mod.SHARED_ACK, reply] if slow else [reply])

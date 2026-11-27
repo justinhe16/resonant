@@ -374,9 +374,11 @@ def test_did(policy: ShellPolicy, tree: dict[str, Path]) -> None:
     assert policy.did({**base, "verb": "gh-pr-create", "shown": "gh pr create"}, pr) == (
         "opened PR #120 in r"
     )
-    assert (
-        policy.did({**base, "verb": "rm", "shown": "rm -rf build"}, "") == "ran `rm -rf build` in r"
-    )
+    # PER-352: never the raw command; Claude Code's own description when there is one
+    rm = {**base, "verb": "rm", "shown": "rm -rf build"}
+    assert policy.did(rm, "") == "ran a command in r"
+    assert policy.did(rm, "", "Remove the build folder") == "remove the build folder in r"
+    assert policy.did(rm, "", "PR 63: close it") == "PR 63: close it in r"
 
 
 def test_git_facts(tree: dict[str, Path]) -> None:

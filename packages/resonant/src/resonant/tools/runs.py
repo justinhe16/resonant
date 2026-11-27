@@ -17,6 +17,9 @@ at call time: the runner is built after the tools are registered) and return cod
   ``started: false`` and the reason as ``text``. ``report``: ``digest`` (the default) puts
   the run's end in the hourly digest; ``now`` texts it when it ends (``/run`` passes it, and
   the model does when the owner asks to hear right away; docs/employee-plan.md D5, EM-6).
+  Who says it started (PER-319, PER-352): a slash command's reply; a Claude brain turn's
+  reply (one line for every run the turn started, ``runners/reply_lines.py``); else, chosen
+  by a model, the run itself in its thread (``announced``).
 - ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
   model sees them, never an approval code. Free text from Claude (summary, failure) is
   cleaned and clipped. ``known`` (PER-270): the owner was already texted how the run ended
@@ -34,7 +37,8 @@ at call time: the runner is built after the tools are registered) and return cod
   session in the same worktree with a fresh budget (``ClaudeRunner.continue_run``); anything
   else is a refusal (``continued: false`` and the reason as ``text``). The owner and approvers
   only: a global builtin with no member grant, and the handler checks the asker again. Chosen
-  by the brain, the run says ``Continuing R5 (…)`` in its thread itself (``announced``).
+  by the brain, the run says ``Continuing R5 (…)`` in its thread itself (``announced``),
+  unless a Claude brain turn chose it: the turn's reply says it (PER-352, as ``start_run``).
   PER-351: the run moves to the calling task's thread and asker: its later updates, end and
   merge go where it was continued, and its old thread gets one pointer.
 - ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
@@ -76,6 +80,7 @@ from resonant.trust import merge_decision
 from resonant_sdk import Effect, Level, ToolSpec
 
 if TYPE_CHECKING:
+    from resonant.loop.types import Task
     from resonant.runners.claude import (
         Cancelled,
         Continued,
@@ -396,6 +401,19 @@ def merge_level(conn: sqlite3.Connection, intent: Intent) -> Level | None:
 # --- helpers -----------------------------------------------------------------------------
 
 
+TURN_RUNNER = "ask"  # ``runners.ask.NAME``: a Claude brain turn, whose reply says what ran
+
+
+def _announces(call: CallContext | None, task: Task | None) -> bool:
+    """PER-319: a run a model chose says it started (or continued) in its thread itself.
+    PER-352: not when a Claude brain turn chose it: that turn's reply lists every run it
+    started or continued in one line (``runners/reply_lines.py``), so the thread hears it
+    once, not once per run and again in the reply."""
+    if call is None or call.origin == "explicit":
+        return False
+    return task is None or task.runner != TURN_RUNNER
+
+
 def _code(value: object) -> str | None:
     """``R3`` for ``"r3"`` or ``" R3 "``; None if it isn't a run code."""
     if not isinstance(value, str):
@@ -526,8 +544,9 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         if asker is not None and asker != owner:
             thread["requested_by"] = asker
         # PER-319: a run a slash command started is announced by its reply (``On it: R5 ·
-        # …``); one the brain started says ``On it: starting R5 (…).`` in its thread itself
-        announce = call is not None and call.origin != "explicit"
+        # …``); one the brain started says ``On it: starting R5 (…).`` in its thread itself,
+        # unless a Claude brain turn started it (PER-352): its reply lists the runs in one line
+        announce = _announces(call, task)
         result = await claude.start_run(repo, ask, owner, merge=merge, report=report,
                                         announce=announce, **thread)  # fmt: skip
         if (reason := _refusal(result)) is not None:
@@ -639,7 +658,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         claude = runner()
         if claude is None:
             return {"continued": False, "code": code, "text": missing()}
-        announce = call is not None and call.origin != "explicit"  # as start_run's (PER-319)
+        announce = _announces(call, task)  # as start_run's (PER-319, PER-352)
         # PER-351: the run moves to the thread the continue was asked in, and to who asked
         moved: dict[str, Any] = {}
         if task is not None and task.channel_ref is not None:
