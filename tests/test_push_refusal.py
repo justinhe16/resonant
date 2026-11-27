@@ -98,8 +98,9 @@ def test_a_rejection_without_an_error_flag_still_counts() -> None:
     assert w.refused is not None and w.refused.startswith("refusing to allow a GitHub App")
 
 
-def test_a_failure_with_no_reason_says_so() -> None:
+def test_another_commands_failure_isnt_a_refused_push() -> None:
+    """``git commit && git push`` whose commit failed: the push never ran."""
     w = PushWatch()
-    w.calls(call("a", "git push"))
-    w.results(answer("a", "Exit code 128", error=True))
-    assert w.refused == "git push failed"
+    w.calls(call("a", "git commit -m x && git push"))
+    w.results(answer("a", "Exit code 1\nnothing to commit, working tree clean", error=True))
+    assert w.refused is None

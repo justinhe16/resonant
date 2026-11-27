@@ -1308,7 +1308,9 @@ class Workspace:
         and not already on the remote. PER-355: a session that checked out a PR (``gh pr
         checkout``, a reset to its head) has that PR's commits on its branch, and they aren't
         its work. "On the remote" is the daemon-only mirror (every branch, as last fetched),
-        never the checkout's ``refs/remotes``, which a worker can write."""
+        never the checkout's ``refs/remotes``, which a worker can write. A run with no token
+        (``_collect_local``) reads the mirror as last fetched, or counts every commit when
+        there is none."""
         if p.checkout is None:
             return 0
         try:

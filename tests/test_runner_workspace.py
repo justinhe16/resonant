@@ -1016,6 +1016,31 @@ async def test_pushed_commits_counts_the_branch_beyond_the_base(env: Env) -> Non
     assert await env.ws.pushed_commits(p, SECRETS) == 2
 
 
+async def test_local_commits_are_only_the_runs_own(env: Env) -> None:
+    """PER-355: a PR's commits the session reset its branch onto aren't its own; a commit on
+    top is. What the remote has comes from the mirror, never the checkout's refs/remotes."""
+    seed = env.root / "seed"
+    git(seed, "checkout", "-q", "-b", "feature")
+    for i in range(2):
+        (seed / f"pr-{i}.txt").write_text(f"{i}\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-q", "-m", f"PR change {i}")
+    git(seed, "push", "-q", str(env.remote), "feature")
+    p = await env.prepare()
+    git(p.workspace, "fetch", "-q", str(env.remote), "feature")
+    git(p.workspace, "reset", "-q", "--hard", "FETCH_HEAD")
+    assert await env.ws.pushed_commits(p, SECRETS) == 0  # refreshes the mirror
+    assert await env.ws.local_commits(p) == 0
+    env.session(p, {"mine.txt": "mine\n"})
+    assert await env.ws.local_commits(p) == 1
+    # a worker can write the checkout's refs: a forged remote ref hides nothing
+    git(p.workspace, "update-ref", "refs/remotes/origin/forged", "HEAD")
+    assert await env.ws.local_commits(p) == 1
+    # with no mirror at all, every commit beyond the base counts
+    await asyncio.to_thread(shutil.rmtree, env.ws.mirror_path("proj"))
+    assert await env.ws.local_commits(p) == 3
+
+
 async def test_ci_state(env: Env) -> None:
     for rc, err, want in (("0", "", "green"), ("8", "", "pending"), ("1", "", "red"),
                           ("1", "no checks reported on the 'x' branch", "none"),

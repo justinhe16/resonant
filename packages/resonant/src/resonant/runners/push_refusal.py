@@ -6,10 +6,10 @@ when the session's last ``git push`` failed, git's reason in one line (``non-fas
 GitHub refusing a workflow change without the ``workflows`` permission, a 403).
 
 Where it comes from: the worker's Bash calls in the session's stream-json. A call is noted
-when the assistant makes it and its command contains a ``git push`` (``side_effects``); its
-result is read when it comes back. A failed push records the reason (:func:`reason_of`); a
-push that went through clears it. Only one line of git's output is kept, and the caller
-cleans and clips it like any other outside text before it reaches a message.
+when the assistant makes it and its command runs ``git push``; its result is read when it
+comes back. A refusal in git's output records the reason (:func:`reason_of`); a call that
+went through clears it. Only one line of git's output is kept, and the caller cleans and
+clips it like any other outside text before it reaches a message.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ class PushWatch:
     never raises on odd input."""
 
     def __init__(self) -> None:
-        self._open: set[str] = set()
+        self._open: dict[str, None] = {}  # insertion-ordered: the oldest goes first
         self.refused: str | None = None
 
     def calls(self, message: Mapping[str, Any]) -> None:
@@ -80,17 +80,18 @@ class PushWatch:
             command: Any = args.get("command")
             if tid and name == "Bash" and isinstance(command, str) and is_push(command):
                 if len(self._open) >= MAX_OPEN:
-                    self._open.pop()
-                self._open.add(tid)
+                    self._open.pop(next(iter(self._open)))
+                self._open[tid] = None
 
     def results(self, message: Mapping[str, Any]) -> None:
-        """Read a ``user`` message's results of noted push calls: a failure records git's
-        reason, a success clears it."""
+        """Read a ``user`` message's results of noted push calls: git's own words of a
+        refusal record its reason; a call that ended well clears it. A failed call whose
+        output shows no refusal (another command in it failed) changes nothing."""
         for tid, is_error, text in tool_results(message):
             if tid not in self._open:
                 continue
-            self._open.discard(tid)
-            if is_error or _FAILED.search(text):
+            del self._open[tid]
+            if _FAILED.search(text):
                 self.refused = reason_of(text) or "git push failed"
-            else:
+            elif not is_error:
                 self.refused = None
