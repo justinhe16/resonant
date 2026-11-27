@@ -177,11 +177,11 @@ def test_manifest_passes_every_check() -> None:
     specs = {s.name: s for s in m.tool_specs() + m.job_specs()}
     assert set(specs) == {
         "prs", "pr", "recent_prs", "pr_diff", "pr_comments", "rerun_failed", "merge_pr",
-        "merge_pr_anyway", "comment_pr", "job_watch", "job_digest",
+        "merge_pr_anyway", "comment_pr", "close_pr", "job_watch", "job_digest",
     }  # fmt: skip
     for s in specs.values():
         assert s.secrets == ("token",)
-        if s.name not in ("rerun_failed", "merge_pr", "merge_pr_anyway", "comment_pr"):
+        if s.name not in ("rerun_failed", "merge_pr", "merge_pr_anyway", "comment_pr", "close_pr"):
             assert s.effect is Effect.READ and s.effective_level is Level.L0 and not s.commit
     # PER-336: comment_pr acts then reports, and shows the whole body when it asks.
     comment = specs["comment_pr"]
@@ -210,6 +210,14 @@ def test_manifest_passes_every_check() -> None:
     assert app["comment_pr"] is not None and app["comment_pr"].permissions == {
         "pull_requests": "write"
     }
+    # PER-353: close_pr is a commit like a merge (asks unless you asked for it), shows the
+    # whole comment when it asks, and reaches as far as comment_pr.
+    close = specs["close_pr"]
+    assert close.effect is Effect.WRITE and close.effective_level is Level.L2 and close.commit
+    assert close.approval_detail == "comment"
+    assert close.approval_summary == "close PR #{number} in {repo}"
+    assert close.args_schema["required"] == ["comment", "number", "repo"]
+    assert app["close_pr"] == app["comment_pr"]
     assert app["rerun_failed"] is not None and app["rerun_failed"].permissions["actions"] == "write"
     for name in ("prs", "job_watch", "job_digest"):  # no repo arg: every repo, read only
         reach = app[name]
@@ -1207,6 +1215,76 @@ def test_comment_pr_without_write_access_says_what_to_widen(gh: FakeGh) -> None:
     }  # fmt: skip
     r = gh.run("comment_pr", "--repo", DORI, "--number", "159", "--body=hi")
     assert r.code == 1 and "needs Pull requests: write access" in r.err
+
+
+# --- PER-353: close_pr -----------------------------------------------------------------------
+
+
+def test_close_pr_closes_then_comments(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{DORI}#161": {"number": 161, "state": "OPEN", "url": "u161"}}
+    r = gh.run("close_pr", "--repo", DORI, "--number", "161",
+               "--comment=Closing as a duplicate of #162.")  # fmt: skip
+    assert r.code == 0, r.err
+    view_call, close, post = gh.calls()
+    assert view_call["argv"][:5] == ["pr", "view", "161", "--repo", DORI]
+    assert close["argv"] == ["pr", "close", "161", "--repo", DORI]
+    assert post["argv"] == [
+        "api", f"repos/{DORI}/issues/161/comments", "--method", "POST",
+        "-f", "body=Closing as a duplicate of #162.",
+    ]  # fmt: skip
+    assert r.out == {
+        "summary": "closed voyager-web#161 with a comment", "repo": DORI, "number": 161,
+        "url": "u161", "commented": True,
+    }  # fmt: skip
+
+
+def test_close_pr_with_a_blank_comment_posts_none(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{DORI}#161": {"number": 161, "state": "OPEN", "url": "u161"}}
+    r = gh.run("close_pr", "--repo", DORI, "--number", "161", "--comment=  ")
+    assert r.code == 0, r.err
+    assert [c["argv"][:2] for c in gh.calls()] == [["pr", "view"], ["pr", "close"]]
+    assert r.out["summary"] == "closed voyager-web#161" and r.out["commented"] is False
+
+
+@pytest.mark.parametrize(
+    ("state", "err"),
+    [("MERGED", "already merged; nothing to close"), ("CLOSED", "is already closed")],
+)
+def test_close_pr_refuses_a_pr_that_isnt_open(gh: FakeGh, state: str, err: str) -> None:
+    gh.state["prs"] = {f"{DORI}#161": {"number": 161, "state": state, "url": "u"}}
+    r = gh.run("close_pr", "--repo", DORI, "--number", "161", "--comment=dup")
+    assert r.code == 1 and err in r.err
+    assert [c["argv"][:2] for c in gh.calls()] == [["pr", "view"]]  # nothing changed
+
+
+def test_close_pr_refuses_an_issue_number_and_a_long_comment(gh: FakeGh) -> None:
+    r = gh.run("close_pr", "--repo", DORI, "--number", "5", "--comment=dup")
+    assert r.code == 1 and "Could not resolve to a PullRequest" in r.err
+    assert [c["argv"][0] for c in gh.calls()] == ["pr"]
+    r = gh.run("close_pr", "--repo", DORI, "--number", "161", "--comment=" + "x" * 1001)
+    assert r.code == 1 and "at most 1000" in r.err
+    assert len(gh.calls()) == 1  # no gh call for the long comment
+
+
+def test_close_pr_without_write_access_says_what_to_widen(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{DORI}#161": {"number": 161, "state": "OPEN", "url": "u"}}
+    gh.state["fail_on"] = {
+        "pr close": {"exit": 1, "stderr": "Resource not accessible by integration (HTTP 403)"}
+    }
+    r = gh.run("close_pr", "--repo", DORI, "--number", "161", "--comment=dup")
+    assert r.code == 1 and "needs Pull requests: write access" in r.err
+    assert [c["argv"][:2] for c in gh.calls()] == [["pr", "view"], ["pr", "close"]]
+
+
+def test_close_pr_reports_the_close_when_only_the_comment_fails(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{DORI}#161": {"number": 161, "state": "OPEN", "url": "u"}}
+    gh.state["fail_on"] = {
+        f"api repos/{DORI}/issues/161/comments": {"exit": 1, "stderr": "HTTP 502"}
+    }
+    r = gh.run("close_pr", "--repo", DORI, "--number", "161", "--comment=dup")
+    assert r.code == 0, r.err  # it closed: success, with what didn't happen
+    assert r.out["summary"] == "closed voyager-web#161" and r.out["commented"] is False
+    assert r.out["warning"].startswith("closed, but the comment didn't post: gh api failed")
 
 
 def app_gh(gh: FakeGh) -> dict[str, str]:

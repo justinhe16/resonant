@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -33,7 +34,7 @@ from resonant.tools import trust as trust_tools
 from resonant.tools import watches as watch_tools
 from resonant.tools.builtin import BUILTIN_MODULES
 from resonant.trust.tools import StandingAllows
-from resonant_sdk import Effect, Level, ToolSpec
+from resonant_sdk import Effect, Level, ToolSpec, load_manifest
 
 NOW = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
 OWNER, APPROVER, MEMBER, OUTSIDER = "lead", "second", "member", "outsider"
@@ -245,6 +246,30 @@ def test_allow_runs_an_untainted_staff_l2_write(db: sqlite3.Connection, principa
     ] * 2
     assert staff_allowed(db) == [True, True]
     assert all("tainted_allowed" not in r["detail"] for r in rows)
+
+
+def _github_spec(name: str) -> ToolSpec:
+    manifest = Path(__file__).resolve().parents[1] / "extensions/github/resonant.yaml"
+    return next(s for s in load_manifest(manifest).tool_specs() if s.name == name)
+
+
+@pytest.mark.parametrize("origin", ["tainted", "inferred"])
+@pytest.mark.parametrize("principal", [OWNER, APPROVER])
+def test_allow_lifts_the_real_github_close_pr(
+    db: sqlite3.Connection, origin: Origin, principal: str
+) -> None:
+    """PER-353: a staff "close #161, it's a duplicate" runs github's close_pr, as shipped, with
+    no prompt under ``allow`` (as merge_pr does), so it never needs the brain's shell."""
+    gate = make_gate(db, tainted_writes="allow")
+    spec = _github_spec("close_pr")
+    gate.registry.register(spec)
+    args = {"repo": "jhe/dori", "number": 161, "comment": "Closing as a duplicate of #162."}
+    d = evaluate(db, gate, spec, args, origin=origin, principal=principal)
+    assert isinstance(d, Allow) and d.unattended and d.approval_id is None
+    gate = make_gate(db, tainted_writes="ask")
+    gate.registry.register(spec)
+    assert isinstance(evaluate(db, gate, spec, args, origin=origin, principal=principal),
+                      NeedsApproval)  # fmt: skip
 
 
 def test_ask_keeps_an_untainted_staff_l2_write_asking(db: sqlite3.Connection) -> None:
