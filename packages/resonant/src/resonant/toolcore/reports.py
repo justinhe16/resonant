@@ -23,6 +23,7 @@ NOT_AVAILABLE_REPLY = "Not done: that tool isn't available."
 BAD_ARGS_REPLY = "Not done: invalid arguments."
 NOTE_TEXT_CHARS = 60
 SHELL_SHOWN_CHARS = 160
+APPROVED_COMMAND = "Approved; Claude runs it now."
 
 
 def _note_saved(d: dict[str, Any]) -> str | None:
@@ -177,16 +178,16 @@ def summarize_intent(intent: Intent) -> str:
 # reports ``Done: <summary>``. A renderer returns None for a result it doesn't recognize.
 def _shell_permitted(d: dict[str, Any]) -> str | None:
     """PER-258: the owner's yes to a Claude brain change after its turn; Claude runs it in a
-    new turn (``runners/ask.py``), and its own line says what ran."""
+    new turn (``runners/ask.py``), and its own line says what ran. PER-352: a command isn't
+    repeated (the prompt showed it, and a shell line, ``&&`` and all, isn't a report), so a
+    batch of them reads as one line."""
     shown = d.get("shown")
     if d.get("permitted") is not True or not isinstance(shown, str):
         return None
+    if d.get("tool") == "Bash":
+        return APPROVED_COMMAND
     what = clean_external(shown)[:SHELL_SHOWN_CHARS]
-    return (
-        f"Approved: `{what}`; Claude runs it now."
-        if d.get("tool") == "Bash"
-        else (f"Approved: {what}; Claude makes the change now.")
-    )
+    return f"Approved: {what}; Claude makes the change now."
 
 
 REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {

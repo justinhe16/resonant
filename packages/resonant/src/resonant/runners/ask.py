@@ -168,7 +168,7 @@ from resonant.redact import Redactor
 from resonant.router.prefixes import time_context
 from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
 from resonant.runner.scope import Instructions, read_instructions, warn_key
-from resonant.runners import continuation, reaper
+from resonant.runners import continuation, reaper, reply_lines
 from resonant.runners import status as status_lines
 from resonant.runners.ask_tools import (
     PERMISSION_LISTING,
@@ -180,7 +180,6 @@ from resonant.runners.ask_tools import (
     ToolAccess,
     listing,
     sweep_bridge_dirs,
-    was_announced,
 )
 from resonant.runners.claude import LimitHit, read_lines, usage_limit, wake_time
 from resonant.runners.claude_session import (
@@ -817,11 +816,6 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def progress_line(did: Sequence[str]) -> str:
-    """PER-258: the changes of Claude's own that ran this turn, in one code-built line."""
-    return "Did: " + ", ".join(dict.fromkeys(flat(d, 80) for d in did))
-
-
 def approved_line(n: int, args: dict[str, Any]) -> str:
     """One approved change in the approved turn's message (Claude's own command, exactly)."""
     tool, command, cwd = args.get("tool"), args.get("command"), args.get("cwd")
@@ -1285,8 +1279,6 @@ class AskRunner:
                 await asyncio.sleep(delay)
             if task_id in self._answered or self._has_answer(task_id):
                 return
-            if was_announced(task_id):  # a run's start line is already in the thread
-                return
             try:
                 thread = thread_of(get_task(self.conn, task_id), to=principal)
                 await self.channel.send(
@@ -1719,6 +1711,7 @@ class AskRunner:
         lines of what ran, a usage limit, or a change waiting on the owner. ``keep``: keys
         for the checkpoint on top of the stored one (a turn's taint hops)."""
         reports: list[str] = []
+        progress: list[str] = []
         pending = False
         if bridge is not None:  # the session's pins: the stored checkpoint has them
             latest = get_task(self.conn, task.id)
@@ -1727,7 +1720,7 @@ class AskRunner:
             cp.update(keep or {})
             reports = list(bridge.reports)
             if bridge.progress and self.session_cfg is not None and self.session_cfg.progress_texts:
-                reports.append(progress_line(bridge.progress))
+                progress = [flat(d, 80) for d in bridge.progress]
             pending = bool(bridge.asked) and outcome[0] == "answered"
             # Every allowed call ran by now: ``call`` never waits (BA-1: the changes that
             # ask are in ``batch``, prompted after the answer, or dropped with it).
@@ -1752,10 +1745,19 @@ class AskRunner:
             elif status != "answered" and said is not None:
                 fed, text = [], said
             reports = [*fed, *reports]
+
+        def lines(prose: str | None) -> list[str]:
+            """PER-352: the report lines under ``prose`` (Claude's text as sent with them):
+            the runs in one line, none the prose already reports."""
+            out = reply_lines.tidy(reports, prose)
+            if (did := reply_lines.did_line(progress, prose)) is not None:
+                out.append(did)
+            return out
+
         if status == "usage_limit" and result is not None:
             hit = usage_limit(result, tz=self.tz, now=self.clock())
             assert hit is not None
-            return await self._limit(task, ctx, cp, hit, reports)
+            return await self._limit(task, ctx, cp, hit, lines(None))
         if (
             status == "answered"
             and not pending
@@ -1765,14 +1767,16 @@ class AskRunner:
             text, asks = drop_pending_asks(text)  # PER-268: no "approve it?" with none open
             if asks:
                 log.info("ask: dropped %d sentence(s) asking for a yes with none pending", asks)
-        reply = with_reports(text if status != "answered" else None, text, reports, redactor,
+        answered = status == "answered"
+        reply = with_reports(None if answered else text, text,
+                             lines(text if answered else None), redactor,
                              self.cfg.reply_max_chars)  # fmt: skip
         held: str | None = None
         says_it = bridge is not None and short_note(reply) and self._prompt_says_it(task, bridge)
         if pending and says_it:
             # PER-328: the prompt's plain line says what the yes is for; Claude's text about
             # it is kept for history, and only what ran goes out with the prompt
-            held, reply = reply, "\n".join(r for r in reports if r)
+            held, reply = reply, "\n".join(lines(None))
         extra: dict[str, Any] = {}
         if result is not None:
             cost = result.get("total_cost_usd")
@@ -1781,8 +1785,8 @@ class AskRunner:
             extra["turns"] = turns if isinstance(turns, int) else None
             extra["usage"] = usage_of(result)  # PER-250: tokens, for the live Claude eval
         if bridge is not None:
-            extra.update(tool_calls=bridge.calls, changes=len(reports), waiting=pending,
-                         tainted=bridge.tainted)  # fmt: skip
+            extra.update(tool_calls=bridge.calls, changes=len(reports) + bool(progress),
+                         waiting=pending, tainted=bridge.tainted)  # fmt: skip
         return await self._finish(task, ctx, cp, status, reply, proposed=status == "answered"
                                   and has_proposal(text), pending=pending, held=held,
                                   **extra)  # fmt: skip
@@ -2078,9 +2082,9 @@ class AskRunner:
 
     @staticmethod
     def _ran(bridge: ClaudeTools) -> bool:
-        """A change ran this turn: a report line, a change of Claude's own, or a run that
-        announced itself in the thread (it has no report line, PER-319)."""
-        return bool(bridge.reports or bridge.progress or bridge.announced)
+        """A change ran this turn: a report line (a run started or continued among them) or a
+        change of Claude's own."""
+        return bool(bridge.reports or bridge.progress)
 
     @staticmethod
     def _acted(bridge: ClaudeTools) -> bool:

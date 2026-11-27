@@ -124,6 +124,7 @@ from resonant.toolcore import is_explicit as is_explicit
 from resonant.toolcore import refusal_reply as refusal_reply
 from resonant.toolcore import report_line as report_line
 from resonant.toolcore import summarize_intent as summarize_intent
+from resonant.toolcore.reports import APPROVED_COMMAND
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Event, ToolSpec
 
@@ -854,7 +855,10 @@ class LocalRunner:
             if done.path in ("done", "replay"):
                 used.extend(done.tools_used)
         meta["batch_ran"] = len(used)
-        reply = clip_reply("\n".join([*effects, *lines]), BATCH_REPLY_CHARS)
+        # PER-352: ``Approved; Claude runs it now.`` once for the batch's commands
+        said = [*effects, *lines]
+        said = [x for n, x in enumerate(said) if x != APPROVED_COMMAND or said.index(x) == n]
+        reply = clip_reply("\n".join(said), BATCH_REPLY_CHARS)
         return Answer(reply, "done" if used else "failed", used, meta=meta)
 
     def _paused(self) -> bool:

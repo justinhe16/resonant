@@ -190,10 +190,10 @@ async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
         assert shell_gated(w) == [("NeedsApproval", "inferred")] * 2  # in the turn, prompted
         await prompt_recorded(w)
         approved, ran = await w.say("yes", replies=2)
-        assert approved.startswith("Approved: `cd ") and approved.endswith(
-            "&& git push -q origin main`; Claude runs it now."
-        )
-        assert ran == "Pushed main: (Bash completed with no output)\nDid: pushed main in r"
+        # PER-352: the command isn't repeated (the prompt showed it), and the reply's own
+        # words say the push, so no ``Did: pushed main in r`` under them
+        assert approved == "Approved; Claude runs it now."
+        assert ran == "Pushed main: (Bash completed with no output)"
         await w.settled()
         assert remote_head(remote, "main") == git(repo, "rev-parse", "main")
         # the approved turn's message is Resonant's, naming the exact command and its dir

@@ -94,8 +94,11 @@ async def test_the_owners_tainted_robot_surf_starts_with_no_prompt(
     async with team(tmp_path, resonant_home, chat, monkeypatch, tainted="allow") as (w, d, fake):
         w.claude(calls=[START], answer="Starting it now.")
         assert fake.inject(LEAD, "robot-surf the README typo", thread=THREAD)
-        await until(lambda: bool(in_thread(fake, "On it")), 60, "the start line")
-        assert in_thread(fake, "On it") == [f"On it: starting R1 ({ASK})."]
+        await until(lambda: bool(in_thread(fake, "Starting it now.")), 60, "the reply")
+        # PER-352: the turn's reply says the run started, in one line; no start line of its own
+        (reply,) = in_thread(fake, "Starting it now.")
+        assert reply.startswith("Starting it now.\nStarted R1 (")
+        assert in_thread(fake, "On it: starting") == []
         assert not any(PROMPT.search(m.text) for m in fake.sent)  # no approval prompt
         assert d.conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 0
         assert start_runs(d) == [{"decision": "Allow", "origin": "tainted", "lifted": 1}]
